@@ -2,119 +2,184 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
 import numpy as np
 import h5py
 
-
-MatValue = Union[np.ndarray, str, float, int, bool, None, Dict[str, Any], List[Any]]
-
-
-def _is_h5_ref_array(x: Any) -> bool:
-    return isinstance(x, np.ndarray) and x.dtype == object and x.size > 0
-
-
-def _maybe_decode_matlab_string(x: Any) -> Optional[str]:
+def bytes_to_str(x: Any) -> Any:
     """
-    Try to decode typical MATLAB string encodings in v7.3 files.
-    Returns None if not decodable.
+    Best-effort conversion of common MATLAB v7.3 string encodings.
+
+    Returns:
+      - python str if convertible
+      - otherwise returns x unchanged
     """
     if isinstance(x, (bytes, np.bytes_)):
         return x.decode("utf-8", "ignore").rstrip("\x00")
 
     if isinstance(x, np.ndarray):
-        # MATLAB char stored as uint16/uint8
+        # MATLAB char arrays often stored as uint16
         if x.dtype == np.uint16:
-            return "".join(chr(c) for c in x.flatten() if c != 0).rstrip("\x00")
+            s = "".join(chr(int(c)) for c in x.flatten() if int(c) != 0)
+            return s.rstrip("\x00")
+
+        # sometimes uint8 bytes
         if x.dtype == np.uint8:
-            return x.tobytes().decode("utf-8", "ignore").rstrip("\x00")
+            try:
+                return x.tobytes().decode("utf-8", "ignore").rstrip("\x00")
+            except Exception:
+                return x
 
-        # h5py can expose variable-length strings as dtype object or bytes
-        if x.dtype.kind in ("S",):
-            return x.tobytes().decode("utf-8", "ignore").rstrip("\x00")
+        # fixed-width bytes
+        if x.dtype.kind == "S":
+            try:
+                return x.tobytes().decode("utf-8", "ignore").rstrip("\x00")
+            except Exception:
+                return x
 
-    return None
+        # h5py vlen strings sometimes appear as object array of bytes
+        if x.dtype == object:
+            # try a very common case: shape (1,1) containing bytes
+            if x.size == 1 and isinstance(x.flat[0], (bytes, np.bytes_)):
+                return bytes_to_str(x.flat[0])
+
+    return x
 
 
-@dataclass(frozen=True)
-class MatV73:
+def _is_ref_dtype(dset: h5py.Dataset) -> bool:
+    # MATLAB cell arrays and object refs are stored as HDF5 references
+    try:
+        return dset.dtype == h5py.ref_dtype
+    except Exception:
+        return False
+
+
+def _safe_2d_index(shape: Tuple[int, ...], i: int, j: int) -> Tuple[int, int]:
     """
-    Minimal, robust reader for MATLAB -v7.3 .mat (HDF5) files.
-    Handles:
-      - structs (HDF5 groups with field datasets)
-      - cell arrays (object references)
-      - numeric arrays / logicals
-      - common MATLAB string encodings
+    MATLAB sometimes stores cell arrays as (1, N) or (N, 1) or (N, M).
+    This helper lets callers ask for (i,j) but tolerates degenerate dims.
     """
-    path: Path
+    if len(shape) == 1:
+        # treat as (N,1)
+        return (i, 0)
+    if len(shape) >= 2:
+        return (i, j)
+    raise ValueError(f"Unsupported shape for 2D index: {shape}")
+
+
+@dataclass
+class MatV73File:
+    """
+    Thin wrapper around an HDF5-backed MATLAB v7.3 MAT file.
+
+    Key goals:
+      - fast: avoid reading large arrays unless explicitly requested
+      - ergonomic: dereference MATLAB object refs / cell arrays
+      - robust: handle common MATLAB string encodings
+    """
+    path: Union[str, Path]
+    keep_open: bool = True
+
+    def __post_init__(self) -> None:
+        self.path = Path(self.path)
+        self._fh: Optional[h5py.File] = None
+        if self.keep_open:
+            self.open()
 
     def open(self) -> h5py.File:
-        return h5py.File(self.path, "r")
+        if self._fh is None:
+            self._fh = h5py.File(self.path, "r")
+        return self._fh
 
-    def read_var(self, var_name: str) -> MatValue:
+    def close(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            finally:
+                self._fh = None
+
+    def __enter__(self) -> "MatV73File":
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if not self.keep_open:
+            self.close()
+
+    @property
+    def f(self) -> h5py.File:
+        return self.open()
+
+    # ---------- low-level helpers ----------
+
+    def has(self, *keys: str) -> bool:
         """
-        Read a top-level variable ('summary', 'exptSummary', etc.)
+        Check existence of nested keys, e.g. has("summary","E")
         """
-        with self.open() as f:
-            if var_name not in f:
-                raise KeyError(f"Variable '{var_name}' not found. Top-level keys: {list(f.keys())}")
-            return self._read_node(f[var_name], f)
+        node: Any = self.f
+        for k in keys:
+            if k not in node:
+                return False
+            node = node[k]
+        return True
 
-    def _read_node(self, node: Union[h5py.Dataset, h5py.Group], f: h5py.File) -> MatValue:
-        if isinstance(node, h5py.Dataset):
-            data = node[()]
-
-            # If dataset is a ref array, interpret as cell array
-            if _is_h5_ref_array(data):
-                return self._read_cell(data, f)
-
-            # Strings
-            s = _maybe_decode_matlab_string(data)
-            if s is not None:
-                return s
-
-            # Numeric/logical arrays
-            if isinstance(data, np.ndarray):
-                # squeeze scalar arrays
-                if data.shape == (1, 1):
-                    return data.squeeze().item()
-                return data
-
-            # Scalars
-            return data
-
-        # Group: interpret as struct-like container
-        if isinstance(node, h5py.Group):
-            out: Dict[str, Any] = {}
-            for k, v in node.items():
-                out[k] = self._read_node(v, f)
-            return out
-
-        raise TypeError(f"Unsupported node type: {type(node)}")
-
-    def _read_cell(self, ref_array: np.ndarray, f: h5py.File) -> List[Any]:
+    def g(self, *keys: str) -> h5py.Group:
         """
-        Read MATLAB cell arrays saved as object references.
-        MATLAB stores cells with shape (m, n); keep that shape by default.
-        Return a nested list [row][col].
+        Return group at nested path.
         """
-        # ensure 2D
-        arr = ref_array
-        if arr.ndim == 0:
-            arr = arr.reshape(1, 1)
-        elif arr.ndim == 1:
-            arr = arr.reshape(arr.shape[0], 1)
+        node: Any = self.f
+        for k in keys:
+            node = node[k]
+        if not isinstance(node, h5py.Group):
+            raise TypeError(f"Expected Group at {'/'.join(keys)}, got {type(node)}")
+        return node
 
-        out: List[List[Any]] = []
-        for r in range(arr.shape[0]):
-            row: List[Any] = []
-            for c in range(arr.shape[1]):
-                ref = arr[r, c]
-                if ref == 0:
-                    row.append(None)
-                    continue
-                row.append(self._read_node(f[ref], f))
-            out.append(row)
+    def d(self, *keys: str) -> h5py.Dataset:
+        """
+        Return dataset at nested path.
+        """
+        node: Any = self.f
+        for k in keys:
+            node = node[k]
+        if not isinstance(node, h5py.Dataset):
+            raise TypeError(f"Expected Dataset at {'/'.join(keys)}, got {type(node)}")
+        return node
 
-        return out
+    def deref(self, ref: h5py.Reference) -> Union[h5py.Group, h5py.Dataset]:
+        """
+        Dereference an HDF5 object reference.
+        """
+        return self.f[ref]
+
+    def cell_ref(self, cell_dset: h5py.Dataset, i: int, j: int = 0) -> Optional[h5py.Reference]:
+        """
+        Read a single object ref from a MATLAB cell array stored as a ref-typed dataset.
+        Returns None for null refs.
+        """
+        if not _is_ref_dtype(cell_dset):
+            raise TypeError("cell_ref called on non-ref dataset")
+
+        ii, jj = _safe_2d_index(cell_dset.shape, i, j)
+        ref = cell_dset[ii, jj]
+        # null ref can come through as 0 or an invalid reference
+        if ref is None:
+            return None
+        try:
+            # h5py.Reference is truthy even when null, so check repr-ish
+            if int(ref) == 0:  # type: ignore[arg-type]
+                return None
+        except Exception:
+            pass
+        return ref
+
+    def read_scalar(self, dset: h5py.Dataset) -> Any:
+        """
+        Read small scalar-ish items with minimal overhead.
+        """
+        x = dset[()]
+        x = bytes_to_str(x)
+        # squeeze trivial MATLAB scalar arrays
+        if isinstance(x, np.ndarray) and x.shape == (1, 1):
+            return bytes_to_str(x.squeeze().item())
+        return x
