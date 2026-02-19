@@ -1,0 +1,850 @@
+{
+   "object_type": "Acquisition",
+   "describedBy": "https://raw.githubusercontent.com/AllenNeuralDynamics/aind-data-schema/main/src/aind_data_schema/core/acquisition.py",
+   "schema_version": "2.2.3",
+   "subject_id": "12345",
+   "specimen_id": null,
+   "acquisition_start_time": "2022-07-12T07:00:00Z",
+   "acquisition_end_time": "2022-07-12T07:30:00Z",
+   "experimenters": [
+      "John Smith"
+   ],
+   "protocol_id": null,
+   "ethics_review_id": [
+      "2415"
+   ],
+   "instrument_id": "SLAP2_1_VCO_1",
+   "acquisition_type": "SLAP2: multi-roi raster drifting gratings",
+   "notes": "center back of cranial window is coordinate system origin",
+   "coordinate_system": {
+      "object_type": "Coordinate system",
+      "name": "Arbitrary Origin ARI",
+      "origin": "Origin",
+      "axes": [
+         {
+            "object_type": "Axis",
+            "name": "AP",
+            "direction": "Posterior_to_anterior"
+         },
+         {
+            "object_type": "Axis",
+            "name": "ML",
+            "direction": "Left_to_right"
+         },
+         {
+            "object_type": "Axis",
+            "name": "SI",
+            "direction": "Superior_to_inferior"
+         }
+      ],
+      "axis_unit": "micrometer"
+   },
+   "calibrations": [],
+   "maintenance": [],
+   "data_streams": [
+      {
+         "object_type": "Data stream",
+         "stream_start_time": "2022-07-12T07:00:00Z",
+         "stream_end_time": "2022-07-12T07:30:00Z",
+         "modalities": [
+            {
+               "name": "Random access projection microscopy",
+               "abbreviation": "slap2"
+            },
+            {
+               "name": "Behavior videos",
+               "abbreviation": "behavior-videos"
+            },
+            {
+               "name": "Behavior",
+               "abbreviation": "behavior"
+            }
+         ],
+         "code": null,
+         "notes": null,
+         "active_devices": [
+            "SLAP2-1-PC",
+            "SLAP2_1",
+            "SiPM Red",
+            "SiPM Green",
+            "Half-Wave Plate",
+            "Leica Objective",
+            "Monaco 150",
+            "vDAQ",
+            "Green Emission Filters",
+            "Red Emission Filters",
+            "DMD1",
+            "DMD2",
+            "Polygonal Scanner",
+            "Pockels Cell",
+            "w10dt714710",
+            "VCO1_Behavior",
+            "VCO1_CuttlefishCamTrigger",
+            "VCO1_TimeStampGenerator",
+            "MindScope Running Disc",
+            "FaceCamera Assembly",
+            "FaceCamera",
+            "FaceCamera Lens",
+            "FaceCamera Filter",
+            "BodyCamera Assembly",
+            "BodyCamera",
+            "BodyCamera Lens",
+            "BodyCamera Filter",
+            "EyeCamera Assembly",
+            "EyeCamera",
+            "EyeCamera Lens",
+            "Stimulus Screen",
+            "Photodiode",
+            "SLAP2_1_VCO_1"
+         ],
+         "configurations": [
+            {
+               "object_type": "Imaging config",
+               "device_name": "SLAP2_1",
+               "channels": [
+                  {
+                     "object_type": "Channel",
+                     "channel_name": "Path 1 Red channel",
+                     "intended_measurement": "RCaMP3",
+                     "detector": {
+                        "object_type": "Detector config",
+                        "device_name": "Red SiPM",
+                        "exposure_time": null,
+                        "exposure_time_unit": "millisecond",
+                        "trigger_type": "Internal",
+                        "compression": null
+                     },
+                     "additional_device_names": [
+                        {
+                           "object_type": "Device config",
+                           "device_name": "DMD1"
+                        },
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Leica Objective"
+                        },
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Half-Wave Plate"
+                        },
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Polygonal Scanner"
+                        }
+                     ],
+                     "light_sources": [
+                        {
+                           "object_type": "Laser config",
+                           "device_name": "Monaco 150",
+                           "wavelength": 1030,
+                           "wavelength_unit": "nanometer",
+                           "power": 150.0,
+                           "power_unit": "milliwatt",
+                           "power_measured_at": null
+                        }
+                     ],
+                     "variable_power": false,
+                     "excitation_filters": null,
+                     "emission_filters": [
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Red Emission Filters"
+                        }
+                     ],
+                     "emission_wavelength": 655,
+                     "emission_wavelength_unit": "nanometer"
+                  },
+                  {
+                     "object_type": "Channel",
+                     "channel_name": "Path 1 Green channel",
+                     "intended_measurement": "iGluSnFR4s",
+                     "detector": {
+                        "object_type": "Detector config",
+                        "device_name": "Green SiPM",
+                        "exposure_time": null,
+                        "exposure_time_unit": "millisecond",
+                        "trigger_type": "Internal",
+                        "compression": null
+                     },
+                     "additional_device_names": [
+                        {
+                           "object_type": "Device config",
+                           "device_name": "DMD1"
+                        },
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Leica Objective"
+                        },
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Half-Wave Plate"
+                        },
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Polygonal Scanner"
+                        }
+                     ],
+                     "light_sources": [
+                        {
+                           "object_type": "Laser config",
+                           "device_name": "Monaco 150",
+                           "wavelength": 1030,
+                           "wavelength_unit": "nanometer",
+                           "power": 150.0,
+                           "power_unit": "milliwatt",
+                           "power_measured_at": null
+                        }
+                     ],
+                     "variable_power": false,
+                     "excitation_filters": null,
+                     "emission_filters": [
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Green Emission Filters"
+                        }
+                     ],
+                     "emission_wavelength": 540,
+                     "emission_wavelength_unit": "nanometer"
+                  },
+                  {
+                     "object_type": "Channel",
+                     "channel_name": "Path 2 Red channel",
+                     "intended_measurement": "RCaMP3",
+                     "detector": {
+                        "object_type": "Detector config",
+                        "device_name": "Red SiPM",
+                        "exposure_time": null,
+                        "exposure_time_unit": "millisecond",
+                        "trigger_type": "Internal",
+                        "compression": null
+                     },
+                     "additional_device_names": [
+                        {
+                           "object_type": "Device config",
+                           "device_name": "DMD2"
+                        },
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Leica Objective"
+                        },
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Half-Wave Plate"
+                        },
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Polygonal Scanner"
+                        }
+                     ],
+                     "light_sources": [
+                        {
+                           "object_type": "Laser config",
+                           "device_name": "Monaco 150",
+                           "wavelength": 1030,
+                           "wavelength_unit": "nanometer",
+                           "power": 150.0,
+                           "power_unit": "milliwatt",
+                           "power_measured_at": null
+                        }
+                     ],
+                     "variable_power": false,
+                     "excitation_filters": null,
+                     "emission_filters": [
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Red Emission Filters"
+                        }
+                     ],
+                     "emission_wavelength": 655,
+                     "emission_wavelength_unit": "nanometer"
+                  },
+                  {
+                     "object_type": "Channel",
+                     "channel_name": "Path 2 Green channel",
+                     "intended_measurement": "iGluSnFR4s",
+                     "detector": {
+                        "object_type": "Detector config",
+                        "device_name": "Green SiPM",
+                        "exposure_time": null,
+                        "exposure_time_unit": "millisecond",
+                        "trigger_type": "Internal",
+                        "compression": null
+                     },
+                     "additional_device_names": [
+                        {
+                           "object_type": "Device config",
+                           "device_name": "DMD2"
+                        },
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Leica Objective"
+                        },
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Half-Wave Plate"
+                        },
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Polygonal Scanner"
+                        }
+                     ],
+                     "light_sources": [
+                        {
+                           "object_type": "Laser config",
+                           "device_name": "Monaco 150",
+                           "wavelength": 1030,
+                           "wavelength_unit": "nanometer",
+                           "power": 150.0,
+                           "power_unit": "milliwatt",
+                           "power_measured_at": null
+                        }
+                     ],
+                     "variable_power": false,
+                     "excitation_filters": null,
+                     "emission_filters": [
+                        {
+                           "object_type": "Device config",
+                           "device_name": "Green Emission Filters"
+                        }
+                     ],
+                     "emission_wavelength": 540,
+                     "emission_wavelength_unit": "nanometer"
+                  }
+               ],
+               "coordinate_system": null,
+               "images": [
+                  {
+                     "object_type": "Planar image",
+                     "channel_name": "Path 1 Red channel",
+                     "dimensions_unit": "pixel",
+                     "image_to_acquisition_transform": [
+                        {
+                           "object_type": "Scale",
+                           "scale": [
+                              0.25,
+                              0.25
+                           ]
+                        }
+                     ],
+                     "dimensions": {
+                        "object_type": "Scale",
+                        "scale": [
+                           800.0,
+                           1280.0
+                        ]
+                     },
+                     "planes": [
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 184.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "raster",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        },
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 160.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "raster",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        },
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 184.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "integration",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        },
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 160.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "integration",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        }
+                     ]
+                  },
+                  {
+                     "object_type": "Planar image",
+                     "channel_name": "Path 1 Green channel",
+                     "dimensions_unit": "pixel",
+                     "image_to_acquisition_transform": [
+                        {
+                           "object_type": "Scale",
+                           "scale": [
+                              0.25,
+                              0.25
+                           ]
+                        }
+                     ],
+                     "dimensions": {
+                        "object_type": "Scale",
+                        "scale": [
+                           800.0,
+                           1280.0
+                        ]
+                     },
+                     "planes": [
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 184.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "raster",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        },
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 160.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "raster",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        },
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 184.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "integration",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        },
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 160.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "integration",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        }
+                     ]
+                  },
+                  {
+                     "object_type": "Planar image",
+                     "channel_name": "Path 2 Red channel",
+                     "dimensions_unit": "pixel",
+                     "image_to_acquisition_transform": [
+                        {
+                           "object_type": "Scale",
+                           "scale": [
+                              0.25,
+                              0.25
+                           ]
+                        }
+                     ],
+                     "dimensions": {
+                        "object_type": "Scale",
+                        "scale": [
+                           800.0,
+                           1280.0
+                        ]
+                     },
+                     "planes": [
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 100.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "raster",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        },
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 105.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "raster",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        },
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 100.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "integration",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        },
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 105.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "integration",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        }
+                     ]
+                  },
+                  {
+                     "object_type": "Planar image",
+                     "channel_name": "Path 2 Green channel",
+                     "dimensions_unit": "pixel",
+                     "image_to_acquisition_transform": [
+                        {
+                           "object_type": "Scale",
+                           "scale": [
+                              0.25,
+                              0.25
+                           ]
+                        }
+                     ],
+                     "dimensions": {
+                        "object_type": "Scale",
+                        "scale": [
+                           800.0,
+                           1280.0
+                        ]
+                     },
+                     "planes": [
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 100.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "raster",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        },
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 105.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "raster",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        },
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 100.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "integration",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        },
+                        {
+                           "object_type": "Slap2 plane",
+                           "depth": 105.0,
+                           "depth_unit": "micrometer",
+                           "power": 75.0,
+                           "power_unit": "percent",
+                           "targeted_structure": {
+                              "atlas": "CCFv3",
+                              "name": "Posterolateral visual area, layer 2/3",
+                              "acronym": "VISpl2/3",
+                              "id": "269"
+                           },
+                           "slap2_acquisition_type": "integration",
+                           "target_name": "Neuron1",
+                           "superpixel_image_path": "path/to/mask.tif",
+                           "unique_y_dilations": [],
+                           "y_dilation_image_path": "path/to/dilation_image.tif",
+                           "x_dilation": 9,
+                           "dilation_unit": "pixel",
+                           "unique_frame_rates": [],
+                           "frame_rate_image_path": "path/to/frame_rate_image.tif",
+                           "frame_rate_unit": "hertz"
+                        }
+                     ]
+                  }
+               ],
+               "sampling_strategy": null
+            },
+            {
+               "object_type": "Detector config",
+               "device_name": "FaceCamera",
+               "exposure_time": 10.0,
+               "exposure_time_unit": "millisecond",
+               "trigger_type": "External",
+               "compression": null
+            },
+            {
+               "object_type": "Detector config",
+               "device_name": "BodyCamera",
+               "exposure_time": 10.0,
+               "exposure_time_unit": "millisecond",
+               "trigger_type": "External",
+               "compression": null
+            },
+            {
+               "object_type": "Detector config",
+               "device_name": "EyeCamera",
+               "exposure_time": 10.0,
+               "exposure_time_unit": "millisecond",
+               "trigger_type": "External",
+               "compression": null
+            }
+         ],
+         "connections": []
+      }
+   ],
+   "stimulus_epochs": [
+      {
+         "object_type": "Stimulus epoch",
+         "stimulus_start_time": "2022-07-12T07:00:00Z",
+         "stimulus_end_time": "2022-07-12T07:30:00Z",
+         "stimulus_name": "Shuffled 8-direction drifting gratings",
+         "code": {
+            "object_type": "Code",
+            "url": "https://github.com/AllenNeuralDynamics/ophys-passive-visual-stim/blob/main/src/RandomDriftingGratings_ContinuousTrials.bonsai",
+            "name": "RandomDriftingGratings_ContinuousTrials.bonsai",
+            "version": "168e4ef1923c535f6c4d914a126526cc11168ac7",
+            "container": null,
+            "run_script": null,
+            "language": "Bonsai",
+            "language_version": "2.9.0",
+            "input_data": null,
+            "parameters": {
+               "Initial Spont Int": 28,
+               "Num Trials": 40,
+               "PortName": "COM7",
+               "Screen_BlueColor (0-1)": 1,
+               "Screen_GreenColor (0-1)": 0,
+               "Screen_RedColor (0-1)": 0,
+               "Subject": "000000",
+               "GratingTrialParametersFile": "ParameterFiles/8_direction_drifting_grating_params.csv"
+            },
+            "core_dependency": null
+         },
+         "stimulus_modalities": [
+            "Visual"
+         ],
+         "performance_metrics": null,
+         "notes": "",
+         "active_devices": [
+            "Stimulus Screen"
+         ],
+         "configurations": [],
+         "training_protocol_name": null,
+         "curriculum_status": null
+      }
+   ],
+   "manipulations": [],
+   "subject_details": null
+}
