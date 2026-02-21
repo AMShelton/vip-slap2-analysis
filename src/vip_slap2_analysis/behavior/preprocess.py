@@ -170,8 +170,9 @@ def get_signal_edges(signal,time,est_rate = 30):
 #         print('Saved stimulus table to savepath')
 
     # return stimulus_df
-    
+
 PathLike = Union[str, Path]
+
 @dataclass
 class AlignmentMeta:
     alignment_method: str
@@ -185,55 +186,36 @@ class AlignmentMeta:
     bv_t0: Optional[float] = None
     phase: Optional[int] = None
     edge_start: Optional[int] = None
+    used_piecewise_warp: bool = False
 
 
 def correct_event_log(
     bonsai_event_log_csv: PathLike,
     photodiode_pkl: PathLike,
     savepath: Optional[PathLike] = None,
+    qc_dir: Optional[PathLike] = None,
     modulo_frames: int = 60,
     min_edge_separation_s: float = 0.005,
     insert_missing_first_stim_rows: bool = True,
-    # robust fallback selection controls
-    slope_bounds: Tuple[float, float] = (0.90, 1.10),
-    min_pairs: int = 200,
-    max_edge_start: int = 20000,
-    max_pairs_per_fit: int = 5000,
-    rmse_tol: float = 0.25,
-    n_frac: float = 0.90,
-    b_abs_max: float = 5.0,
+    use_piecewise_warp: bool = True,
 ) -> Tuple[pd.DataFrame, AlignmentMeta]:
     """
-    Align a BonVision/Bonsai event log (BonVision time) to HARP time using a photodiode trace.
+    Align Bonsai/BonVision event log (BonVision time) to HARP time using photodiode.
 
-    Produces a modified event log containing:
-      - corrected_timestamps: BonVision timestamps mapped into HARP timebase (seconds, HARP-relative)
-      - alignment_method: which strategy was used
-      - photodiode_event / photodiode_state: annotated for Photodiode-0/1 rows (if present),
-        with photodiode_state forward-filled across ALL rows (easy plotting).
+    Output columns:
+      - timestamp_bv_rel
+      - corrected_timestamps  (HARP-relative seconds)
+      - alignment_method
+      - photodiode_event / photodiode_state
 
-    Strategy:
-      1) If BonVision photodiode events are present (Value in {"Photodiode-0","Photodiode-1"}):
-         - create photodiode_event + photodiode_state (ffill) for all rows
-         - collapse repeated states to obtain true edges
-         - match rising-edge trains to HARP rising edges (small integer shift)
-         - fit affine map on BV-relative times: t_harp_rel = slope * t_bv_rel + intercept
-      2) Else (no BonVision photodiode):
-         - estimate display rate from HARP PD
-         - robustly align using Frame % modulo class + edge_start search
-         - among “good” fits, choose smallest |intercept| (anchors to expected small correction)
-
-    Notes on timebases:
-      - HARP photodiode times are converted to relative seconds: idx - idx[0]
-      - BonVision timestamps are converted to BV-relative: Timestamp - t_bv0
-      - corrected_timestamps are HARP-relative seconds (add photodiode_df.index[0] externally if you need absolute HARP)
-
-    Returns
-    -------
-    (out_df, meta)
+    If BV photodiode exists, we build a piecewise-linear warp anchored at matched PD rises
+    (removes per-pulse jitter that comes from BV event quantization).
     """
     bonsai_event_log_csv = Path(bonsai_event_log_csv)
     photodiode_pkl = Path(photodiode_pkl)
+    qc_dir = Path(qc_dir) if qc_dir is not None else None
+    if qc_dir is not None:
+        qc_dir.mkdir(parents=True, exist_ok=True)
 
     bv = _load_bonsai_event_log(bonsai_event_log_csv)
     harp_pd = _load_photodiode(photodiode_pkl)
@@ -241,86 +223,86 @@ def correct_event_log(
     if insert_missing_first_stim_rows:
         bv = _insert_first_stim_rows(bv)
 
-    # Add photodiode_event + photodiode_state (dense ffill) for ALL rows
-    bv = _add_bv_photodiode_columns(bv)
+    # --- YOUR REQUESTED photodiode_state generation (dense ffill across all rows)
+    bv = _add_bv_photodiode_columns_dense(bv)
 
-    # BV reference time (for BV-relative timestamps)
+    # BV-relative timestamps (prevents huge intercepts)
     t_bv0 = _choose_bv_t0(bv)
     bv = bv.copy()
     bv["timestamp_bv_rel"] = bv["Timestamp"].to_numpy(dtype=float) - float(t_bv0)
 
-    # HARP PD in seconds relative to recording start
-    display_rate_hz, harp_rise_s, rise_period_s = _estimate_display_rate_from_harp(
-        harp_pd, modulo_frames=modulo_frames, min_edge_separation_s=min_edge_separation_s
+    # HARP photodiode edges in HARP-relative seconds
+    display_rate_hz, harp_rise_s, rise_period_s, thr = _estimate_display_rate_from_harp(
+        harp_pd,
+        modulo_frames=modulo_frames,
+        min_edge_separation_s=min_edge_separation_s,
     )
 
-    # Duration guardrail (prevents nonsense if wrong photodiode file is loaded)
+    # Duration guardrail (avoids silently aligning wrong/truncated PD)
     bv_duration = _estimate_bv_duration_seconds(bv, t_bv0=t_bv0)
     harp_duration = float(harp_pd.index.values[-1] - harp_pd.index.values[0])
     if harp_duration < 0.5 * bv_duration:
         raise RuntimeError(
-            "Photodiode duration mismatch:\n"
-            f"  BV duration ~ {bv_duration:.1f} s\n"
-            f"  HARP photodiode duration ~ {harp_duration:.1f} s\n"
-            "Likely truncated/wrong photodiode.pkl for this session."
+            f"Photodiode duration mismatch: BV~{bv_duration:.1f}s, HARP~{harp_duration:.1f}s. "
+            "Likely wrong/truncated photodiode.pkl."
         )
 
-    # Try BonVision photodiode alignment first
-    pd_parse = _bv_photodiode_edge_times(bv)
-    corrected_rel: np.ndarray
+    # --- Try BV photodiode path
+    pd_parse = _bv_photodiode_rises_from_state(
+    bv,
+    mode="auto",
+    harp_rise_s=harp_rise_s,
+    max_shift=10,
+)
+    if pd_parse is not None and len(pd_parse) >= 3 and len(harp_rise_s) >= 3:
+        bv_rise_rel = pd_parse  # already in BV-relative seconds
+        shift, rmse_int = _best_start_offset_by_intervals(bv_rise_rel, harp_rise_s, max_shift=10)
 
-    if pd_parse is not None:
-        _pd_rows, _edges, bv_rise_abs = pd_parse
-        # convert BV rises to BV-relative
-        bv_rise = np.asarray(bv_rise_abs, dtype=float) - float(t_bv0)
+        bv_r = bv_rise_rel.copy()
+        hp_r = harp_rise_s.copy()
+        if shift > 0:
+            bv_r = bv_r[shift:]
+        elif shift < 0:
+            hp_r = hp_r[-shift:]
 
-        if len(bv_rise) >= 3 and len(harp_rise_s) >= 3:
-            shift, rmse_int = _best_start_offset_by_intervals(bv_rise, harp_rise_s, max_shift=5)
+        # Fit affine (for meta + initial correspondence)
+        slope, intercept, matched = _fit_affine(bv_r, hp_r)
 
-            bv_rise_adj = bv_rise.copy()
-            harp_rise_adj = harp_rise_s.copy()
-
-            if shift > 0:
-                bv_rise_adj = bv_rise_adj[shift:]
-            elif shift < 0:
-                harp_rise_adj = harp_rise_adj[-shift:]
-
-            slope, intercept, matched = _fit_affine(bv_rise_adj, harp_rise_adj)
-
-            corrected_rel = slope * bv["timestamp_bv_rel"].to_numpy(dtype=float) + intercept
-
-            meta = AlignmentMeta(
-                alignment_method="bv_photodiode_affine",
-                slope=float(slope),
-                intercept=float(intercept),
-                display_rate_est_hz=float(display_rate_hz),
-                matched_edges=int(matched),
-                edge_rmse_intervals=float(rmse_int),
-                bv_duration_s=float(bv_duration),
-                harp_duration_s=float(harp_duration),
-                bv_t0=float(t_bv0),
+        if use_piecewise_warp:
+            # Piecewise linear warp anchored at matched rises (removes per-pulse jitter)
+            corrected = _piecewise_warp(
+                t_query=bv["timestamp_bv_rel"].to_numpy(dtype=float),
+                t_src=bv_r[:matched],
+                t_dst=hp_r[:matched],
             )
+            method = "bv_photodiode_piecewise"
+            used_pw = True
         else:
-            # Photodiode present but not usable → fall back
-            pd_parse = None
+            corrected = slope * bv["timestamp_bv_rel"].to_numpy(dtype=float) + intercept
+            method = "bv_photodiode_affine"
+            used_pw = False
 
-    # Fallback: robust frame%modulo alignment (no BV photodiode)
-    if pd_parse is None:
-        slope, intercept, phase, edge_start, matched, rmse = _fit_frame_modclass_to_harp_edges(
+        meta = AlignmentMeta(
+            alignment_method=method,
+            slope=float(slope),
+            intercept=float(intercept),
+            display_rate_est_hz=float(display_rate_hz),
+            matched_edges=int(matched),
+            edge_rmse_intervals=float(rmse_int),
+            bv_duration_s=float(bv_duration),
+            harp_duration_s=float(harp_duration),
+            bv_t0=float(t_bv0),
+            used_piecewise_warp=used_pw,
+        )
+
+    else:
+        # --- Fallback: no BV photodiode, use robust modulo-class fit anchored by min |b|
+        slope, intercept, phase, edge_start, matched, rmse = _fit_frame_modclass_to_harp_edges_anchored(
             bv=bv,
             harp_rise_s=harp_rise_s,
             modulo_frames=modulo_frames,
-            slope_bounds=slope_bounds,
-            min_pairs=min_pairs,
-            max_edge_start=max_edge_start,
-            max_pairs_per_fit=max_pairs_per_fit,
-            rmse_tol=rmse_tol,
-            n_frac=n_frac,
-            b_abs_max=b_abs_max,
         )
-
-        corrected_rel = slope * bv["timestamp_bv_rel"].to_numpy(dtype=float) + intercept
-
+        corrected = slope * bv["timestamp_bv_rel"].to_numpy(dtype=float) + intercept
         meta = AlignmentMeta(
             alignment_method="frame_modclass_affine_anchored",
             slope=float(slope),
@@ -333,12 +315,15 @@ def correct_event_log(
             bv_t0=float(t_bv0),
             phase=int(phase),
             edge_start=int(edge_start),
+            used_piecewise_warp=False,
         )
 
-    # Build output dataframe
     out = bv.copy()
-    out["corrected_timestamps"] = corrected_rel  # HARP-relative seconds
+    out["corrected_timestamps"] = corrected
     out["alignment_method"] = meta.alignment_method
+
+    if qc_dir is not None:
+        (qc_dir / "alignment_meta.json").write_text(pd.Series(meta.__dict__).to_json(indent=2))
 
     if savepath is not None:
         savepath = Path(savepath)
@@ -346,6 +331,63 @@ def correct_event_log(
         out.to_csv(savepath, index=False)
 
     return out, meta
+
+
+def analyze_jitter(
+    corrected_event_log: pd.DataFrame,
+    photodiode_pkl: PathLike,
+    qc_dir: PathLike,
+    min_edge_separation_s: float = 0.005,
+) -> pd.DataFrame:
+    """
+    Quantify jitter between BV photodiode rises (mapped into HARP time) and HARP photodiode rises.
+    Saves:
+      - jitter_residuals.csv
+      - jitter_residuals.png (residual vs time)
+      - jitter_hist.png
+    Returns residual dataframe.
+    """
+    qc_dir = Path(qc_dir)
+    qc_dir.mkdir(parents=True, exist_ok=True)
+
+    harp_pd = _load_photodiode(Path(photodiode_pkl))
+    t_rel = harp_pd.index.values.astype(float) - harp_pd.index.values.astype(float)[0]
+    y = harp_pd["AnalogInput0"].values.astype(float)
+
+    _, _, harp_rise, _, _ = _get_signal_edges(y, t_rel, min_edge_separation_s=min_edge_separation_s)
+
+    bv_rise_corr = _bv_photodiode_rises_from_corrected(corrected_event_log)
+    if bv_rise_corr is None or len(bv_rise_corr) < 3:
+        raise RuntimeError("No BV photodiode rises found in corrected_event_log to quantify jitter.")
+
+    shift, _ = _best_start_offset_by_intervals(bv_rise_corr, harp_rise, max_shift=10)
+    bv_r, hp_r = _apply_shift(bv_rise_corr, harp_rise, shift)
+
+    res = bv_r - hp_r
+    df = pd.DataFrame({"harp_rise_s": hp_r, "bv_rise_corrected_s": bv_r, "residual_s": res})
+    df.to_csv(qc_dir / "jitter_residuals.csv", index=False)
+
+    # Plots
+    plt.figure(figsize=(10,4))
+    plt.plot(hp_r, res * 1000.0, marker="o", linestyle="none")
+    plt.axhline(0, color="k", linewidth=1)
+    plt.xlabel("HARP rise time (s)")
+    plt.ylabel("Residual (ms)")
+    plt.title("Photodiode rise jitter (BV corrected - HARP)")
+    plt.tight_layout()
+    plt.savefig(qc_dir / "jitter_residuals.png", dpi=200)
+    plt.close()
+
+    plt.figure(figsize=(6,4))
+    plt.hist(res * 1000.0, bins=40)
+    plt.xlabel("Residual (ms)")
+    plt.ylabel("Count")
+    plt.title("Residual distribution")
+    plt.tight_layout()
+    plt.savefig(qc_dir / "jitter_hist.png", dpi=200)
+    plt.close()
+
+    return df
 
 
 # =============================================================================
@@ -359,10 +401,9 @@ def _drop_unnamed(df: pd.DataFrame) -> pd.DataFrame:
 def _load_bonsai_event_log(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     df = _drop_unnamed(df)
-    required = ["Frame", "Timestamp", "Value"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"{path}: missing columns {missing}. Columns={list(df.columns)}")
+    for c in ("Frame", "Timestamp", "Value"):
+        if c not in df.columns:
+            raise ValueError(f"{path}: missing required column '{c}'. Columns={list(df.columns)}")
     return df
 
 
@@ -370,40 +411,29 @@ def _load_photodiode(path: Path) -> pd.DataFrame:
     df = pd.read_pickle(path)
     if isinstance(df, pd.Series):
         df = df.to_frame("AnalogInput0")
-
     if "AnalogInput0" not in df.columns:
         df = df.rename(columns={df.columns[0]: "AnalogInput0"})
-
     df = df.copy()
-    df.index = df.index.astype(float)  # HARP timebase
+    df.index = df.index.astype(float)
     df.index.name = "Time"
     return df
 
 
-def _add_bv_photodiode_columns(event_log: pd.DataFrame) -> pd.DataFrame:
+def _add_bv_photodiode_columns_dense(stim_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Your requested behavior:
-      - photodiode_event: sparse 0/1 where Value is Photodiode-0/1, NaN elsewhere
-      - photodiode_state: forward-filled across ALL rows (easy plotting)
+    Exactly your requested implementation: photodiode_state forward-filled across all rows.
     """
-    df = event_log.copy()
+    df = stim_df.copy()
     val = df["Value"].astype(str)
-
     pd_event = np.full(len(df), np.nan, dtype=float)
     pd_event[val.str.fullmatch(r"Photodiode-1", case=False)] = 1.0
     pd_event[val.str.fullmatch(r"Photodiode-0", case=False)] = 0.0
-
     df["photodiode_event"] = pd_event
     df["photodiode_state"] = pd.Series(pd_event).ffill().to_numpy()
-
     return df
 
 
 def _choose_bv_t0(bv: pd.DataFrame) -> float:
-    """
-    Choose BV reference time:
-      - first Timestamp among Value=='Frame' if present, else min Timestamp.
-    """
     frame_mask = bv["Value"].astype(str).str.lower().eq("frame")
     if frame_mask.any():
         return float(bv.loc[frame_mask, "Timestamp"].iloc[0])
@@ -411,30 +441,19 @@ def _choose_bv_t0(bv: pd.DataFrame) -> float:
 
 
 def _insert_first_stim_rows(event_log: pd.DataFrame) -> pd.DataFrame:
-    """
-    Prepends:
-      Frame=-1, Timestamp=0, Value='Frame'
-      Frame=-1, Timestamp=0, Value='<first .tif or .tiff found>'
-    """
     df = event_log.copy()
     tif_mask = df["Value"].astype(str).str.contains(r"\.tif{1,2}f?$", case=False, na=False)
     if not tif_mask.any():
         return df
-
     tif_value = df.loc[tif_mask, "Value"].iloc[0]
-
     prepend = pd.DataFrame(
-        [
-            {"Frame": -1, "Timestamp": 0.0, "Value": "Frame"},
-            {"Frame": -1, "Timestamp": 0.0, "Value": tif_value},
-        ]
+        [{"Frame": -1, "Timestamp": 0.0, "Value": "Frame"},
+         {"Frame": -1, "Timestamp": 0.0, "Value": tif_value}]
     )
-
     for c in df.columns:
         if c not in prepend.columns:
             prepend[c] = np.nan
     prepend = prepend[df.columns]
-
     return pd.concat([prepend, df], ignore_index=True)
 
 
@@ -444,14 +463,10 @@ def _get_signal_edges(
     *,
     min_edge_separation_s: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-    """
-    Threshold + debounce edge detection for the photodiode analog trace.
-    Uses a small median filter to suppress ripple.
-    """
     sig = np.asarray(signal)
     t = np.asarray(time)
 
-    y_s = medfilt(sig, kernel_size=5) if len(sig) >= 5 else sig.copy()
+    y_s = medfilt(sig, kernel_size=9) if len(sig) >= 9 else sig.copy()
     thr = (np.percentile(y_s, 95) + np.percentile(y_s, 5)) / 2.0
     binary = (y_s > thr).astype(np.int8)
 
@@ -473,7 +488,6 @@ def _get_signal_edges(
 
     t_rise = _debounce(t_rise)
     t_fall = _debounce(t_fall)
-
     return rise_idx, fall_idx, t_rise, t_fall, float(thr)
 
 
@@ -482,161 +496,240 @@ def _estimate_display_rate_from_harp(
     *,
     modulo_frames: int,
     min_edge_separation_s: float,
-) -> Tuple[float, np.ndarray, float]:
-    """
-    Assumes photodiode toggles once per `modulo_frames` display frames.
-
-    period = median(diff(rising_edges))
-    display_rate_hz = modulo_frames / period
-    """
+) -> Tuple[float, np.ndarray, float, float]:
     t = photodiode_df.index.values - photodiode_df.index.values[0]  # HARP-relative seconds
     y = photodiode_df["AnalogInput0"].values
-
-    _, _, t_rise, _, _ = _get_signal_edges(y, t, min_edge_separation_s=min_edge_separation_s)
+    _, _, t_rise, _, thr = _get_signal_edges(y, t, min_edge_separation_s=min_edge_separation_s)
     if len(t_rise) < 3:
-        raise ValueError("Not enough HARP photodiode rising edges to estimate display rate.")
-
+        raise ValueError("Not enough HARP photodiode rising edges.")
     period = float(np.median(np.diff(t_rise)))
     display_rate = float(modulo_frames / period)
-    return display_rate, t_rise, period
-
-
-def _bv_photodiode_edge_times(event_log: pd.DataFrame):
-    """
-    Extract true photodiode edges from BonVision event log rows.
-
-    We use the dense photodiode_state already computed, but edges are derived by
-    selecting rows where photodiode_event is not NaN and collapsing duplicates.
-    """
-    if "photodiode_event" not in event_log.columns:
-        return None
-
-    mask = ~pd.isna(event_log["photodiode_event"])
-    if not mask.any():
-        return None
-
-    pd_rows = event_log.loc[mask, ["Frame", "Timestamp", "Value", "photodiode_event"]].copy()
-    pd_rows = pd_rows.sort_values(["Timestamp", "Frame"]).reset_index(drop=True)
-    pd_rows["state"] = pd_rows["photodiode_event"].astype(int)
-
-    state = pd_rows["state"].values
-    change = np.r_[True, state[1:] != state[:-1]]
-    edges = pd_rows.loc[change, ["Timestamp", "state"]].reset_index(drop=True)
-
-    edge_states = edges["state"].values
-    prev = np.r_[edge_states[0], edge_states[:-1]]
-    bv_rise = edges.loc[(prev == 0) & (edge_states == 1), "Timestamp"].values
-
-    return pd_rows, edges, bv_rise
-
-
-def _best_start_offset_by_intervals(
-    bv_times: np.ndarray,
-    harp_times: np.ndarray,
-    *,
-    max_shift: int = 5,
-) -> Tuple[int, float]:
-    """
-    Pick an integer shift (within +/- max_shift) that best aligns the early inter-edge intervals.
-    Returns (shift, rmse_of_intervals).
-    """
-    bv_times = np.asarray(bv_times, dtype=float)
-    harp_times = np.asarray(harp_times, dtype=float)
-
-    bv_dt = np.diff(bv_times)
-    harp_dt = np.diff(harp_times)
-
-    n = min(len(bv_dt), len(harp_dt), 20)
-    if n <= 2:
-        return 0, float("inf")
-
-    bv_dt = bv_dt[:n]
-    harp_dt = harp_dt[:n]
-
-    best_shift = 0
-    best_rmse = float("inf")
-
-    for shift in range(-max_shift, max_shift + 1):
-        if shift >= 0:
-            a = bv_dt[shift:]
-            b = harp_dt[: len(a)]
-        else:
-            b = harp_dt[-shift:]
-            a = bv_dt[: len(b)]
-
-        m = min(len(a), len(b))
-        if m < 5:
-            continue
-
-        rmse = float(np.sqrt(np.mean((a[:m] - b[:m]) ** 2)))
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_shift = shift
-
-    return best_shift, best_rmse
-
-
-def _fit_affine(
-    bv_edge_times: np.ndarray,
-    harp_edge_times: np.ndarray,
-) -> Tuple[float, float, int]:
-    """
-    Fit t_harp = slope * t_bv + intercept using least squares (polyfit).
-    """
-    bv = np.asarray(bv_edge_times, dtype=float)
-    hp = np.asarray(harp_edge_times, dtype=float)
-    n = min(len(bv), len(hp))
-    if n < 3:
-        raise ValueError("Need at least 3 matched edges to fit affine map.")
-    bv = bv[:n]
-    hp = hp[:n]
-    slope, intercept = np.polyfit(bv, hp, 1)
-    return float(slope), float(intercept), int(n)
+    return display_rate, t_rise, period, thr
 
 
 def _estimate_bv_duration_seconds(bv: pd.DataFrame, *, t_bv0: float) -> float:
-    """
-    Estimate BV duration (relative to t_bv0). Prefer Frame rows if present.
-    """
     frame_mask = bv["Value"].astype(str).str.lower().eq("frame")
     if frame_mask.any():
         return float(bv.loc[frame_mask, "Timestamp"].max() - t_bv0)
     return float(bv["Timestamp"].max() - t_bv0)
 
 
-def _fit_frame_modclass_to_harp_edges(
+def _bv_photodiode_rises_from_state(
+    bv: pd.DataFrame,
+    *,
+    mode: str = "auto",   # "auto" | "current" | "midpoint" | "previous"
+    harp_rise_s: Optional[np.ndarray] = None,
+    max_shift: int = 10,
+) -> Optional[np.ndarray]:
+    """
+    Extract BV photodiode rise times (BV-relative seconds) from photodiode_state,
+    using only Frame rows (reduces scheduling jitter from Photodiode-* events).
+
+    The key: ds==1 is observed at index i, meaning the transition occurred between
+    frames i-1 and i. Depending on how BV logs the state, using t[i] can be ~1 frame late.
+
+    mode:
+      - "current":  rise time = t[i]
+      - "midpoint": rise time = 0.5*(t[i-1] + t[i])
+      - "previous": rise time = t[i-1]
+      - "auto":     tries the above and picks the one with smallest residual RMSE
+                    after affine fitting to harp_rise_s (requires harp_rise_s).
+    """
+    if "photodiode_state" not in bv.columns:
+        return None
+
+    frame_mask = bv["Value"].astype(str).str.lower().eq("frame")
+    if not frame_mask.any():
+        return None
+
+    fr = bv.loc[frame_mask, ["timestamp_bv_rel", "photodiode_state"]].copy()
+    state = fr["photodiode_state"].ffill().fillna(0.0).to_numpy(dtype=float)
+    t = fr["timestamp_bv_rel"].to_numpy(dtype=float)
+
+    ds = np.diff(state, prepend=state[0])
+    idx = np.where(ds == 1)[0]
+    if len(idx) == 0:
+        return None
+
+    def rises_with(m: str) -> np.ndarray:
+        if m == "current":
+            return t[idx]
+        if m == "midpoint":
+            idx2 = idx[idx > 0]
+            return 0.5 * (t[idx2 - 1] + t[idx2])
+        if m == "previous":
+            idx2 = idx[idx > 0]
+            return t[idx2 - 1]
+        raise ValueError(f"Unknown mode: {m}")
+
+    if mode != "auto":
+        r = rises_with(mode)
+        return np.asarray(r, dtype=float) if len(r) else None
+
+    # auto-select best mode by fitting to harp and checking residuals
+    if harp_rise_s is None or len(harp_rise_s) < 3:
+        # fallback if user asked for auto but didn't provide harp_rise_s
+        r = rises_with("previous")
+        return np.asarray(r, dtype=float) if len(r) else None
+
+    modes = ["previous", "midpoint", "current"]
+    best = None
+
+    for m in modes:
+        bv_r = rises_with(m)
+        if len(bv_r) < 3:
+            continue
+
+        # align start by interval pattern, then fit affine and score residuals
+        shift, _ = _best_start_offset_by_intervals(bv_r, harp_rise_s, max_shift=max_shift)
+        bv_r2, hp_r2 = _apply_shift(bv_r, harp_rise_s, shift)
+        if len(bv_r2) < 3:
+            continue
+
+        a, b, _ = _fit_affine(bv_r2, hp_r2)
+        res = (a * bv_r2 + b) - hp_r2
+        rmse = float(np.sqrt(np.mean(res ** 2)))
+
+        cand = (rmse, m, bv_r)
+        if best is None or cand[0] < best[0]:
+            best = cand
+
+    if best is None:
+        r = rises_with("previous")
+        return np.asarray(r, dtype=float) if len(r) else None
+
+    # best[1] is selected mode; return the full rise vector in that mode
+    return np.asarray(best[2], dtype=float)
+
+
+def _bv_photodiode_rises_from_corrected(df: pd.DataFrame) -> Optional[np.ndarray]:
+    """
+    Extract BV photodiode rises in corrected (HARP) time by using photodiode_event rows.
+    """
+    if "photodiode_event" not in df.columns or "corrected_timestamps" not in df.columns:
+        return None
+    mask = ~df["photodiode_event"].isna()
+    if not mask.any():
+        return None
+
+    sub = df.loc[mask, ["corrected_timestamps", "photodiode_event"]].copy()
+    sub = sub[sub["photodiode_event"].ne(sub["photodiode_event"].shift())]
+    states = sub["photodiode_event"].to_numpy(dtype=float)
+    times = sub["corrected_timestamps"].to_numpy(dtype=float)
+    prev = np.r_[states[0], states[:-1]]
+    rises = times[(prev == 0) & (states == 1)]
+    return np.asarray(rises, dtype=float)
+
+
+def _best_start_offset_by_intervals(bv_times: np.ndarray, harp_times: np.ndarray, *, max_shift: int = 5) -> Tuple[int, float]:
+    bv_times = np.asarray(bv_times, dtype=float)
+    harp_times = np.asarray(harp_times, dtype=float)
+    bv_dt = np.diff(bv_times)
+    hp_dt = np.diff(harp_times)
+    n = min(len(bv_dt), len(hp_dt), 20)
+    if n < 5:
+        return 0, float("inf")
+    bv_dt = bv_dt[:n]
+    hp_dt = hp_dt[:n]
+
+    best_shift = 0
+    best_rmse = float("inf")
+    for shift in range(-max_shift, max_shift + 1):
+        if shift >= 0:
+            a = bv_dt[shift:]
+            b = hp_dt[: len(a)]
+        else:
+            b = hp_dt[-shift:]
+            a = bv_dt[: len(b)]
+        m = min(len(a), len(b))
+        if m < 5:
+            continue
+        rmse = float(np.sqrt(np.mean((a[:m] - b[:m]) ** 2)))
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_shift = shift
+    return best_shift, best_rmse
+
+
+def _apply_shift(bv: np.ndarray, hp: np.ndarray, shift: int) -> Tuple[np.ndarray, np.ndarray]:
+    bv = np.asarray(bv, dtype=float)
+    hp = np.asarray(hp, dtype=float)
+    if shift > 0:
+        bv = bv[shift:]
+    elif shift < 0:
+        hp = hp[-shift:]
+    n = min(len(bv), len(hp))
+    return bv[:n], hp[:n]
+
+
+def _fit_affine(bv_edge_times: np.ndarray, harp_edge_times: np.ndarray) -> Tuple[float, float, int]:
+    bv = np.asarray(bv_edge_times, dtype=float)
+    hp = np.asarray(harp_edge_times, dtype=float)
+    n = min(len(bv), len(hp))
+    if n < 3:
+        raise ValueError("Need at least 3 edges to fit affine.")
+    bv = bv[:n]
+    hp = hp[:n]
+    slope, intercept = np.polyfit(bv, hp, 1)
+    return float(slope), float(intercept), int(n)
+
+
+def _piecewise_warp(t_query: np.ndarray, t_src: np.ndarray, t_dst: np.ndarray) -> np.ndarray:
+    """
+    Piecewise-linear mapping that ensures t_src[k] -> t_dst[k] exactly.
+    Uses linear extrapolation outside the anchor range.
+    """
+    t_query = np.asarray(t_query, dtype=float)
+    t_src = np.asarray(t_src, dtype=float)
+    t_dst = np.asarray(t_dst, dtype=float)
+
+    if len(t_src) < 2:
+        raise ValueError("Need at least 2 anchors for piecewise warp.")
+
+    # Ensure sorted
+    order = np.argsort(t_src)
+    t_src = t_src[order]
+    t_dst = t_dst[order]
+
+    # Core interpolation
+    out = np.interp(t_query, t_src, t_dst)
+
+    # Linear extrapolation on left/right using first/last segment slope
+    left = t_query < t_src[0]
+    right = t_query > t_src[-1]
+
+    m0 = (t_dst[1] - t_dst[0]) / (t_src[1] - t_src[0])
+    b0 = t_dst[0] - m0 * t_src[0]
+    out[left] = m0 * t_query[left] + b0
+
+    m1 = (t_dst[-1] - t_dst[-2]) / (t_src[-1] - t_src[-2])
+    b1 = t_dst[-1] - m1 * t_src[-1]
+    out[right] = m1 * t_query[right] + b1
+
+    return out
+
+
+def _fit_frame_modclass_to_harp_edges_anchored(
     *,
     bv: pd.DataFrame,
     harp_rise_s: np.ndarray,
     modulo_frames: int,
-    slope_bounds: Tuple[float, float],
-    min_pairs: int,
-    max_edge_start: int,
-    max_pairs_per_fit: int,
-    rmse_tol: float,
-    n_frac: float,
-    b_abs_max: float,
+    slope_bounds: Tuple[float, float] = (0.90, 1.10),
+    min_pairs: int = 200,
+    max_edge_start: int = 20000,
+    max_pairs_per_fit: int = 5000,
+    rmse_tol: float = 0.25,
+    n_frac: float = 0.90,
+    b_abs_max: float = 5.0,
 ) -> Tuple[float, float, int, int, int, float]:
     """
-    Robust fallback when BV photodiode is absent.
-
-    Use modulo-class frames:
-      - take Frame rows
-      - for each phase in [0..modulo_frames-1], candidate flip times are frames where Frame%modulo==phase
-      - search edge_start shift into harp_rise_s
-      - fit affine t_harp = a*t_bv + b on BV-relative times
-      - select among near-best fits the one with smallest |b| (anchors to small correction)
+    Fallback: choose flip train as Frame%modulo==phase; match to harp_rise with edge_start shift.
+    Then pick among near-best fits the one with smallest |b|.
     """
     frame_mask = bv["Value"].astype(str).str.lower().eq("frame")
-    if not frame_mask.any():
-        raise RuntimeError("No Frame rows found; cannot do frame-modclass alignment.")
-
-    frame_rows = bv.loc[frame_mask, ["Frame", "timestamp_bv_rel"]].copy()
-    frames = frame_rows["Frame"].to_numpy(dtype=int)
-    t_frame = frame_rows["timestamp_bv_rel"].to_numpy(dtype=float)
-
-    if len(harp_rise_s) < min_pairs:
-        raise RuntimeError(f"Not enough HARP edges (have {len(harp_rise_s)}, need {min_pairs}).")
+    fr = bv.loc[frame_mask, ["Frame", "timestamp_bv_rel"]].copy()
+    frames = fr["Frame"].to_numpy(dtype=int)
+    t_frame = fr["timestamp_bv_rel"].to_numpy(dtype=float)
 
     max_edge_start = int(min(max_edge_start, max(0, len(harp_rise_s) - min_pairs)))
 
@@ -645,30 +738,23 @@ def _fit_frame_modclass_to_harp_edges(
         sel = (frames % modulo_frames) == phase
         if int(np.sum(sel)) < min_pairs:
             continue
-
-        bv_flip_t = t_frame[sel]
-        order = np.argsort(bv_flip_t)
-        bv_flip_t = bv_flip_t[order][:max_pairs_per_fit]
+        bv_flip = np.sort(t_frame[sel])[:max_pairs_per_fit]
 
         for edge_start in range(max_edge_start + 1):
-            n = min(len(bv_flip_t), len(harp_rise_s) - edge_start, max_pairs_per_fit)
+            n = min(len(bv_flip), len(harp_rise_s) - edge_start, max_pairs_per_fit)
             if n < min_pairs:
                 continue
-
-            t_bv = bv_flip_t[:n]
+            t_bv = bv_flip[:n]
             t_hp = harp_rise_s[edge_start:edge_start + n]
-
             a, b, _ = _fit_affine(t_bv, t_hp)
-
-            if not (np.isfinite(a) and np.isfinite(b) and a > 0 and slope_bounds[0] <= a <= slope_bounds[1]):
+            if not (slope_bounds[0] <= a <= slope_bounds[1]):
                 continue
-
             err = (a * t_bv + b) - t_hp
             rmse = float(np.sqrt(np.mean(err**2)))
-            candidates.append(dict(phase=int(phase), edge_start=int(edge_start), a=float(a), b=float(b), rmse=float(rmse), n=int(n)))
+            candidates.append(dict(phase=phase, edge_start=edge_start, a=a, b=b, rmse=rmse, n=n))
 
     if not candidates:
-        raise RuntimeError("No valid (phase, edge_start) candidates found. Check modulo/edge detection/slope bounds.")
+        raise RuntimeError("No valid candidates in frame-modclass fallback.")
 
     best_rmse = min(c["rmse"] for c in candidates)
     max_n = max(c["n"] for c in candidates)
@@ -680,14 +766,9 @@ def _fit_frame_modclass_to_harp_edges(
         and abs(c["b"]) <= b_abs_max
     ]
     if not good:
-        # Relax |b| if nothing passes
-        good = [
-            c for c in candidates
-            if c["rmse"] <= best_rmse * (1.0 + rmse_tol)
-            and c["n"] >= int(max_n * n_frac)
-        ]
+        good = [c for c in candidates if c["rmse"] <= best_rmse * (1.0 + rmse_tol) and c["n"] >= int(max_n * n_frac)]
 
     good.sort(key=lambda c: (abs(c["b"]), c["edge_start"], c["rmse"]))
     best = good[0]
-
     return best["a"], best["b"], best["phase"], best["edge_start"], best["n"], best["rmse"]
+
