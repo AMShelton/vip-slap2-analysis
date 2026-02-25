@@ -320,12 +320,20 @@ def correct_event_log(
         # ---------------------------------------------------------------------
         slope, intercept, phase, edge_start, matched, rmse = _fit_frame_modclass_to_harp_edges_anchored_edges(
             bv=bv,
-            harp_edge_s=harp_edges_s,
-            modulo_frames=modulo_frames,
-            # Recommended: keep slope close to 1 if BV timestamps are in seconds
-            slope_bounds=(0.98, 1.02),
-            min_pairs=100,
-            b_abs_max=5.0,  # allow stimulus onset to be a few seconds after HARP start
+            harp_edge_s=harp_edges_s,   # <-- rises+falls, sorted
+            modulo_frames=30,           # frames per transition
+            b_abs_max=3.0,
+
+            # Dropout detection defaults are good; you can tune:
+            dropout_gap_factor=1.5,
+            dropout_min_gap_s=1.5,
+            dropout_min_edges_per_segment=80,
+
+            # 2025 priority: use a wide prior to break periodic ties
+            use_b_prior=True,
+            b_prior=0.30,
+            b_prior_sigma=0.25,
+            prior_strength_b=1.0,
         )
         corrected = slope * bv["timestamp_bv_rel"].to_numpy(dtype=float) + intercept
 
@@ -697,30 +705,22 @@ def _split_edge_train_into_segments(
     gap_factor: float = 1.5,
     min_gap_s: float = 1.5,
     min_edges_per_segment: int = 50,
+    always_keep_first_segment: bool = True,
 ) -> Tuple[List[np.ndarray], Dict[str, Any]]:
     """
-    Detect photodiode dropouts by looking for large gaps in the edge train, then split into segments.
+    Split a HARP edge train into contiguous segments separated by dropout-sized gaps.
 
-    Parameters
-    ----------
-    harp_edge_s:
-        1D array of sorted HARP edge times (rises+falls) in HARP-relative seconds.
-    gap_factor:
-        Gap threshold relative to the median edge interval (dt > gap_factor * median_dt).
-    min_gap_s:
-        Absolute gap threshold in seconds (dt > min_gap_s).
-    min_edges_per_segment:
-        Drop segments smaller than this (too little data to fit robustly).
+    Robust behavior:
+    - If always_keep_first_segment=True, the first segment is kept even if short.
+      This prevents losing the true onset time when an early dropout occurs.
 
-    Returns
-    -------
-    segments:
-        List of 1D arrays, each a contiguous segment of edges.
-    meta:
-        Dict with QC information (median_dt, gap indices, etc).
+    Returns:
+      segments: list of edge arrays
+      meta: QC info
     """
     edges = np.asarray(harp_edge_s, dtype=float)
     edges = np.sort(edges)
+
     if edges.size < 5:
         return [edges], dict(
             n_edges=int(edges.size),
@@ -734,18 +734,21 @@ def _split_edge_train_into_segments(
 
     dt = np.diff(edges)
     median_dt = float(np.median(dt))
-    # dropout if it's "way larger than typical" AND absolutely large
     gap_mask = (dt > (gap_factor * median_dt)) & (dt > min_gap_s)
     gap_idx = np.where(gap_mask)[0]
 
     if gap_idx.size == 0:
         segs = [edges]
     else:
-        cut_points = (gap_idx + 1).tolist()
-        segs = np.split(edges, cut_points)
+        segs = np.split(edges, (gap_idx + 1).tolist())
 
-    # filter small segments
-    segs = [s for s in segs if s.size >= int(min_edges_per_segment)]
+    # Filter small segments, but optionally keep the first no matter what
+    kept = []
+    for i, s in enumerate(segs):
+        if s.size >= int(min_edges_per_segment):
+            kept.append(s)
+        elif always_keep_first_segment and i == 0:
+            kept.append(s)
 
     meta = dict(
         n_edges=int(edges.size),
@@ -753,26 +756,22 @@ def _split_edge_train_into_segments(
         n_gaps=int(gap_idx.size),
         max_gap_s=float(dt[gap_idx].max()) if gap_idx.size else 0.0,
         gap_indices=gap_idx.tolist(),
-        segment_lengths=[int(s.size) for s in segs],
-        segment_starts=[float(s[0]) for s in segs] if segs else [],
+        segment_lengths=[int(s.size) for s in kept],
+        segment_starts=[float(s[0]) for s in kept] if kept else [],
     )
-    # If we filtered everything, keep the largest raw segment so we can fail gracefully downstream
-    if not segs:
-        # pick largest segment from unfiltered split
-        if gap_idx.size == 0:
-            segs = [edges]
-        else:
-            raw_segs = np.split(edges, (gap_idx + 1).tolist())
-            raw_segs.sort(key=lambda s: s.size, reverse=True)
-            segs = [raw_segs[0]]
-        meta["segment_lengths"] = [int(segs[0].size)]
-        meta["segment_starts"] = [float(segs[0][0])]
 
-    return segs, meta
+    # If everything got filtered (should be rare), keep the largest segment.
+    if not kept:
+        segs.sort(key=lambda s: s.size, reverse=True)
+        kept = [segs[0]]
+        meta["segment_lengths"] = [int(kept[0].size)]
+        meta["segment_starts"] = [float(kept[0][0])]
+
+    return kept, meta
 
 def _fit_frame_modclass_to_harp_edges_anchored_edges(
     *,
-    bv: pd.DataFrame,
+    bv: "pd.DataFrame",
     harp_edge_s: np.ndarray,
     modulo_frames: int,
     slope_bounds: Tuple[float, float] = (0.98, 1.02),
@@ -781,29 +780,39 @@ def _fit_frame_modclass_to_harp_edges_anchored_edges(
     max_pairs_per_fit: int = 5000,
     rmse_tol: float = 0.2,
     n_frac: float = 0.95,
-    b_abs_max: float = 1.0,
-    # -------------------------
-    # NEW: priors from BV-PD ground truth
-    # -------------------------
-    b_prior: float = 0.133,        # seconds (median from your rec1–rec9)
-    b_prior_sigma: float = 0.029,  # seconds (std from your rec1–rec9)
+    b_abs_max: float = 3.0,
+    # --- Dropout handling ---
+    dropout_gap_factor: float = 1.5,
+    dropout_min_gap_s: float = 1.5,
+    dropout_min_edges_per_segment: int = 80,
+    # --- Robust selection / priors (recommended for 2025) ---
+    use_b_prior: bool = True,
+    b_prior: float = 0.30,         # default for 2025-ish sessions; override upstream if you have better
+    b_prior_sigma: float = 0.25,   # wide, because 2025 appears multi-modal
+    prior_strength_b: float = 1.0,
+    # Optionally (usually weak)
+    use_a_prior: bool = False,
     a_prior: float = 1.0,
-    a_prior_sigma: float = 0.002,  # conservative; BV↔HARP slope is ~1
-    prior_strength_b: float = 1.0, # increase to weight b prior more strongly
-    prior_strength_a: float = 0.2, # usually weaker than b prior
+    a_prior_sigma: float = 0.01,
+    prior_strength_a: float = 0.1,
 ) -> Tuple[float, float, int, int, int, float]:
     """
-    Fallback alignment when BV photodiode is absent:
-      - Match BV "flip frames" (Frame%modulo_frames == phase) to HARP photodiode EDGES (rises+falls)
-      - Fit affine map t_harp = a*t_bv + b
-      - Choose solution using a MAP-like score that includes a prior on b (and optionally a)
+    Dropout-aware fallback:
+
+    - Uses HARP EDGES (rises+falls).
+    - Treats modulo_frames as "frames per TRANSITION".
+    - Detects edge-train dropouts and fits on contiguous edge segments.
+    - Does NOT force edge_start=0; instead searches edge_start within constraints
+      and selects using a robust score (RMSE + optional priors).
 
     Returns (a, b, phase, edge_start, n, rmse).
 
     Notes
     -----
-    - modulo_frames is interpreted as "frames per TRANSITION" (e.g., 30 frames @ 30 Hz -> 1 s edges).
-    - b_prior/b_prior_sigma should come from ground-truth BV-PD sessions on the same rig configuration.
+    1) If a dropout exists, fitting across the whole edge train can "cycle slip" by ~N seconds.
+       We prevent that by splitting into segments and picking the best segment.
+    2) If your system is periodic/ambiguous, priors help choose the correct branch.
+       For 2025, I recommend a WIDE prior (sigma ~0.2–0.3) unless you have day-by-day continuity.
     """
 
     frame_mask = bv["Value"].astype(str).str.lower().eq("frame")
@@ -814,111 +823,154 @@ def _fit_frame_modclass_to_harp_edges_anchored_edges(
     frames = fr["Frame"].to_numpy(dtype=int)
     t_frame = fr["timestamp_bv_rel"].to_numpy(dtype=float)
 
+    # Segment the edge train to avoid dropout-induced slips
     harp_edge_s = np.asarray(harp_edge_s, dtype=float)
     harp_edge_s = np.sort(harp_edge_s)
+    segments, seg_meta = _split_edge_train_into_segments(
+        harp_edge_s,
+        gap_factor=dropout_gap_factor,
+        min_gap_s=dropout_min_gap_s,
+        min_edges_per_segment=dropout_min_edges_per_segment,
+    )
 
-    # Constrain edge_start based on intercept bound: b ~ time of first matched HARP edge
-    edge_start_limit = int(np.searchsorted(harp_edge_s, b_abs_max + 0.25))
-    max_edge_start = int(min(max_edge_start, max(0, len(harp_edge_s) - min_pairs), edge_start_limit))
+    # Candidate generation on a given segment
+    def _candidates_for_segment(seg_edges: np.ndarray) -> List[Dict[str, Any]]:
+        seg_edges = np.asarray(seg_edges, dtype=float)
+        seg_edges = np.sort(seg_edges)
 
-    if max_edge_start < 0 or max_edge_start < 1:
-        raise RuntimeError(
-            f"HARP edges do not contain enough early transitions within {b_abs_max}s "
-            f"to constrain alignment. edge_start_limit={edge_start_limit}."
-        )
+        # Constrain edge_start based on |b| bound, but allow segment start later if b_abs_max allows.
+        # Since b ~ time of first matched edge, edge_start values beyond this are meaningless for small b_abs_max.
+        edge_start_limit = int(np.searchsorted(seg_edges, b_abs_max + 0.25))
+        max_es = int(min(max_edge_start, max(0, seg_edges.size - min_pairs), edge_start_limit))
+        if max_es < 0:
+            return []
 
-    # Adapt min_pairs if needed (short recordings)
-    min_pairs_eff = int(min(min_pairs, max(20, len(harp_edge_s) // 5)))
+        # Adapt min_pairs for shorter segments
+        min_pairs_eff = int(min(min_pairs, max(20, seg_edges.size // 5)))
 
-    candidates: List[Dict[str, Any]] = []
-    for phase in range(int(modulo_frames)):
-        sel = (frames % modulo_frames) == phase
-        if int(np.sum(sel)) < min_pairs_eff:
-            continue
-
-        bv_flip = np.sort(t_frame[sel])[:max_pairs_per_fit]
-
-        for edge_start in range(max_edge_start + 1):
-            n = min(len(bv_flip), len(harp_edge_s) - edge_start, max_pairs_per_fit)
-            if n < min_pairs_eff:
+        cands: List[Dict[str, Any]] = []
+        for phase in range(int(modulo_frames)):
+            sel = (frames % modulo_frames) == phase
+            if int(np.sum(sel)) < min_pairs_eff:
                 continue
 
-            t_bv = bv_flip[:n]
-            t_hp = harp_edge_s[edge_start:edge_start + n]
+            bv_flip = np.sort(t_frame[sel])[:max_pairs_per_fit]
 
-            a, b, _ = _fit_affine(t_bv, t_hp)
-            if not (slope_bounds[0] <= a <= slope_bounds[1]):
-                continue
+            for edge_start in range(max_es + 1):
+                n = min(bv_flip.size, seg_edges.size - edge_start, max_pairs_per_fit)
+                if n < min_pairs_eff:
+                    continue
 
-            err = (a * t_bv + b) - t_hp
-            rmse = float(np.sqrt(np.mean(err ** 2)))
+                t_bv = bv_flip[:n]
+                t_hp = seg_edges[edge_start:edge_start + n]
 
-            # --- NEW: MAP-like score with priors ---
-            # Use rmse^2 so units match variance terms.
-            rmse2 = rmse * rmse
+                a, b, _ = _fit_affine(t_bv, t_hp)
+                if not (slope_bounds[0] <= a <= slope_bounds[1]):
+                    continue
+                if abs(b) > b_abs_max:
+                    continue
 
-            # Guard sigma to avoid division issues if user passes 0
-            sig_b = max(float(b_prior_sigma), 1e-6)
-            sig_a = max(float(a_prior_sigma), 1e-6)
+                err = (a * t_bv + b) - t_hp
+                rmse = float(np.sqrt(np.mean(err ** 2)))
 
-            z_b = (b - float(b_prior)) / sig_b
-            z_a = (a - float(a_prior)) / sig_a
+                # Score: prioritize small RMSE; optionally add priors to break periodic ties
+                score = rmse * rmse
+                if use_b_prior:
+                    sigb = max(float(b_prior_sigma), 1e-6)
+                    zb = (b - float(b_prior)) / sigb
+                    score += float(prior_strength_b) * (zb * zb)
+                if use_a_prior:
+                    siga = max(float(a_prior_sigma), 1e-6)
+                    za = (a - float(a_prior)) / siga
+                    score += float(prior_strength_a) * (za * za)
 
-            score = rmse2 + float(prior_strength_b) * (z_b * z_b) + float(prior_strength_a) * (z_a * z_a)
-
-            candidates.append(
-                dict(
-                    phase=phase,
-                    edge_start=edge_start,
-                    a=a,
-                    b=b,
-                    rmse=rmse,
-                    n=n,
-                    score=score,
-                    z_b=z_b,
-                    z_a=z_a,
+                cands.append(
+                    dict(
+                        phase=int(phase),
+                        edge_start=int(edge_start),
+                        a=float(a),
+                        b=float(b),
+                        rmse=float(rmse),
+                        n=int(n),
+                        score=float(score),
+                        seg_start=float(seg_edges[0]),
+                        seg_len=int(seg_edges.size),
+                    )
                 )
-            )
+        return cands
 
-    if not candidates:
+    # Evaluate segments. Strategy:
+    # - prefer segments that start early and are long, BUT only if they yield valid candidates.
+    # We'll compute candidates per segment and then select globally among "good" candidates.
+    all_candidates: List[Dict[str, Any]] = []
+    for seg in segments:
+        all_candidates.extend(_candidates_for_segment(seg))
+
+    if not all_candidates:
         raise RuntimeError(
-            "No valid candidates in frame-modclass fallback (edges). "
-            "Likely wrong modulo_frames, poor edge detection, or mismatched photodiode.pkl."
+            "No valid candidates in frame-modclass fallback (edges) after dropout segmentation.\n"
+            f"Edge QC: n_edges={seg_meta.get('n_edges')}, median_dt={seg_meta.get('median_dt'):.3f}, "
+            f"n_gaps={seg_meta.get('n_gaps')}, max_gap_s={seg_meta.get('max_gap_s'):.3f}\n"
+            f"Segments kept: starts={seg_meta.get('segment_starts')}, lengths={seg_meta.get('segment_lengths')}\n"
+            "Likely causes: wrong modulo_frames, poor BV flip definition (Frame%modulo), "
+            "b_abs_max too small, or photodiode.pkl mismatched."
         )
 
-    best_rmse = min(c["rmse"] for c in candidates)
-    max_n = max(c["n"] for c in candidates)
+    # Filter to "good" set using your existing rmse_tol and n_frac logic,
+    # but apply those AFTER gathering across segments.
+    best_rmse = min(c["rmse"] for c in all_candidates)
+    max_n = max(c["n"] for c in all_candidates)
 
-    # Keep only near-best RMSE and high-n candidates, plus the absolute b bound.
     good = [
-        c for c in candidates
+        c for c in all_candidates
         if c["rmse"] <= best_rmse * (1.0 + rmse_tol)
         and c["n"] >= int(max_n * n_frac)
         and abs(c["b"]) <= b_abs_max
     ]
 
     if not good:
-        top = sorted(candidates, key=lambda c: c["rmse"])[:5]
+        # Keep the best few for diagnostics
+        top = sorted(all_candidates, key=lambda c: c["rmse"])[:8]
         msg = (
-            "No valid candidates in frame-modclass fallback (edges) AFTER enforcing constraints.\n"
-            f"Constraints: b_abs_max={b_abs_max}, slope_bounds={slope_bounds}, min_pairs={min_pairs_eff}, "
-            f"rmse_tol={rmse_tol}, n_frac={n_frac}\n"
-            f"Priors: b_prior={b_prior:.3f}±{b_prior_sigma:.3f}s, a_prior={a_prior:.6f}±{a_prior_sigma:.6f}\n"
+            "No valid candidates after applying rmse/n filters.\n"
+            f"Constraints: slope_bounds={slope_bounds}, b_abs_max={b_abs_max}, "
+            f"rmse_tol={rmse_tol}, n_frac={n_frac}, min_pairs={min_pairs}\n"
+            f"Edge QC: n_edges={seg_meta.get('n_edges')}, median_dt={seg_meta.get('median_dt'):.3f}, "
+            f"n_gaps={seg_meta.get('n_gaps')}, max_gap_s={seg_meta.get('max_gap_s'):.3f}\n"
             "Top candidates by RMSE:\n"
             + "\n".join(
-                f"  rmse={c['rmse']:.4f}s score={c.get('score', float('nan')):.3f} "
-                f"a={c['a']:.6f} b={c['b']:.3f}s z_b={c.get('z_b', float('nan')):.2f} "
-                f"phase={c['phase']} edge_start={c['edge_start']} n={c['n']}"
+                f"  rmse={c['rmse']:.4f}s score={c['score']:.3f} a={c['a']:.6f} b={c['b']:.3f}s "
+                f"phase={c['phase']} edge_start={c['edge_start']} n={c['n']} "
+                f"(seg_start={c['seg_start']:.3f}, seg_len={c['seg_len']})"
                 for c in top
             )
         )
         raise RuntimeError(msg)
 
-    # --- NEW: choose best by MAP score, with a reasonable tie-break ---
-    # Primary: score (includes b prior)
-    # Secondary: rmse
-    # Tertiary: earliest edge_start
-    good.sort(key=lambda c: (c["score"], c["rmse"], c["edge_start"]))
+    # Final selection:
+    # - Primary: score (RMSE + priors)
+    # - Secondary: edge_start (prefer earlier pairing *within the chosen segment*)
+    # - Tertiary: segment start time (prefer earlier segments)
+    # - Quaternary: rmse
+    good.sort(key=lambda c: (c["seg_start"], c["score"], c["edge_start"], c["rmse"]))
     best = good[0]
     return best["a"], best["b"], best["phase"], best["edge_start"], best["n"], best["rmse"]
+
+
+# =============================================================================
+# Optional: tighten your HARP edge extraction by rejecting obvious non-1Hz segments
+# (Not required, but pairs nicely with dropout handling.)
+# =============================================================================
+def _edge_train_qc_summary(harp_edge_s: np.ndarray) -> Dict[str, Any]:
+    edges = np.asarray(harp_edge_s, float)
+    edges = np.sort(edges)
+    if edges.size < 5:
+        return dict(n_edges=int(edges.size))
+    dt = np.diff(edges)
+    return dict(
+        n_edges=int(edges.size),
+        median_dt=float(np.median(dt)),
+        p95_dt=float(np.percentile(dt, 95)),
+        max_dt=float(np.max(dt)),
+    )
 
