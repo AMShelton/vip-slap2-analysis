@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Literal
 
 import numpy as np
 import h5py
@@ -13,6 +13,155 @@ from vip_slap2_analysis.io.matv73 import MatV73File, bytes_to_str
 
 ChannelSpec = Union[None, int, str, Sequence[Union[int, str]]]
 
+
+@dataclass
+class UnmixResult:
+    ca_unmixed: np.ndarray      # (n_rois, n_samples)
+    beta: np.ndarray            # (n_rois,)
+    intercept: np.ndarray       # (n_rois,)
+    method: str
+
+
+@dataclass
+class DffResult:
+    dff: np.ndarray             # (n_rois, n_samples)
+    baseline: np.ndarray        # (n_rois, n_samples)
+    method: str
+
+
+def _nan_pad_artifacts_by_diff(
+    x: np.ndarray,
+    std_factor: float = 20.0,
+    nan_pad: int = 10,
+) -> np.ndarray:
+    """
+    Port of ExperimentSummary.process_ca_trace artifact masking:
+    detect big jumps in diff(x) and NaN-pad around them.
+    """
+    x = np.asarray(x, float).copy()
+    x[np.isinf(x)] = np.nan
+    if x.ndim != 1:
+        raise ValueError("_nan_pad_artifacts_by_diff expects 1D trace")
+
+    d = np.diff(x)
+    thresh = np.nanmedian(d) + std_factor * np.nanstd(d)
+
+    y = x.copy()
+    for i in range(1, len(d) - 1):
+        if np.abs(d[i]) > thresh:
+            a = max(0, i - nan_pad)
+            b = min(len(y), i + nan_pad)
+            y[a:b] = np.nan
+    return y
+
+
+def _moving_average_reflect(x: np.ndarray, win: int) -> np.ndarray:
+    x = np.asarray(x, float)
+    if win <= 1:
+        return x.copy()
+    if win % 2 == 0:
+        win += 1
+    pad = win // 2
+    xp = np.pad(x, (pad, pad), mode="reflect")
+    c = np.cumsum(np.insert(xp, 0, 0.0))
+    return (c[win:] - c[:-win]) / win
+
+
+def _baseline_percentile_filter(
+    x: np.ndarray,
+    fs_hz: float,
+    window_s: float = 4.0,
+    q: float = 10.0,
+    smooth_s: float = 1.0,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """
+    Practical stand-in for "compute_f0(... hull_window ... denoise_window ...)".
+    Uses a percentile filter to follow the lower envelope + optional smoothing.
+    """
+    x = np.asarray(x, float)
+    n = x.size
+    win = max(3, int(round(window_s * fs_hz)))
+    if win % 2 == 0:
+        win += 1
+
+    # fill NaNs for filtering, but preserve mask later
+    if np.isfinite(x).any():
+        fill = np.nanmedian(x)
+    else:
+        fill = 0.0
+    xf = x.copy()
+    xf[~np.isfinite(xf)] = fill
+
+    try:
+        from scipy.ndimage import percentile_filter
+        base = percentile_filter(xf, percentile=q, size=win, mode="reflect")
+    except Exception:
+        # fallback: coarse baseline via moving average
+        base = _moving_average_reflect(xf, win)
+
+    # optional smoothing of baseline
+    smooth = max(1, int(round(smooth_s * fs_hz)))
+    base = _moving_average_reflect(base, smooth)
+
+    return np.maximum(base, eps)
+
+
+def unmix_ca_with_glu_hp_regress(
+    ca: np.ndarray,
+    glu: np.ndarray,
+    fs_hz: float,
+    hp_window_s: float = 0.2,
+    ridge: float = 1e-6,
+    min_finite_frac: float = 0.5,
+) -> UnmixResult:
+    """
+    Remove glutamate-shaped contamination from Ca by fitting on high-pass components:
+      ca_hp ≈ beta * glu_hp + intercept
+    then subtract beta*glu from raw ca.
+    """
+    ca = np.asarray(ca, float)
+    glu = np.asarray(glu, float)
+    if ca.shape != glu.shape or ca.ndim != 2:
+        raise ValueError("ca and glu must be (n_rois, n_samples) and match shape")
+
+    n_rois, n = ca.shape
+    win = max(3, int(round(hp_window_s * fs_hz)))
+    if win % 2 == 0:
+        win += 1
+
+    beta = np.full(n_rois, np.nan)
+    intercept = np.full(n_rois, np.nan)
+    out = ca.copy()
+
+    for i in range(n_rois):
+        ca_i = ca[i]
+        glu_i = glu[i]
+        finite = np.isfinite(ca_i) & np.isfinite(glu_i)
+        if finite.mean() < min_finite_frac:
+            continue
+
+        ca_f = ca_i.copy()
+        glu_f = glu_i.copy()
+        ca_f[~np.isfinite(ca_f)] = np.nanmedian(ca_f[finite])
+        glu_f[~np.isfinite(glu_f)] = np.nanmedian(glu_f[finite])
+
+        ca_hp = ca_f - _moving_average_reflect(ca_f, win)
+        glu_hp = glu_f - _moving_average_reflect(glu_f, win)
+
+        x = glu_hp[finite]
+        y = ca_hp[finite]
+        X = np.vstack([x, np.ones_like(x)]).T
+        A = X.T @ X
+        A[0, 0] += ridge
+        b = X.T @ y
+        b0, b1 = np.linalg.solve(A, b)
+
+        beta[i] = b0
+        intercept[i] = b1
+        out[i, finite] = ca_i[finite] - beta[i] * glu_i[finite]
+
+    return UnmixResult(out, beta, intercept, method="hp_regress")
 
 def _as_1d_bool(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x).astype(bool).squeeze()
@@ -805,3 +954,296 @@ class GlutamateSummary:
         if not np.isfinite(hz) or hz <= 0:
             return np.arange(n, dtype=float)
         return np.arange(n, dtype=float) / hz
+    
+    def get_soma_glu_ca_traces(
+        self,
+        dmd: int = 1,
+        trial: int = 1,
+        trace_type: str = "Fsvd",
+        roi_inds: Optional[Sequence[int]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Convenience loader for somatic user ROI traces.
+        Returns (glu, ca) each shaped (n_rois, n_samples).
+        """
+        glu = self.get_user_roi_traces(
+            dmd=dmd, trial=trial, trace_type=trace_type,
+            channels="glutamate", roi_inds=roi_inds, squeeze_channels=True
+        )
+        ca = self.get_user_roi_traces(
+            dmd=dmd, trial=trial, trace_type=trace_type,
+            channels="calcium", roi_inds=roi_inds, squeeze_channels=True
+        )
+        return np.asarray(glu, float), np.asarray(ca, float)
+
+    def process_ca_trace_extended(
+        self,
+        ca: np.ndarray,
+        fs_hz: float,
+        glu: Optional[np.ndarray] = None,
+        *,
+        # artifact masking (ported)
+        mask_artifacts: bool = True,
+        std_factor: float = 20.0,
+        nan_pad: int = 10,
+        # unmixing
+        unmix: bool = True,
+        hp_window_s: float = 0.2,
+        ridge: float = 1e-6,
+        # baseline + dff
+        compute_dff: bool = True,
+        baseline_window_s: float = 4.0,
+        baseline_q: float = 10.0,
+        baseline_smooth_s: float = 1.0,
+        eps: float = 1e-6,
+    ) -> Dict[str, Any]:
+        """
+        Extended Ca processing:
+          (optional) artifact masking
+          (optional) unmix Ca using Glu
+          (optional) baseline + dF/F
+        Inputs:
+          ca: (n_rois, n_samples)
+          glu: (n_rois, n_samples) if unmixing
+        """
+        ca = np.asarray(ca, float)
+        if ca.ndim != 2:
+            raise ValueError("ca must be (n_rois, n_samples)")
+
+        n_rois, n = ca.shape
+
+        # 1) artifact masking (per ROI)
+        ca_clean = ca.copy()
+        if mask_artifacts:
+            for i in range(n_rois):
+                if np.isfinite(ca_clean[i]).any():
+                    ca_clean[i] = _nan_pad_artifacts_by_diff(
+                        ca_clean[i], std_factor=std_factor, nan_pad=nan_pad
+                    )
+
+        # 2) unmixing
+        unmix_res: Optional[UnmixResult] = None
+        ca_unmixed = ca_clean
+        if unmix:
+            if glu is None:
+                raise ValueError("glu must be provided when unmix=True")
+            glu = np.asarray(glu, float)
+            if glu.shape != ca.shape:
+                raise ValueError(f"glu must match ca shape; got {glu.shape} vs {ca.shape}")
+            unmix_res = unmix_ca_with_glu_hp_regress(
+                ca=ca_clean, glu=glu, fs_hz=fs_hz,
+                hp_window_s=hp_window_s, ridge=ridge
+            )
+            ca_unmixed = unmix_res.ca_unmixed
+
+        # 3) baseline + dF/F
+        dff_res: Optional[DffResult] = None
+        if compute_dff:
+            baseline = np.full_like(ca_unmixed, np.nan)
+            dff = np.full_like(ca_unmixed, np.nan)
+            for i in range(n_rois):
+                xi = ca_unmixed[i]
+                finite = np.isfinite(xi)
+                if finite.mean() < 0.5:
+                    continue
+                base = _baseline_percentile_filter(
+                    xi, fs_hz=fs_hz,
+                    window_s=baseline_window_s,
+                    q=baseline_q,
+                    smooth_s=baseline_smooth_s,
+                    eps=eps
+                )
+                baseline[i] = base
+                dff[i, finite] = (xi[finite] - base[finite]) / base[finite]
+            dff_res = DffResult(dff=dff, baseline=baseline, method="percentile_filter")
+
+        return {
+            "ca_clean": ca_clean,
+            "unmix": unmix_res,
+            "ca_unmixed": ca_unmixed,
+            "dff": dff_res,
+        }
+
+    def get_processed_soma_ca(
+        self,
+        dmd: int = 1,
+        trial: int = 1,
+        trace_type: str = "Fsvd",
+        roi_inds: Optional[Sequence[int]] = None,
+        fs_hz: Optional[float] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Loads soma ROI Glu/Ca traces from the summary file and runs processing.
+        """
+        if fs_hz is None:
+            fs_hz = float(self.metadata.get("analyzeHz", np.nan))
+        if not np.isfinite(fs_hz) or fs_hz <= 0:
+            raise ValueError("fs_hz must be provided or present in metadata['analyzeHz'].")
+
+        glu, ca = self.get_soma_glu_ca_traces(dmd=dmd, trial=trial, trace_type=trace_type, roi_inds=roi_inds)
+        return self.process_ca_trace_extended(ca=ca, glu=glu, fs_hz=fs_hz, **kwargs)
+    
+    def _first_valid_trial(self, dmd0: int) -> Optional[int]:
+        """Return 0-based trial index of first valid trial for this DMD, else None."""
+        v = np.argwhere(self.keep_trials[dmd0])
+        if v.size == 0:
+            return None
+        return int(v[0, 0])
+
+    def _ref_trial_shape_user_rois(
+        self,
+        dmd: int,
+        trace_type: str = "Fsvd",
+        roi_inds: Optional[Sequence[int]] = None,
+    ) -> Tuple[int, int]:
+        """
+        Determine (n_rois, n_time) from the first valid trial.
+        """
+        dmd0 = dmd - 1
+        t0 = self._first_valid_trial(dmd0)
+        if t0 is None:
+            raise ValueError(f"No valid trials found for dmd={dmd}")
+
+        x = self.get_user_roi_traces(dmd=dmd, trial=t0 + 1, trace_type=trace_type, roi_inds=roi_inds)
+        # x is (n_rois, n_ch, n_time) or (n_rois, n_time) if squeeze_channels True (not used here)
+        if x.ndim == 3:
+            n_rois = x.shape[0]
+            n_time = x.shape[2]
+        elif x.ndim == 2:
+            n_rois = x.shape[0]
+            n_time = x.shape[1]
+        else:
+            raise ValueError(f"Unexpected user ROI trace shape: {x.shape}")
+        return int(n_rois), int(n_time)
+
+    def get_processed_soma_ca_all_trials(
+        self,
+        dmd: int = 1,
+        trace_type: str = "Fsvd",
+        roi_inds: Optional[Sequence[int]] = None,
+        fs_hz: Optional[float] = None,
+        pad_to: Literal["ref", "max_valid", "none"] = "ref",
+        include_invalid: bool = True,
+        **proc_kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Compute Ca processing (unmix + baseline + dF/F) across ALL trials.
+
+        Returns dict with arrays shaped:
+          - if pad_to != "none": (n_trials, n_rois, Tpad)
+          - if pad_to == "none": list length n_trials, each element (n_rois, T_trial) or None for invalid
+
+        Invalid trials:
+          - if include_invalid=True: filled with NaNs
+          - else: left as None (pad_to must be "none" in that case)
+
+        proc_kwargs are forwarded to process_ca_trace_extended().
+        """
+        if fs_hz is None:
+            fs_hz = float(self.metadata.get("analyzeHz", np.nan))
+        if not np.isfinite(fs_hz) or fs_hz <= 0:
+            raise ValueError("fs_hz must be provided or present as metadata['analyzeHz'].")
+
+        n_rois_ref, T_ref = self._ref_trial_shape_user_rois(dmd=dmd, trace_type=trace_type, roi_inds=roi_inds)
+
+        # Determine pad length
+        if pad_to == "ref":
+            Tpad = T_ref
+        elif pad_to == "max_valid":
+            Ts = []
+            for tr in range(1, self.n_trials + 1):
+                if self.keep_trials[dmd - 1, tr - 1]:
+                    x = self.get_user_roi_traces(dmd=dmd, trial=tr, trace_type=trace_type, roi_inds=roi_inds)
+                    T = x.shape[2] if x.ndim == 3 else x.shape[1]
+                    Ts.append(int(T))
+            Tpad = max(Ts) if Ts else T_ref
+        elif pad_to == "none":
+            Tpad = -1
+        else:
+            raise ValueError(f"pad_to must be 'ref', 'max_valid', or 'none'. Got: {pad_to}")
+
+        # Allocate outputs
+        if pad_to == "none":
+            ca_clean_list = [None] * self.n_trials
+            ca_unmixed_list = [None] * self.n_trials
+            baseline_list = [None] * self.n_trials
+            dff_list = [None] * self.n_trials
+            beta = np.full((self.n_trials, n_rois_ref), np.nan)
+        else:
+            ca_clean = np.full((self.n_trials, n_rois_ref, Tpad), np.nan, dtype=float)
+            ca_unmixed = np.full((self.n_trials, n_rois_ref, Tpad), np.nan, dtype=float)
+            baseline = np.full((self.n_trials, n_rois_ref, Tpad), np.nan, dtype=float)
+            dff = np.full((self.n_trials, n_rois_ref, Tpad), np.nan, dtype=float)
+            beta = np.full((self.n_trials, n_rois_ref), np.nan, dtype=float)
+
+        # Loop trials
+        for tr in range(1, self.n_trials + 1):
+            valid = bool(self.keep_trials[dmd - 1, tr - 1])
+
+            if not valid:
+                if not include_invalid:
+                    if pad_to != "none":
+                        raise ValueError("include_invalid=False requires pad_to='none' (so invalid can be None).")
+                    continue
+                # else: leave NaNs (already)
+                continue
+
+            # Load traces for this trial
+            glu, ca = self.get_soma_glu_ca_traces(
+                dmd=dmd, trial=tr, trace_type=trace_type, roi_inds=roi_inds
+            )  # both (n_rois, T_trial)
+
+            # Safety: ROI count must match reference (or be a subset)
+            if glu.shape[0] != n_rois_ref:
+                # If roi_inds was passed, this should match; otherwise something inconsistent is happening.
+                # We'll handle by truncating/padding ROI axis conservatively.
+                n_use = min(glu.shape[0], n_rois_ref)
+                glu = glu[:n_use]
+                ca = ca[:n_use]
+
+            out = self.process_ca_trace_extended(ca=ca, glu=glu, fs_hz=fs_hz, **proc_kwargs)
+
+            ca_clean_tr = out["ca_clean"]
+            ca_unmixed_tr = out["ca_unmixed"]
+            dff_tr = out["dff"].dff if out["dff"] is not None else None
+            base_tr = out["dff"].baseline if out["dff"] is not None else None
+            beta_tr = out["unmix"].beta if out["unmix"] is not None else None
+
+            if pad_to == "none":
+                ca_clean_list[tr - 1] = ca_clean_tr
+                ca_unmixed_list[tr - 1] = ca_unmixed_tr
+                baseline_list[tr - 1] = base_tr
+                dff_list[tr - 1] = dff_tr
+                if beta_tr is not None:
+                    beta[tr - 1, : beta_tr.shape[0]] = beta_tr
+            else:
+                Ttr = ca_clean_tr.shape[1]
+                tcopy = min(Ttr, Tpad)
+                rcopy = min(ca_clean_tr.shape[0], n_rois_ref)
+
+                ca_clean[tr - 1, :rcopy, :tcopy] = ca_clean_tr[:rcopy, :tcopy]
+                ca_unmixed[tr - 1, :rcopy, :tcopy] = ca_unmixed_tr[:rcopy, :tcopy]
+                if base_tr is not None:
+                    baseline[tr - 1, :rcopy, :tcopy] = base_tr[:rcopy, :tcopy]
+                if dff_tr is not None:
+                    dff[tr - 1, :rcopy, :tcopy] = dff_tr[:rcopy, :tcopy]
+                if beta_tr is not None:
+                    beta[tr - 1, :rcopy] = beta_tr[:rcopy]
+
+        if pad_to == "none":
+            return {
+                "ca_clean": ca_clean_list,
+                "ca_unmixed": ca_unmixed_list,
+                "baseline": baseline_list,
+                "dff": dff_list,
+                "beta": beta,
+            }
+
+        return {
+            "ca_clean": ca_clean,
+            "ca_unmixed": ca_unmixed,
+            "baseline": baseline,
+            "dff": dff,
+            "beta": beta,
+        }
