@@ -232,8 +232,16 @@ def classify_top_level_metadata(path: Path) -> Optional[Tuple[str, str]]:
 def route_behavior_tree(path: Path, names: SessionNames, raw_root: Path) -> Path:
     """
     Move behavior-related content into raw_root / behavior or behavior-videos.
+    Avoid re-nesting canonical directories that are already top-level.
     """
     lower = path.name.lower()
+
+    # Canonical directories should remain canonical
+    if path.is_dir() and path.name == "behavior":
+        return raw_root / "behavior"
+
+    if path.is_dir() and path.name == "behavior-videos":
+        return raw_root / "behavior-videos"
 
     if path.is_dir() and lower.endswith(".harp"):
         return raw_root / "behavior" / names.harp_dir_name
@@ -255,61 +263,92 @@ def route_behavior_tree(path: Path, names: SessionNames, raw_root: Path) -> Path
 
 def route_slap2_content(src: Path, slap2_root: Path, processed_root: Path, raw_root: Path) -> Tuple[Path, str, str]:
     """
-    Returns (dst, reason, category)
+    Route files from a SLAP2 tree into:
+      - raw_root/slap2/...                  for raw acquisition / metadata
+      - processed_root/motion_correction    for alignment outputs
+      - processed_root/source_extraction    for ROI/source extraction outputs
+      - processed_root                      for trialTable.*
     """
     rel = src.relative_to(slap2_root)
-    parts_lower = [p.lower() for p in rel.parts]
     name = src.name
     name_lower = name.lower()
+    parts_lower = [p.lower() for p in rel.parts]
 
-    # Raw-ish acquisition/reference content
-    if "reference" in parts_lower or name_lower.startswith("reference"):
-        return raw_root / "imaging_data" / "SLAP2_data" / rel, "reference stack / reference content", "raw"
+    raw_slap2_root = raw_root / "slap2"
 
-    if name_lower.endswith((".meta", ".cfg", ".ini", ".log")):
-        return raw_root / "imaging_data" / "SLAP2_data" / rel, "acquisition sidecar/log/config", "raw"
+    # ------------------------------------------------------------------
+    # Raw: explicitly preserved raw acquisition/reference images
+    # ------------------------------------------------------------------
+    if name_lower == "localvasculature.tif":
+        return (
+            raw_slap2_root / rel,
+            "local vasculature image",
+            "raw",
+        )
 
-    if name_lower.endswith((".bin", ".dat", ".raw", ".tif", ".tiff")) and "motion_correction" not in parts_lower:
-        return raw_root / "imaging_data" / "SLAP2_data" / rel, "raw binary/image acquisition content", "raw"
+    # ------------------------------------------------------------------
+    # Processed: motion correction
+    # ------------------------------------------------------------------
+    if name.endswith("_ALIGNMENTDATA.mat"):
+        return (
+            processed_root / "motion_correction" / name,
+            "alignment output",
+            "processed",
+        )
 
-    # Explicit processed outputs
-    if "motion_correction" in parts_lower:
-        idx = parts_lower.index("motion_correction")
-        tail = rel.parts[idx + 1:]
-        return processed_root / "motion_correction" / Path(*tail), "motion correction output", "processed"
-
-    if "source_extraction" in parts_lower:
-        idx = parts_lower.index("source_extraction")
-        tail = rel.parts[idx + 1:]
-        return processed_root / "source_extraction" / Path(*tail), "source extraction output", "processed"
+    # ------------------------------------------------------------------
+    # Processed: source extraction
+    # ------------------------------------------------------------------
+    if name == "ANNOTATIONS.mat":
+        return (
+            processed_root / "source_extraction" / name,
+            "annotation file",
+            "processed",
+        )
 
     if "experimentsummary" in parts_lower:
         idx = parts_lower.index("experimentsummary")
-        tail = rel.parts[idx + 1:]
-        return processed_root / "source_extraction" / "ExperimentSummary" / Path(*tail), "ExperimentSummary output", "processed"
+        tail = rel.parts[idx + 1 :]
+        return (
+            processed_root / "source_extraction" / "ExperimentSummary" / Path(*tail),
+            "ExperimentSummary output",
+            "processed",
+        )
 
-    if DMD_FILE_RE.match(name):
-        return processed_root / "motion_correction" / name, "DMD-aligned processed file", "processed"
-
-    if name == "ANNOTATIONS.mat":
-        return processed_root / "source_extraction" / name, "annotation file", "processed"
-
-    if name_lower.startswith("trialtable."):
-        return processed_root / name, "trial table", "processed"
-
-    # MATLAB summaries / output mats
-    if name_lower.endswith(".mat") and (
-        "summary" in name_lower
-        or "roi" in name_lower
-        or "extract" in name_lower
-        or "trace" in name_lower
-        or "annotation" in name_lower
+    if (
+        name_lower.endswith(".mat")
+        and (
+            "summary" in name_lower
+            or "extract" in name_lower
+            or "trace" in name_lower
+            or "roi" in name_lower
+        )
+        and "_alignmentdata.mat" not in name_lower
     ):
-        return processed_root / "source_extraction" / name, "processed matlab output", "processed"
+        return (
+            processed_root / "source_extraction" / name,
+            "source extraction matlab output",
+            "processed",
+        )
 
-    # Fallback backup
-    return processed_root / "unclassified_from_slap2" / rel, "unclassified slap2 content", "processed"
+    # ------------------------------------------------------------------
+    # Processed: trial table
+    # ------------------------------------------------------------------
+    if name_lower.startswith("trialtable."):
+        return (
+            processed_root / name,
+            "trial table",
+            "processed",
+        )
 
+    # ------------------------------------------------------------------
+    # Everything else in the slap2 tree is raw
+    # ------------------------------------------------------------------
+    return (
+        raw_slap2_root / rel,
+        "raw SLAP2 acquisition / metadata content",
+        "raw",
+    )
 
 def build_reorganization_plan(
     target_session_dir: Path,
@@ -332,6 +371,8 @@ def build_reorganization_plan(
         backup_root=backup_root,
     )
 
+
+
     if raw_root.exists() and raw_root.resolve() != target_session_dir.resolve():
         plan.warnings.append(f"Raw root already exists: {raw_root}")
     if processed_root.exists():
@@ -342,6 +383,16 @@ def build_reorganization_plan(
     # Top-level organization from current target session dir
     for child in iter_immediate_children(target_session_dir):
         if child.name in {processed_root.name, backup_root.name}:
+            continue
+
+        if child.name == "ANNOTATIONS.mat":
+            dst = processed_root / "source_extraction" / child.name
+            plan.add(child, dst, "top-level annotation file", "processed")
+            continue
+
+        if child.name == "ExperimentSummary" and child.is_dir():
+            dst = processed_root / "source_extraction" / "ExperimentSummary"
+            plan.add(child, dst, "top-level ExperimentSummary directory", "processed")
             continue
 
         # Keep current target session dir as the eventual raw root name;
@@ -366,66 +417,42 @@ def build_reorganization_plan(
             or "video" in child_lower
             or "camera" in child_lower
         ):
+            # If these are already the canonical top-level raw folders, leave them alone.
+            if child.is_dir() and child.name in {"behavior", "behavior-videos"}:
+                continue
+
             dst = route_behavior_tree(child, names, raw_root)
+
+            # Do not allow moves where destination is inside source
+            try:
+                dst.relative_to(child)
+                plan.warnings.append(
+                    f"Skipping nested move for behavior content already effectively in place: {child} -> {dst}"
+                )
+                continue
+            except Exception:
+                pass
+
             if child.resolve() != dst.resolve():
                 plan.add(child, dst, "behavior-related content", "raw")
             continue
 
-        # Imaging content
-        if child.name == "imaging_data":
-            imaging_root = child
-            slap2_root = find_first_existing(
-                [
-                    imaging_root / "SLAP2_data",
-                    imaging_root / "slap2_data",
-                ]
-            )
-
-            if slap2_root is None:
-                # Keep the whole imaging tree in raw if structure is unusual
-                dst = raw_root / child.name
-                if child.resolve() != dst.resolve():
-                    plan.add(child, dst, "unparsed imaging_data tree kept as raw", "raw")
-                continue
-
-            # Move everything under imaging_data except processed SLAP2 products
-            # We recurse only one level down from SLAP2_data and then finer below.
-            for p in slap2_root.rglob("*"):
+        # Top-level SLAP2 content
+        if child.name.lower() == "slap2":
+            for p in child.rglob("*"):
                 if p.is_dir():
                     continue
-                # Determine route based on its nearest slap2_* ancestor if present
-                slap2_ancestor = None
-                for anc in [p.parent, *p.parents]:
-                    if anc == slap2_root.parent.parent:
-                        break
-                    if anc.name.lower().startswith("slap2_"):
-                        slap2_ancestor = anc
-                        break
 
-                if slap2_ancestor is not None:
-                    dst, reason, category = route_slap2_content(
-                        src=p,
-                        slap2_root=slap2_root,
-                        processed_root=processed_root,
-                        raw_root=raw_root,
-                    )
-                else:
-                    # non-slap2 files under imaging_data/SLAP2_data go to raw
-                    rel = p.relative_to(target_session_dir)
-                    dst = raw_root / rel
-                    reason = "non-slap2 imaging content"
-                    category = "raw"
+                dst, reason, category = route_slap2_content(
+                    src=p,
+                    slap2_root=child,
+                    processed_root=processed_root,
+                    raw_root=raw_root,
+                )
 
                 if p.resolve() != dst.resolve():
                     plan.add(p, dst, reason, category)
 
-            # Also handle any non-SLAP2_data content within imaging_data by keeping it raw
-            for p in imaging_root.iterdir():
-                if p.name.lower() in {"slap2_data", "slap2_data"}:
-                    continue
-                dst = raw_root / "imaging_data" / p.name
-                if p.resolve() != dst.resolve():
-                    plan.add(p, dst, "non-SLAP2 imaging tree", "raw")
             continue
 
         # Known loose processed files at top level
@@ -484,11 +511,10 @@ def validate_plan(plan: ReorgPlan) -> List[str]:
         try:
             rec.dst.relative_to(rec.src)
             errors.append(f"Destination is inside source for move: {rec.src} -> {rec.dst}")
-        except Exception:
+        except ValueError:
             pass
 
     return errors
-
 
 def find_duplicates(paths: Sequence[Path]) -> List[str]:
     seen: Dict[Path, int] = {}
@@ -506,7 +532,7 @@ def create_destination_roots(plan: ReorgPlan, execute: bool) -> None:
         plan.raw_root,
         plan.raw_root / "behavior",
         plan.raw_root / "behavior-videos",
-        plan.raw_root / "imaging_data" / "SLAP2_data",
+        plan.raw_root / "slap2",
         plan.processed_root,
         plan.processed_root / "motion_correction",
         plan.processed_root / "source_extraction",
