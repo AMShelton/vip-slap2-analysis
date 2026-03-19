@@ -371,8 +371,6 @@ def build_reorganization_plan(
         backup_root=backup_root,
     )
 
-
-
     if raw_root.exists() and raw_root.resolve() != target_session_dir.resolve():
         plan.warnings.append(f"Raw root already exists: {raw_root}")
     if processed_root.exists():
