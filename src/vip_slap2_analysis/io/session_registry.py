@@ -22,7 +22,7 @@ def _find_one(base: Path, pattern: str) -> Optional[Path]:
     if matches:
         return Path(max(matches, key=os.path.getmtime))
     else:
-        None
+        return None
 
 
 @dataclass
