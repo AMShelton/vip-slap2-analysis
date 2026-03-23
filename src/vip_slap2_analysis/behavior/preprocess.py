@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import glob
 import json
@@ -6,49 +8,271 @@ import pandas as pd
 from pathlib import Path
 import matplotlib.pyplot as plt
 from read_harp import HarpReader
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from scipy.signal import medfilt
 from typing import Optional, Tuple, Dict, Any, List,Union
 
-def process_harp_sessions(harp_root_dir, save=True, overwrite=False):
-    """
-    Process all subdirectories in `harp_root_dir` that contain HARP binary data.
+from .io import (
+    BehaviorPaths,
+    ensure_harp_extracted,
+    load_bonsai_df,
+    load_harp_df,
+    load_photodiode_df,
+    resolve_behavior_paths,
+    save_epochs_csv,
+)
+from .validation import (
+    audit_event_coverage,
+    validate_bonsai_event_log,
+    validate_harp_data,
+)
+from .epochs import (
+    detect_epochs_adaptive,
+    epochs_to_dataframe,
+    shift_epochs_to_photodiode_time,
+    summarize_epochs,
+)
+@dataclass
+class BehaviorProcessingResult:
+    paths: BehaviorPaths
+    bonsai_validation: Dict[str, Any]
+    harp_validation: Dict[str, Any]
+    alignment_meta: Dict[str, Any]
+    epochs_summary: Dict[str, Any]
+    event_coverage: Dict[str, Any]
+    ready_for_physiology_extraction: bool
+    status: str = "success"
+    failure_stage: Optional[str] = None
+    failure_reasons: Optional[List[str]] = None
 
-    Parameters:
-    -----------
-    harp_root_dir : str or Path
-        Path to the parent directory containing session folders.
-    save : bool
-        If True, saves .pkl files for encoder, photodiode, licks, and rewards.
-    overwrite : bool
-        If True, existing extracted files will be overwritten.
-    """
-    harp_root_dir = Path(harp_root_dir)
-    session_dirs = [d for d in harp_root_dir.iterdir() if d.is_dir()]
+def _write_behavior_failure_metadata(
+    paths: Path,
+    *,
+    status: str,
+    failure_stage: str,
+    failure_reasons: list[str],
+    bonsai_validation: dict | None = None,
+    harp_validation: dict | None = None,
+    alignment_meta: dict | None = None,
+    epochs_summary: dict | None = None,
+    event_coverage: dict | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    out = {
+        "schema_version": "0.1.0",
+        "status": status,
+        "failure_stage": failure_stage,
+        "failure_reasons": failure_reasons,
+        "ready_for_physiology_extraction": False,
+        "bonsai_validation": bonsai_validation or {},
+        "harp_validation": harp_validation or {},
+        "alignment": alignment_meta or {},
+        "epochs": epochs_summary or {},
+        "event_coverage": event_coverage or {},
+        "prepost_sec": (metadata or {}).get("prepost_sec", None),
+    }
 
-    for session in session_dirs:
-        try:
-            print(f"Processing {session}...")
-            reader = HarpReader(session)
-            extracted_dir = session / "extracted_files"
-            if extracted_dir.exists() and not overwrite:
-                print(f"→ Skipping {session.name}: already processed.")
-                continue
+    with open(Path(paths.qc_dir) / "behavior_validation.json", "w") as f:
+        json.dump(out, f, indent=2)
 
-            if save:
-                extracted_dir.mkdir(exist_ok=True)
-                reader.get_encoder.to_pickle(extracted_dir / 'encoder.pkl')
-                reader.get_photodiode.to_pickle(extracted_dir / 'photodiode.pkl')
-                reader.get_licks.to_pickle(extracted_dir / 'licks.pkl')
-                reader.get_rewards.to_pickle(extracted_dir / 'rewards.pkl')
-                print(f"→ Saved data to {extracted_dir}")
-            else:
-                print(reader.get_encoder.head())
-                print(reader.get_photodiode.head())
-                print(reader.get_licks.head())
-                print(reader.get_rewards.head())
-        except Exception as e:
-            print(f"❌ Error processing {session.name}: {e}")
+    return out
+
+def make_behavior_qc_plots(
+    harp_df: pd.DataFrame,
+    photodiode_df: pd.DataFrame,
+    epoch_df: pd.DataFrame,
+    out_dir: Path,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(10, 3))
+    ax.plot(harp_df["time"], harp_df["DI3"], lw=0.5)
+    for _, row in epoch_df.iterrows():
+        ax.axvspan(row["start_time"], row["end_time"], alpha=0.2)
+    ax.set_title("DI3 with detected imaging epochs")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("DI3")
+    fig.tight_layout()
+    fig.savefig(out_dir / "di3_epochs.png", dpi=200)
+    plt.close(fig)
+
+    pd_col = photodiode_df.columns[0]
+    fig, ax = plt.subplots(figsize=(10, 3))
+    ax.plot(photodiode_df.index, photodiode_df[pd_col], lw=0.5)
+    ax.set_title("Photodiode trace")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel(pd_col)
+    fig.tight_layout()
+    fig.savefig(out_dir / "photodiode_trace.png", dpi=200)
+    plt.close(fig)
+
+
+def process_behavior_session(
+    asset,
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+    overwrite_harp_extract: bool = False,
+    overwrite_alignment: bool = False,
+    save_corrected_in_place: bool = True,
+    min_epoch_duration: float = 6.0,
+    trial_gap_start: float = 0.02,
+    expected_trial_epoch_min: Optional[int] = None,
+    use_piecewise_warp: bool = True,
+) -> BehaviorProcessingResult:
+    metadata = metadata or {}
+    paths = resolve_behavior_paths(asset)
+
+    reuse_info = ensure_harp_extracted(
+        paths,
+        overwrite=overwrite_harp_extract,
+        harp_extract_fn=process_single_harp_session,
+    )
+
+    stim_df = load_bonsai_df(paths.bonsai_csv)
+    harp_df, acq_time = load_harp_df(paths.harp_dir)
+    photodiode_df = load_photodiode_df(paths.photodiode_pkl)
+
+    bonsai_validation = validate_bonsai_event_log(stim_df)
+    harp_validation = validate_harp_data(harp_df, photodiode_df)
+
+    if not bonsai_validation["passed"]:
+        _write_behavior_failure_metadata(
+            paths,
+            status="failed_validation",
+            failure_stage="bonsai_validation",
+            failure_reasons=bonsai_validation["warnings"],
+            bonsai_validation=bonsai_validation,
+            harp_validation={},
+            alignment_meta={},
+            epochs_summary={},
+            event_coverage={},
+            metadata=metadata,
+        )
+        return BehaviorProcessingResult(
+            paths=paths,
+            bonsai_validation=bonsai_validation,
+            harp_validation={},
+            alignment_meta={},
+            epochs_summary={},
+            event_coverage={},
+            ready_for_physiology_extraction=False,
+            status="failed_validation",
+            failure_stage="bonsai_validation",
+            failure_reasons=bonsai_validation["warnings"],
+        )
+
+    if not harp_validation["passed"]:
+        _write_behavior_failure_metadata(
+            paths,
+            status="failed_validation",
+            failure_stage="harp_validation",
+            failure_reasons=harp_validation["warnings"],
+            bonsai_validation=bonsai_validation,
+            harp_validation=harp_validation,
+            alignment_meta={},
+            epochs_summary={},
+            event_coverage={},
+            metadata=metadata,
+        )
+        return BehaviorProcessingResult(
+            paths=paths,
+            bonsai_validation=bonsai_validation,
+            harp_validation=harp_validation,
+            alignment_meta={},
+            epochs_summary={},
+            event_coverage={},
+            ready_for_physiology_extraction=False,
+            status="failed_validation",
+            failure_stage="harp_validation",
+            failure_reasons=harp_validation["warnings"],
+        )
+
+    already_corrected = "corrected_timestamps" in stim_df.columns
+    if already_corrected and not overwrite_alignment:
+        corrected_df = stim_df.copy()
+        alignment_meta = {
+            "alignment_method": "existing_corrected_timestamps",
+            "reused_existing_corrected_event_log": True,
+        }
+    else:
+        corrected_df, meta = correct_event_log(
+            paths.bonsai_csv,
+            paths.photodiode_pkl,
+            savepath=paths.corrected_bonsai_csv if save_corrected_in_place else None,
+            qc_dir=paths.qc_dir,
+            use_piecewise_warp=use_piecewise_warp,
+            insert_missing_first_stim_rows=True,
+        )
+        alignment_meta = asdict(meta)
+        alignment_meta["reused_existing_corrected_event_log"] = False
+
+        if not save_corrected_in_place:
+            corrected_path = paths.qc_dir / "bonsai_event_log_corrected.csv"
+            corrected_df.to_csv(corrected_path, index=False)
+            paths.corrected_bonsai_csv = corrected_path
+
+    acq_type = metadata.get("epochs_mode", "continuous")
+    epochs, gap_used = detect_epochs_adaptive(
+        harp_df,
+        acq_time,
+        acq_type=acq_type,
+        min_duration=min_epoch_duration,
+        gap_start=trial_gap_start,
+        target_min=expected_trial_epoch_min,
+    )
+    epochs = shift_epochs_to_photodiode_time(epochs, harp_df, photodiode_df)
+    epoch_df = epochs_to_dataframe(epochs)
+    save_epochs_csv(epoch_df, paths.qc_dir / "imaging_epochs.csv")
+
+    event_coverage = audit_event_coverage(corrected_df, epoch_df)
+    epochs_summary = summarize_epochs(epoch_df, mode=acq_type, gap_threshold_used=gap_used)
+
+    ready = (
+        bonsai_validation["passed"]
+        and harp_validation["passed"]
+        and epochs_summary["passed"]
+        and (event_coverage["image_identity_in_epochs"] > 0)
+    )
+
+    behavior_meta = {
+        "schema_version": "0.1.0",
+        "session_dir": str(paths.session_dir),
+        "bonsai_event_log": str(paths.bonsai_csv),
+        "corrected_bonsai_event_log": str(paths.corrected_bonsai_csv),
+        "harp_dir": str(paths.harp_dir),
+        "photodiode_pkl": str(paths.photodiode_pkl),
+        "harp_df_csv": str(paths.harp_df_csv),
+        **reuse_info,
+        "bonsai_validation": bonsai_validation,
+        "harp_validation": harp_validation,
+        "alignment": alignment_meta,
+        "epochs": epochs_summary,
+        "event_coverage": event_coverage,
+        "prepost_sec": metadata.get("prepost_sec", None),
+        "ready_for_physiology_extraction": ready,
+    }
+
+    with open(paths.qc_dir / "behavior_validation.json", "w") as f:
+        json.dump(behavior_meta, f, indent=2)
+
+    with open(paths.qc_dir / "alignment_meta.json", "w") as f:
+        json.dump(alignment_meta, f, indent=2)
+
+    with open(paths.qc_dir / "imaging_epochs_summary.json", "w") as f:
+        json.dump(epochs_summary, f, indent=2)
+
+    make_behavior_qc_plots(harp_df, photodiode_df, epoch_df, paths.qc_dir)
+
+    return BehaviorProcessingResult(
+        paths=paths,
+        bonsai_validation=bonsai_validation,
+        harp_validation=harp_validation,
+        alignment_meta=alignment_meta,
+        epochs_summary=epochs_summary,
+        event_coverage=event_coverage,
+        ready_for_physiology_extraction=ready,
+    )
+
 
 def process_single_harp_session(session_path, save=True, overwrite=False):
     """
@@ -890,4 +1114,45 @@ def _edge_train_qc_summary(harp_edge_s: np.ndarray) -> Dict[str, Any]:
         p95_dt=float(np.percentile(dt, 95)),
         max_dt=float(np.max(dt)),
     )
+
+
+# def process_harp_sessions(harp_root_dir, save=True, overwrite=False):
+#     """
+#     Process all subdirectories in `harp_root_dir` that contain HARP binary data.
+
+#     Parameters:
+#     -----------
+#     harp_root_dir : str or Path
+#         Path to the parent directory containing session folders.
+#     save : bool
+#         If True, saves .pkl files for encoder, photodiode, licks, and rewards.
+#     overwrite : bool
+#         If True, existing extracted files will be overwritten.
+#     """
+#     harp_root_dir = Path(harp_root_dir)
+#     session_dirs = [d for d in harp_root_dir.iterdir() if d.is_dir()]
+
+#     for session in session_dirs:
+#         try:
+#             print(f"Processing {session}...")
+#             reader = HarpReader(session)
+#             extracted_dir = session / "extracted_files"
+#             if extracted_dir.exists() and not overwrite:
+#                 print(f"→ Skipping {session.name}: already processed.")
+#                 continue
+
+#             if save:
+#                 extracted_dir.mkdir(exist_ok=True)
+#                 reader.get_encoder.to_pickle(extracted_dir / 'encoder.pkl')
+#                 reader.get_photodiode.to_pickle(extracted_dir / 'photodiode.pkl')
+#                 reader.get_licks.to_pickle(extracted_dir / 'licks.pkl')
+#                 reader.get_rewards.to_pickle(extracted_dir / 'rewards.pkl')
+#                 print(f"→ Saved data to {extracted_dir}")
+#             else:
+#                 print(reader.get_encoder.head())
+#                 print(reader.get_photodiode.head())
+#                 print(reader.get_licks.head())
+#                 print(reader.get_rewards.head())
+#         except Exception as e:
+#             print(f"❌ Error processing {session.name}: {e}")
 
