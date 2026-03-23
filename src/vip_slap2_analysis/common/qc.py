@@ -561,7 +561,7 @@ def run_session_synapse_qc(
         }
 
     if output_dir is None:
-        output_dir = summary_mat_path.parent / "analysis" / "qc"
+        output_dir = summary_mat_path.parent / "analysis" /  "qc" / "slap2"
     output_dir = Path(output_dir)
 
     exp = GlutamateSummary(summary_mat_path)
