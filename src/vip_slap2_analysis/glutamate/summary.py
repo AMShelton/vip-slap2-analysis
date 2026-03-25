@@ -349,6 +349,35 @@ class GlutamateSummary:
 
         return node
 
+    # ----------------- grab aData structure from summary .mat file -----------------
+
+    def _aData_ref(self, dmd0: int, trial0: int) -> Optional[h5py.Reference]:
+        f = self._mat.f
+        if "aData" not in f["exptSummary"]:
+            return None
+        A = f["exptSummary"]["aData"]
+        if self._E_layout == "dmd_trial":
+            ref = A[dmd0, trial0]
+        else:
+            ref = A[trial0, dmd0]
+
+        if ref is None:
+            return None
+        try:
+            if int(ref) == 0:  # type: ignore[arg-type]
+                return None
+        except Exception:
+            pass
+        return ref
+
+
+    def _aData_group(self, dmd0: int, trial0: int) -> Optional[h5py.Group]:
+        ref = self._aData_ref(dmd0, trial0)
+        if ref is None:
+            return None
+        node = self._mat.deref(ref)
+        return node if isinstance(node, h5py.Group) else None
+
     # ----------------- metadata (lazy) -----------------
 
     @property
@@ -622,6 +651,97 @@ class GlutamateSummary:
         if squeeze_channels and x.ndim == 3 and x.shape[2] == 1:
             return x[:, :, 0]
         return x
+    
+    def _get_motion_regressors(
+        self,
+        dmd: int,
+        trial: int,
+        target_len: int,
+        use_fields: Sequence[str] = ("onlineXshift", "onlineYshift", "motionDSr", "motionDSc"),
+    ) -> Tuple[np.ndarray, List[str]]:
+        """
+        Returns:
+        X: (target_len, n_regressors)
+        names: list of regressor names
+
+        Strategy:
+        - Pull vectors from aData struct
+        - Squeeze to 1D
+        - Interpolate each vector to target_len (so it matches ROI trace length)
+        - Add derived terms (optional): dx, dy, dx^2, dy^2, dx*dy, d/dt terms
+        """
+        dmd0, trial0 = dmd - 1, trial - 1
+        g = self._aData_group(dmd0, trial0)
+        if g is None:
+            return np.zeros((target_len, 0), float), []
+
+        regs = []
+        names = []
+
+        def _read_vec(key: str) -> Optional[np.ndarray]:
+            if key not in g:
+                return None
+            v = np.asarray(g[key][()]).squeeze()
+            if v.ndim != 1:
+                v = v.reshape(-1)
+            v = v.astype(float)
+            return v
+
+        # 1) raw motion vectors
+        raw = {}
+        for k in use_fields:
+            v = _read_vec(k)
+            if v is None or v.size < 2 or not np.isfinite(v).any():
+                continue
+            raw[k] = v
+
+        if len(raw) == 0:
+            return np.zeros((target_len, 0), float), []
+
+        # 2) interpolate to target_len
+        t_tgt = np.linspace(0, 1, target_len)
+        for k, v in raw.items():
+            t_src = np.linspace(0, 1, v.size)
+            # fill NaNs for interp
+            if np.any(~np.isfinite(v)):
+                vv = v.copy()
+                finite = np.isfinite(vv)
+                if finite.sum() < 2:
+                    continue
+                vv[~finite] = np.interp(np.flatnonzero(~finite), np.flatnonzero(finite), vv[finite])
+            else:
+                vv = v
+            vi = np.interp(t_tgt, t_src, vv)
+            regs.append(vi)
+            names.append(k)
+
+        X = np.stack(regs, axis=1)  # (T, P)
+
+        # 3) derived regressors (helps a lot for motion artifacts)
+        # If we have dx/dy, add quadratic + interaction + derivatives
+        if "onlineXshift" in names and "onlineYshift" in names:
+            dx = X[:, names.index("onlineXshift")]
+            dy = X[:, names.index("onlineYshift")]
+            regs2 = [
+                dx**2, dy**2, dx * dy,
+                np.gradient(dx), np.gradient(dy)
+            ]
+            names2 = ["dx2", "dy2", "dxdy", "ddx", "ddy"]
+            X = np.concatenate([X, np.stack(regs2, axis=1)], axis=1)
+            names.extend(names2)
+
+        # zscore columns (helps ridge behave)
+        Xz = X.copy()
+        for j in range(Xz.shape[1]):
+            col = Xz[:, j]
+            mu = np.nanmean(col)
+            sd = np.nanstd(col)
+            if np.isfinite(sd) and sd > 0:
+                Xz[:, j] = (col - mu) / sd
+            else:
+                Xz[:, j] = 0.0
+
+        return Xz, names
 
     # ----------------- synapse/source traces -----------------
 
@@ -742,7 +862,7 @@ class GlutamateSummary:
 
         return out
 
-    # ----------------- user ROI traces (UPDATED FORMAT) -----------------
+    # ----------------- user ROI traces -----------------
 
     def get_user_roi_traces(
         self,
@@ -990,6 +1110,12 @@ class GlutamateSummary:
         unmix: bool = True,
         hp_window_s: float = 0.2,
         ridge: float = 1e-6,
+        # motion regression
+        motion_correct: bool = True,
+        motion_ridge: float = 1e-2,
+        use_motion_fields: Sequence[str] = ("onlineXshift","onlineYshift","motionDSr","motionDSc"),
+        use_glu_as_motion_regressor: bool = True,
+        glu_motion_hp_window_s: float = 0.5,
         # baseline + dff
         compute_dff: bool = True,
         baseline_window_s: float = 4.0,
@@ -1035,6 +1161,16 @@ class GlutamateSummary:
                 hp_window_s=hp_window_s, ridge=ridge
             )
             ca_unmixed = unmix_res.ca_unmixed
+
+        # 2.5) motion decorrelation (trace-space "motion correction")
+        ca_mc = ca_unmixed.copy()
+        motion_betas = None
+        motion_names = None
+
+        if motion_correct:
+            # X_motion must be provided externally (per-trial) OR built by caller;
+            # easiest: have caller pass X_motion.
+            pass
 
         # 3) baseline + dF/F
         dff_res: Optional[DffResult] = None
@@ -1206,6 +1342,23 @@ class GlutamateSummary:
 
             ca_clean_tr = out["ca_clean"]
             ca_unmixed_tr = out["ca_unmixed"]
+
+            # Build regressors aligned to this trial's time length
+            Ttr = ca_unmixed_tr.shape[1]
+            Xmot, mot_names = self._get_motion_regressors(dmd=dmd, trial=tr, target_len=Ttr)
+
+            # Optionally add Glu as an additional nuisance regressor for motion
+            if use_glu_as_motion_regressor:
+                # Use *unmixed* stage already subtracted beta*glu for crosstalk,
+                # but Glu can still capture motion-related intensity fluctuations.
+                glu_tr = glu  # (n_rois, Ttr)
+                # Build a per-ROI regressor column; simplest: use each ROI's own Glu HP
+                win = max(3, int(round(glu_motion_hp_window_s * fs_hz)))
+                if win % 2 == 0:
+                    win += 1
+                # We will append one column per ROI (can be heavy). Better: one column per ROI in its own regression.
+                pass
+
             dff_tr = out["dff"].dff if out["dff"] is not None else None
             base_tr = out["dff"].baseline if out["dff"] is not None else None
             beta_tr = out["unmix"].beta if out["unmix"] is not None else None
@@ -1247,3 +1400,42 @@ class GlutamateSummary:
             "dff": dff,
             "beta": beta,
         }
+
+#---------------- Motion regression --------------------------------------
+
+def regress_out_(
+    y: np.ndarray,
+    X: np.ndarray,
+    ridge: float = 1e-3,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    y: (T,) signal
+    X: (T, P) nuisance regressors
+    Returns:
+      y_resid: (T,)
+      beta: (P+1,) including intercept
+    """
+    y = np.asarray(y, float)
+    X = np.asarray(X, float)
+    if X.size == 0:
+        return y.copy(), np.zeros((0,), float)
+
+    finite = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+    if finite.sum() < max(10, X.shape[1] + 2):
+        return y.copy(), np.zeros((X.shape[1] + 1,), float) * np.nan
+
+    Xf = X[finite]
+    yf = y[finite]
+
+    # add intercept
+    A = np.column_stack([Xf, np.ones(Xf.shape[0])])
+    # ridge on regressors only, not intercept
+    ATA = A.T @ A
+    ATA[:-1, :-1] += ridge * np.eye(A.shape[1] - 1)
+    ATy = A.T @ yf
+    beta = np.linalg.solve(ATA, ATy)
+
+    yhat = (np.column_stack([X, np.ones(X.shape[0])]) @ beta)
+    y_resid = y.copy()
+    y_resid[finite] = y[finite] - yhat[finite]
+    return y_resid, beta
