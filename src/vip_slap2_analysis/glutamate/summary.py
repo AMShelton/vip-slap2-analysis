@@ -1,4 +1,3 @@
-# vip_slap2_analysis/glutamate/summary.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -162,6 +161,7 @@ def unmix_ca_with_glu_hp_regress(
         out[i, finite] = ca_i[finite] - beta[i] * glu_i[finite]
 
     return UnmixResult(out, beta, intercept, method="hp_regress")
+
 
 def _as_1d_bool(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x).astype(bool).squeeze()
@@ -369,7 +369,6 @@ class GlutamateSummary:
         except Exception:
             pass
         return ref
-
 
     def _aData_group(self, dmd0: int, trial0: int) -> Optional[h5py.Group]:
         ref = self._aData_ref(dmd0, trial0)
@@ -651,7 +650,7 @@ class GlutamateSummary:
         if squeeze_channels and x.ndim == 3 and x.shape[2] == 1:
             return x[:, :, 0]
         return x
-    
+
     def _get_motion_regressors(
         self,
         dmd: int,
@@ -661,22 +660,22 @@ class GlutamateSummary:
     ) -> Tuple[np.ndarray, List[str]]:
         """
         Returns:
-        X: (target_len, n_regressors)
-        names: list of regressor names
+          X: (target_len, n_regressors)
+          names: list of regressor names
 
         Strategy:
-        - Pull vectors from aData struct
-        - Squeeze to 1D
-        - Interpolate each vector to target_len (so it matches ROI trace length)
-        - Add derived terms (optional): dx, dy, dx^2, dy^2, dx*dy, d/dt terms
+          - Pull vectors from aData struct
+          - Squeeze to 1D
+          - Interpolate each vector to target_len (so it matches ROI trace length)
+          - Add derived terms (optional): dx, dy, dx^2, dy^2, dx*dy, d/dt terms
         """
         dmd0, trial0 = dmd - 1, trial - 1
         g = self._aData_group(dmd0, trial0)
         if g is None:
             return np.zeros((target_len, 0), float), []
 
-        regs = []
-        names = []
+        regs: List[np.ndarray] = []
+        names: List[str] = []
 
         def _read_vec(key: str) -> Optional[np.ndarray]:
             if key not in g:
@@ -687,8 +686,8 @@ class GlutamateSummary:
             v = v.astype(float)
             return v
 
-        # 1) raw motion vectors
-        raw = {}
+        # raw motion vectors
+        raw: Dict[str, np.ndarray] = {}
         for k in use_fields:
             v = _read_vec(k)
             if v is None or v.size < 2 or not np.isfinite(v).any():
@@ -698,11 +697,10 @@ class GlutamateSummary:
         if len(raw) == 0:
             return np.zeros((target_len, 0), float), []
 
-        # 2) interpolate to target_len
+        # interpolate to target_len
         t_tgt = np.linspace(0, 1, target_len)
         for k, v in raw.items():
             t_src = np.linspace(0, 1, v.size)
-            # fill NaNs for interp
             if np.any(~np.isfinite(v)):
                 vv = v.copy()
                 finite = np.isfinite(vv)
@@ -717,20 +715,16 @@ class GlutamateSummary:
 
         X = np.stack(regs, axis=1)  # (T, P)
 
-        # 3) derived regressors (helps a lot for motion artifacts)
-        # If we have dx/dy, add quadratic + interaction + derivatives
+        # derived regressors
         if "onlineXshift" in names and "onlineYshift" in names:
             dx = X[:, names.index("onlineXshift")]
             dy = X[:, names.index("onlineYshift")]
-            regs2 = [
-                dx**2, dy**2, dx * dy,
-                np.gradient(dx), np.gradient(dy)
-            ]
+            regs2 = [dx**2, dy**2, dx * dy, np.gradient(dx), np.gradient(dy)]
             names2 = ["dx2", "dy2", "dxdy", "ddx", "ddy"]
             X = np.concatenate([X, np.stack(regs2, axis=1)], axis=1)
             names.extend(names2)
 
-        # zscore columns (helps ridge behave)
+        # zscore columns
         Xz = X.copy()
         for j in range(Xz.shape[1]):
             col = Xz[:, j]
@@ -742,6 +736,7 @@ class GlutamateSummary:
                 Xz[:, j] = 0.0
 
         return Xz, names
+
 
     # ----------------- synapse/source traces -----------------
 
@@ -1261,33 +1256,46 @@ class GlutamateSummary:
         fs_hz: Optional[float] = None,
         pad_to: Literal["ref", "max_valid", "none"] = "ref",
         include_invalid: bool = True,
+        *,
+        # --- motion regression options ---
+        motion_correct: bool = True,
+        motion_ridge: float = 1e-2,
+        motion_use_fields: Sequence[str] = ("onlineXshift", "onlineYshift", "motionDSr", "motionDSc"),
+        use_glu_as_motion_regressor: bool = True,
+        glu_motion_hp_window_s: float = 0.5,
+        # --- baseline/dff options (baseline computed on fluorescence, dF regressed if motion_correct=True) ---
+        baseline_window_s: float = 4.0,
+        baseline_q: float = 10.0,
+        baseline_smooth_s: float = 1.0,
+        eps: float = 1e-6,
+        # --- choose whether motion regression is applied to F (old) or dF (recommended) ---
+        motion_regress_on: Literal["dF", "F"] = "dF",
         **proc_kwargs: Any,
     ) -> Dict[str, Any]:
         """
-        Compute Ca processing (unmix + baseline + dF/F) across ALL trials.
+        Compute Ca processing (artifact mask + unmix + optional motion regression + baseline + dF/F)
+        across ALL trials, preserving invalid trials as NaNs.
 
-        Returns dict with arrays shaped:
-          - if pad_to != "none": (n_trials, n_rois, Tpad)
-          - if pad_to == "none": list length n_trials, each element (n_rois, T_trial) or None for invalid
-
-        Invalid trials:
-          - if include_invalid=True: filled with NaNs
-          - else: left as None (pad_to must be "none" in that case)
-
-        proc_kwargs are forwarded to process_ca_trace_extended().
+        Key behavior:
+        - Always computes baseline (F0) on fluorescence-domain signal (ca_unmixed) unless motion_regress_on="F"
+        - If motion_correct and motion_regress_on="dF": regress nuisance out of dF = (ca_unmixed - F0)
+            then compute dF/F = dF_mc / F0
+        - If motion_correct and motion_regress_on="F": regress nuisance out of fluorescence directly (older behavior)
+            (not recommended for dF/F)
         """
         if fs_hz is None:
             fs_hz = float(self.metadata.get("analyzeHz", np.nan))
         if not np.isfinite(fs_hz) or fs_hz <= 0:
-            raise ValueError("fs_hz must be provided or present as metadata['analyzeHz'].")
+            raise ValueError("fs_hz must be provided or present in metadata['analyzeHz'].")
 
+        # Reference shape from first valid trial (will raise if no valid trials / no ROIs)
         n_rois_ref, T_ref = self._ref_trial_shape_user_rois(dmd=dmd, trace_type=trace_type, roi_inds=roi_inds)
 
-        # Determine pad length
+        # Determine padding length
         if pad_to == "ref":
             Tpad = T_ref
         elif pad_to == "max_valid":
-            Ts = []
+            Ts: List[int] = []
             for tr in range(1, self.n_trials + 1):
                 if self.keep_trials[dmd - 1, tr - 1]:
                     x = self.get_user_roi_traces(dmd=dmd, trial=tr, trace_type=trace_type, roi_inds=roi_inds)
@@ -1299,21 +1307,30 @@ class GlutamateSummary:
         else:
             raise ValueError(f"pad_to must be 'ref', 'max_valid', or 'none'. Got: {pad_to}")
 
-        # Allocate outputs
+        # If motion correction is on and we plan to compute dF/F ourselves, prevent process_ca_trace_extended
+        # from computing its own dF/F (to avoid the old baseline-on-residual failure mode).
+        if motion_correct and motion_regress_on == "dF":
+            proc_kwargs = dict(proc_kwargs)
+            proc_kwargs.setdefault("compute_dff", False)
+
         if pad_to == "none":
-            ca_clean_list = [None] * self.n_trials
-            ca_unmixed_list = [None] * self.n_trials
-            baseline_list = [None] * self.n_trials
-            dff_list = [None] * self.n_trials
-            beta = np.full((self.n_trials, n_rois_ref), np.nan)
+            ca_clean_list: List[Optional[np.ndarray]] = [None] * self.n_trials
+            ca_unmixed_list: List[Optional[np.ndarray]] = [None] * self.n_trials
+            ca_mc_list: List[Optional[np.ndarray]] = [None] * self.n_trials
+            baseline_list: List[Optional[np.ndarray]] = [None] * self.n_trials
+            dff_list: List[Optional[np.ndarray]] = [None] * self.n_trials
+            beta_unmix = np.full((self.n_trials, n_rois_ref), np.nan)
         else:
             ca_clean = np.full((self.n_trials, n_rois_ref, Tpad), np.nan, dtype=float)
             ca_unmixed = np.full((self.n_trials, n_rois_ref, Tpad), np.nan, dtype=float)
+            ca_mc = np.full((self.n_trials, n_rois_ref, Tpad), np.nan, dtype=float)
             baseline = np.full((self.n_trials, n_rois_ref, Tpad), np.nan, dtype=float)
             dff = np.full((self.n_trials, n_rois_ref, Tpad), np.nan, dtype=float)
-            beta = np.full((self.n_trials, n_rois_ref), np.nan, dtype=float)
+            beta_unmix = np.full((self.n_trials, n_rois_ref), np.nan, dtype=float)
 
-        # Loop trials
+        beta_motion: List[Optional[np.ndarray]] = [None] * self.n_trials
+        motion_names: List[Optional[List[str]]] = [None] * self.n_trials
+
         for tr in range(1, self.n_trials + 1):
             valid = bool(self.keep_trials[dmd - 1, tr - 1])
 
@@ -1322,54 +1339,199 @@ class GlutamateSummary:
                     if pad_to != "none":
                         raise ValueError("include_invalid=False requires pad_to='none' (so invalid can be None).")
                     continue
-                # else: leave NaNs (already)
+                # else: leave NaNs
                 continue
 
             # Load traces for this trial
             glu, ca = self.get_soma_glu_ca_traces(
                 dmd=dmd, trial=tr, trace_type=trace_type, roi_inds=roi_inds
-            )  # both (n_rois, T_trial)
+            )
 
-            # Safety: ROI count must match reference (or be a subset)
+            # Conservative ROI axis handling
             if glu.shape[0] != n_rois_ref:
-                # If roi_inds was passed, this should match; otherwise something inconsistent is happening.
-                # We'll handle by truncating/padding ROI axis conservatively.
                 n_use = min(glu.shape[0], n_rois_ref)
                 glu = glu[:n_use]
                 ca = ca[:n_use]
 
+            # Step 1-2: artifact mask + unmix (and optionally dF/F if motion_regress_on != "dF")
             out = self.process_ca_trace_extended(ca=ca, glu=glu, fs_hz=fs_hz, **proc_kwargs)
-
             ca_clean_tr = out["ca_clean"]
             ca_unmixed_tr = out["ca_unmixed"]
 
-            # Build regressors aligned to this trial's time length
-            Ttr = ca_unmixed_tr.shape[1]
-            Xmot, mot_names = self._get_motion_regressors(dmd=dmd, trial=tr, target_len=Ttr)
+            beta_tr = out["unmix"].beta if out.get("unmix", None) is not None else None
+            if beta_tr is not None:
+                beta_unmix[tr - 1, : beta_tr.shape[0]] = beta_tr
 
-            # Optionally add Glu as an additional nuisance regressor for motion
-            if use_glu_as_motion_regressor:
-                # Use *unmixed* stage already subtracted beta*glu for crosstalk,
-                # but Glu can still capture motion-related intensity fluctuations.
-                glu_tr = glu  # (n_rois, Ttr)
-                # Build a per-ROI regressor column; simplest: use each ROI's own Glu HP
-                win = max(3, int(round(glu_motion_hp_window_s * fs_hz)))
-                if win % 2 == 0:
-                    win += 1
-                # We will append one column per ROI (can be heavy). Better: one column per ROI in its own regression.
-                pass
+            # ---------------------------------------------------------------------
+            # Motion regression + baseline + dF/F
+            # ---------------------------------------------------------------------
+            if motion_correct and motion_regress_on == "dF":
+                # 1) compute F0 on fluorescence-domain signal (unmixed Ca)
+                F0_tr = np.full_like(ca_unmixed_tr, np.nan, dtype=float)
+                dF_tr = np.full_like(ca_unmixed_tr, np.nan, dtype=float)
 
-            dff_tr = out["dff"].dff if out["dff"] is not None else None
-            base_tr = out["dff"].baseline if out["dff"] is not None else None
-            beta_tr = out["unmix"].beta if out["unmix"] is not None else None
+                for iroi in range(ca_unmixed_tr.shape[0]):
+                    xi = ca_unmixed_tr[iroi]
+                    finite = np.isfinite(xi)
+                    if finite.mean() < 0.5:
+                        continue
+                    base = _baseline_percentile_filter(
+                        xi,
+                        fs_hz=fs_hz,
+                        window_s=baseline_window_s,
+                        q=baseline_q,
+                        smooth_s=baseline_smooth_s,
+                        eps=eps,
+                    )
+                    F0_tr[iroi] = base
+                    dF_tr[iroi, finite] = xi[finite] - base[finite]
 
+                # 2) regress nuisance out of dF (not F)
+                dF_mc_tr = dF_tr.copy()
+                names_i: List[str] = []
+                if motion_correct:
+                    Ttr = ca_unmixed_tr.shape[1]
+                    Xmot, mot_names = self._get_motion_regressors(
+                        dmd=dmd, trial=tr, target_len=Ttr, use_fields=motion_use_fields
+                    )
+                    win_g = max(3, int(round(glu_motion_hp_window_s * fs_hz)))
+                    if win_g % 2 == 0:
+                        win_g += 1
+
+                    dF_mc_tr = np.full_like(dF_tr, np.nan, dtype=float)
+                    betas_tr: List[np.ndarray] = []
+                    names_i = list(mot_names)
+
+                    for iroi in range(dF_tr.shape[0]):
+                        Xi = Xmot
+                        names_i = list(mot_names)
+
+                        if use_glu_as_motion_regressor:
+                            g = np.asarray(glu[iroi], float)
+                            if g.size != Ttr:
+                                if g.size > Ttr:
+                                    g = g[:Ttr]
+                                else:
+                                    gg = np.full(Ttr, np.nan, float)
+                                    gg[: g.size] = g
+                                    g = gg
+
+                            gf = g.copy()
+                            fin_g = np.isfinite(gf)
+                            if fin_g.any():
+                                gf[~fin_g] = np.nanmedian(gf[fin_g])
+                            else:
+                                gf[:] = 0.0
+
+                            g_hp = gf - _moving_average_reflect(gf, win_g)
+                            mu = np.nanmean(g_hp)
+                            sd = np.nanstd(g_hp)
+                            if np.isfinite(sd) and sd > 0:
+                                g_hp = (g_hp - mu) / sd
+                            else:
+                                g_hp = np.zeros_like(g_hp)
+
+                            Xi = np.column_stack([Xi, g_hp]) if Xi.size else g_hp[:, None]
+                            names_i.append("glu_hp")
+
+                        y_resid, b_mc = regress_out_(dF_tr[iroi], Xi, ridge=motion_ridge)
+                        dF_mc_tr[iroi] = y_resid
+                        betas_tr.append(b_mc)
+
+                    beta_motion[tr - 1] = np.stack(betas_tr, axis=0) if betas_tr else None
+                    motion_names[tr - 1] = names_i
+
+                # 3) final dF/F uses the fluorescence-domain baseline
+                dff_tr = np.full_like(dF_mc_tr, np.nan, dtype=float)
+                for iroi in range(dF_mc_tr.shape[0]):
+                    finite = np.isfinite(dF_mc_tr[iroi]) & np.isfinite(F0_tr[iroi])
+                    if finite.mean() < 0.5:
+                        continue
+                    dff_tr[iroi, finite] = dF_mc_tr[iroi, finite] / F0_tr[iroi, finite]
+
+                # 4) a "motion-corrected fluorescence" signal that remains on physical scale
+                ca_mc_tr = F0_tr + dF_mc_tr
+                baseline_tr = F0_tr
+
+            elif motion_correct and motion_regress_on == "F":
+                # Old behavior: regress nuisance out of fluorescence directly.
+                # (This can produce near-zero baseline; keep only if you explicitly want it.)
+                Ttr = ca_unmixed_tr.shape[1]
+                Xmot, mot_names = self._get_motion_regressors(
+                    dmd=dmd, trial=tr, target_len=Ttr, use_fields=motion_use_fields
+                )
+                win_g = max(3, int(round(glu_motion_hp_window_s * fs_hz)))
+                if win_g % 2 == 0:
+                    win_g += 1
+
+                ca_mc_tr = np.full_like(ca_unmixed_tr, np.nan, dtype=float)
+                betas_tr: List[np.ndarray] = []
+                names_i = list(mot_names)
+
+                for iroi in range(ca_unmixed_tr.shape[0]):
+                    Xi = Xmot
+                    names_i = list(mot_names)
+
+                    if use_glu_as_motion_regressor:
+                        g = np.asarray(glu[iroi], float)
+                        gf = g.copy()
+                        fin_g = np.isfinite(gf)
+                        if fin_g.any():
+                            gf[~fin_g] = np.nanmedian(gf[fin_g])
+                        else:
+                            gf[:] = 0.0
+                        g_hp = gf - _moving_average_reflect(gf, win_g)
+                        mu = np.nanmean(g_hp)
+                        sd = np.nanstd(g_hp)
+                        if np.isfinite(sd) and sd > 0:
+                            g_hp = (g_hp - mu) / sd
+                        else:
+                            g_hp = np.zeros_like(g_hp)
+
+                        Xi = np.column_stack([Xi, g_hp]) if Xi.size else g_hp[:, None]
+                        names_i.append("glu_hp")
+
+                    y_resid, b_mc = regress_out_(ca_unmixed_tr[iroi], Xi, ridge=motion_ridge)
+                    ca_mc_tr[iroi] = y_resid
+                    betas_tr.append(b_mc)
+
+                beta_motion[tr - 1] = np.stack(betas_tr, axis=0) if betas_tr else None
+                motion_names[tr - 1] = names_i
+
+                # baseline + dF/F on ca_mc (can blow up; use with caution)
+                baseline_tr = np.full_like(ca_mc_tr, np.nan, dtype=float)
+                dff_tr = np.full_like(ca_mc_tr, np.nan, dtype=float)
+                for iroi in range(ca_mc_tr.shape[0]):
+                    xi = ca_mc_tr[iroi]
+                    finite = np.isfinite(xi)
+                    if finite.mean() < 0.5:
+                        continue
+                    base = _baseline_percentile_filter(
+                        xi,
+                        fs_hz=fs_hz,
+                        window_s=baseline_window_s,
+                        q=baseline_q,
+                        smooth_s=baseline_smooth_s,
+                        eps=eps,
+                    )
+                    baseline_tr[iroi] = base
+                    dff_tr[iroi, finite] = (xi[finite] - base[finite]) / base[finite]
+
+            else:
+                # no motion correction: trust process_ca_trace_extended's dF/F (if enabled)
+                ca_mc_tr = ca_unmixed_tr
+                baseline_tr = out["dff"].baseline if out.get("dff", None) is not None else None
+                dff_tr = out["dff"].dff if out.get("dff", None) is not None else None
+
+            # ---------------------------------------------------------------------
+            # Store outputs
+            # ---------------------------------------------------------------------
             if pad_to == "none":
                 ca_clean_list[tr - 1] = ca_clean_tr
                 ca_unmixed_list[tr - 1] = ca_unmixed_tr
-                baseline_list[tr - 1] = base_tr
+                ca_mc_list[tr - 1] = ca_mc_tr
+                baseline_list[tr - 1] = baseline_tr
                 dff_list[tr - 1] = dff_tr
-                if beta_tr is not None:
-                    beta[tr - 1, : beta_tr.shape[0]] = beta_tr
             else:
                 Ttr = ca_clean_tr.shape[1]
                 tcopy = min(Ttr, Tpad)
@@ -1377,28 +1539,34 @@ class GlutamateSummary:
 
                 ca_clean[tr - 1, :rcopy, :tcopy] = ca_clean_tr[:rcopy, :tcopy]
                 ca_unmixed[tr - 1, :rcopy, :tcopy] = ca_unmixed_tr[:rcopy, :tcopy]
-                if base_tr is not None:
-                    baseline[tr - 1, :rcopy, :tcopy] = base_tr[:rcopy, :tcopy]
+                ca_mc[tr - 1, :rcopy, :tcopy] = ca_mc_tr[:rcopy, :tcopy]
+
+                if baseline_tr is not None:
+                    baseline[tr - 1, :rcopy, :tcopy] = baseline_tr[:rcopy, :tcopy]
                 if dff_tr is not None:
                     dff[tr - 1, :rcopy, :tcopy] = dff_tr[:rcopy, :tcopy]
-                if beta_tr is not None:
-                    beta[tr - 1, :rcopy] = beta_tr[:rcopy]
 
         if pad_to == "none":
             return {
                 "ca_clean": ca_clean_list,
                 "ca_unmixed": ca_unmixed_list,
+                "ca_mc": ca_mc_list,
                 "baseline": baseline_list,
                 "dff": dff_list,
-                "beta": beta,
+                "beta_unmix": beta_unmix,
+                "beta_motion": beta_motion,
+                "motion_names": motion_names,
             }
 
         return {
             "ca_clean": ca_clean,
             "ca_unmixed": ca_unmixed,
+            "ca_mc": ca_mc,
             "baseline": baseline,
             "dff": dff,
-            "beta": beta,
+            "beta_unmix": beta_unmix,
+            "beta_motion": beta_motion,
+            "motion_names": motion_names,
         }
 
 #---------------- Motion regression --------------------------------------
