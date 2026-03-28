@@ -10,7 +10,6 @@ from vip_slap2_analysis.common.session import SessionAssets
 from vip_slap2_analysis.glutamate.summary import GlutamateSummary
 from vip_slap2_analysis.glutamate.alignment import (
     EventWindows,
-    OrderedImageEvent,
     align_traces_to_session_intervals,
     build_change_locked_sequences,
     extract_change_intervals,
@@ -93,10 +92,9 @@ def _build_sequence_output(
         seq_lengths: List[int] = []
 
         for pre_evts, rep_evts, term_evt in zip(groups["prechange"], groups["repeated"], groups["terminal"]):
-            # prechange: always 2 presentations when available
             pre_snips = [ordered_snippets.get(evt.event_idx) for evt in pre_evts]
             if all(s is not None for s in pre_snips):
-                pre_arrays.append(np.stack(pre_snips, axis=0))  # (2, n_syn, n_time)
+                pre_arrays.append(np.stack(pre_snips, axis=0))
 
             rep_snips = [ordered_snippets.get(evt.event_idx) for evt in rep_evts]
             rep_snips = [s for s in rep_snips if s is not None]
@@ -134,6 +132,14 @@ def _build_sequence_output(
         }
 
     return out
+
+
+def _jsonify_onset_dict(d: Dict[str, np.ndarray]) -> Dict[str, List[float]]:
+    return {k: [float(x) for x in v.tolist()] for k, v in d.items()}
+
+
+def _jsonify_onset_array(x: np.ndarray) -> List[float]:
+    return [float(v) for v in x.tolist()]
 
 
 def process_glutamate_extraction(
@@ -198,7 +204,7 @@ def process_glutamate_extraction(
     tvecs = _time_vectors(windows, im_rate_hz)
 
     base_meta = {
-        "schema_version": "0.2.0",
+        "schema_version": "0.3.0",
         "session_id": asset.session_id,
         "subject_id": int(asset.subject_id),
         "summary_mat": str(asset.summary_mat),
@@ -219,7 +225,7 @@ def process_glutamate_extraction(
     seq_pkg: Dict[str, Any] = {"metadata": base_meta, "timebase_sec": {"image": tvecs["image"]}, "DMD1": {}, "DMD2": {}}
 
     qc: Dict[str, Any] = {
-        "schema_version": "0.2.0",
+        "schema_version": "0.3.0",
         "session_id": asset.session_id,
         "summary_mat": str(asset.summary_mat),
         "bonsai_event_log_csv": str(asset.bonsai_event_log_csv),
@@ -261,49 +267,47 @@ def process_glutamate_extraction(
         n_syn_kept = int(np.sum(syn_mask))
         synapse_ids = np.array([f"DMD{dmd}_syn{i:04d}" for i in range(n_syn_total)])[syn_mask]
 
-        # Session-wide event-aligned extraction
-        aligned_images = align_traces_to_session_intervals(
+        aligned_images, image_onsets_used = align_traces_to_session_intervals(
             bundle,
             image_times_f,
             im_rate_hz=im_rate_hz,
             pre_time=windows.image[0],
             post_time=windows.image[1],
+            return_used_onsets=True,
         )
-        aligned_changes = align_traces_to_session_intervals(
+        aligned_changes, change_onsets_used = align_traces_to_session_intervals(
             bundle,
             change_times_f,
             im_rate_hz=im_rate_hz,
             pre_time=windows.change[0],
             post_time=windows.change[1],
+            return_used_onsets=True,
         )
-        aligned_omissions = align_traces_to_session_intervals(
+        aligned_omissions, omission_onsets_used = align_traces_to_session_intervals(
             bundle,
             omission_times_f,
             im_rate_hz=im_rate_hz,
             pre_time=windows.omission[0],
             post_time=windows.omission[1],
+            return_used_onsets=True,
         )
 
         aligned_images = {k: _apply_synapse_mask_to_array(v, syn_mask) for k, v in aligned_images.items()}
         aligned_changes = _apply_synapse_mask_to_array(aligned_changes, syn_mask)
         aligned_omissions = _apply_synapse_mask_to_array(aligned_omissions, syn_mask)
 
-        # Build ordered image snippets for sequence assembly
         ordered_snippets: Dict[int, np.ndarray] = {}
         n_img_time = len(tvecs["image"])
+        n_pre_img = int(round(windows.image[0] * im_rate_hz))
         for evt in ordered_images_f:
             center = int(round((float(evt.onset) - bundle.session_start_sec) * im_rate_hz))
-            n_pre = int(round(windows.image[0] * im_rate_hz))
-            start = center - n_pre
+            start = center - n_pre_img
             stop = start + n_img_time
             if start < 0 or stop > bundle.traces.shape[1]:
                 continue
             ordered_snippets[evt.event_idx] = _apply_synapse_mask_to_array(bundle.traces[:, start:stop], syn_mask)
 
-        # Means are image-resolved
-        mean_pkg[f"DMD{dmd}"]["image_identity"] = {
-            img: summarize_event_tensor(arr) for img, arr in aligned_images.items()
-        }
+        mean_pkg[f"DMD{dmd}"]["image_identity"] = {img: summarize_event_tensor(arr) for img, arr in aligned_images.items()}
         mean_pkg[f"DMD{dmd}"]["change"] = summarize_event_tensor(aligned_changes)
         mean_pkg[f"DMD{dmd}"]["omission"] = summarize_event_tensor(aligned_omissions)
         mean_pkg[f"DMD{dmd}"]["synapse_ids"] = synapse_ids
@@ -340,6 +344,11 @@ def process_glutamate_extraction(
             "zero_count_image_ids": zero_count_ids,
             "n_change_events_extracted": int(aligned_changes.shape[0]),
             "n_omission_events_extracted": int(aligned_omissions.shape[0]),
+            "stimulus_onsets_used_for_extraction": {
+                "image_identity": _jsonify_onset_dict(image_onsets_used),
+                "change": _jsonify_onset_array(change_onsets_used),
+                "omission": _jsonify_onset_array(omission_onsets_used),
+            },
             "sequence_counts_by_id": {
                 img: {
                     "n_prechange_sequences": int(seq_pkg[f"DMD{dmd}"]["image_identity"][img]["prechange"]["n_sequences"]),

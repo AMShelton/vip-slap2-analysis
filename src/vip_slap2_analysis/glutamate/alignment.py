@@ -54,6 +54,8 @@ def load_corrected_bonsai_csv(path: Union[str, Path]) -> pd.DataFrame:
             f"{path} does not contain corrected timestamp columns. "
             f"Expected 'corrected_timestamp' or 'corrected_timestamps'."
         )
+    if "Value" not in df.columns:
+        raise ValueError(f"{path} does not contain a 'Value' column.")
     return df
 
 
@@ -88,11 +90,12 @@ def _is_image_value(v: str) -> bool:
 
 
 def _is_change_value(v: str) -> bool:
-    return "changeflash" in v.lower()
+    return "changeflash" in v.lower() or v.lower() == "change"
 
 
 def _is_omission_value(v: str) -> bool:
-    return v.lower() == "omission" or "omission" in v.lower()
+    vl = v.lower()
+    return vl == "omission" or "omission" in vl
 
 
 def _is_nonstimulus_value(v: str) -> bool:
@@ -108,6 +111,9 @@ def extract_image_intervals(
     *,
     time_col: Optional[str] = None,
 ) -> Tuple[StimIntervalDict, List[OrderedImageEvent]]:
+    """
+    Extract image-onset events from Bonsai. Every image row is treated as one flash onset.
+    """
     tcol = time_col or _time_col(stim_df)
     values = _normalize_value_series(stim_df)
 
@@ -170,8 +176,11 @@ def extract_ordered_change_targets(
     *,
     time_col: Optional[str] = None,
 ) -> List[int]:
+    """
+    Mark the first image event after each ChangeFlash as a change-target image.
+    Returns ordered-image indices of those target images.
+    """
     tcol = time_col or _time_col(stim_df)
-    values = _normalize_value_series(stim_df)
 
     image_rows: List[Tuple[int, str, float]] = []
     change_rows: List[Tuple[int, float]] = []
@@ -186,7 +195,6 @@ def extract_ordered_change_targets(
     if not image_rows or not change_rows:
         return []
 
-    # allow repeated onsets by matching in order, not by dict lookup
     change_target_ord_idxs: List[int] = []
     img_ptr = 0
     for change_i, _ in change_rows:
@@ -239,8 +247,7 @@ def filter_intervals_to_epochs(
     if isinstance(stim_times, dict):
         out: StimIntervalDict = {}
         for name, intervals in stim_times.items():
-            kept = [(t0, t1) for (t0, t1) in intervals if _in_any_bound(float(t0), keep_bounds)]
-            out[name] = kept
+            out[name] = [(t0, t1) for (t0, t1) in intervals if _in_any_bound(float(t0), keep_bounds)]
         return out
 
     return [(t0, t1) for (t0, t1) in stim_times if _in_any_bound(float(t0), keep_bounds)]
@@ -273,14 +280,12 @@ def _trial_trace_as_syn_by_time(
     if x.ndim != 2:
         raise ValueError(f"Expected 2D trace matrix, got shape {x.shape}")
 
-    # get_traces returns (samples, rois) in this repo; fall back if transposed
     n0, n1 = x.shape
     expected_n_syn = int(exp.n_synapses[dmd - 1]) if len(exp.n_synapses) >= dmd else None
     if expected_n_syn is not None and n1 == expected_n_syn:
         return np.asarray(x, dtype=float).T
     if expected_n_syn is not None and n0 == expected_n_syn:
         return np.asarray(x, dtype=float)
-    # heuristic fallback: more samples than rois is typical
     if n0 >= n1:
         return np.asarray(x, dtype=float).T
     return np.asarray(x, dtype=float)
@@ -295,6 +300,10 @@ def reconstruct_dmd_session_traces(
     signal: str = "dF",
     mode: str = "ls",
 ) -> ReconstructedTraceBundle:
+    """
+    Reconstruct a session-wide trace by concatenating all trials in order.
+    Invalid trials are represented by NaN blocks of the inferred trial length.
+    """
     n_trials = int(exp.n_trials)
     valid_set = set(int(t) for t in exp.valid_trials[dmd - 1])
 
@@ -372,13 +381,26 @@ def align_traces_to_session_intervals(
     im_rate_hz: float,
     pre_time: float,
     post_time: float,
-) -> Union[Dict[str, np.ndarray], np.ndarray]:
+    return_used_onsets: bool = False,
+) -> Union[
+    Dict[str, np.ndarray],
+    np.ndarray,
+    Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]],
+    Tuple[np.ndarray, np.ndarray],
+]:
+    """
+    Align session-wide reconstructed traces to event onsets.
+
+    If return_used_onsets is True, also returns the event onset times that were
+    actually used for extraction after out-of-bounds filtering.
+    """
     n_pre = int(round(pre_time * im_rate_hz))
     n_post = int(round(post_time * im_rate_hz))
     n_win = n_pre + n_post
 
-    def _extract_one_list(intervals: StimIntervalList) -> np.ndarray:
-        snippets = []
+    def _extract_one_list(intervals: StimIntervalList) -> Tuple[np.ndarray, np.ndarray]:
+        snippets: List[np.ndarray] = []
+        used_onsets: List[float] = []
         for onset, _ in intervals:
             center = int(round((float(onset) - bundle.session_start_sec) * im_rate_hz))
             start = center - n_pre
@@ -386,13 +408,30 @@ def align_traces_to_session_intervals(
             if start < 0 or stop > bundle.traces.shape[1]:
                 continue
             snippets.append(bundle.traces[:, start:stop])
+            used_onsets.append(float(onset))
         if len(snippets) == 0:
-            return np.full((0, bundle.traces.shape[0], n_win), np.nan, dtype=float)
-        return np.stack(snippets, axis=0)
+            arr = np.full((0, bundle.traces.shape[0], n_win), np.nan, dtype=float)
+            onsets = np.empty((0,), dtype=float)
+        else:
+            arr = np.stack(snippets, axis=0)
+            onsets = np.asarray(used_onsets, dtype=float)
+        return arr, onsets
 
     if isinstance(stim_times, dict):
-        return {k: _extract_one_list(v) for k, v in stim_times.items()}
-    return _extract_one_list(stim_times)
+        aligned: Dict[str, np.ndarray] = {}
+        used: Dict[str, np.ndarray] = {}
+        for k, v in stim_times.items():
+            arr, onsets = _extract_one_list(v)
+            aligned[k] = arr
+            used[k] = onsets
+        if return_used_onsets:
+            return aligned, used
+        return aligned
+
+    arr, onsets = _extract_one_list(stim_times)
+    if return_used_onsets:
+        return arr, onsets
+    return arr
 
 
 # -----------------------------------------------------------------------------
@@ -404,9 +443,10 @@ def summarize_event_tensor(x: np.ndarray) -> Dict[str, np.ndarray]:
         raise ValueError(f"Expected (n_events, n_synapses, n_time), got {x.shape}")
     n_events = int(x.shape[0])
     counts = np.sum(np.isfinite(x), axis=0)
+    out_shape = x.shape[1:]
     return {
-        "mean": np.nanmean(x, axis=0) if n_events else np.full(x.shape[1:], np.nan),
-        "std": np.nanstd(x, axis=0, ddof=0) if n_events else np.full(x.shape[1:], np.nan),
+        "mean": np.nanmean(x, axis=0) if n_events else np.full(out_shape, np.nan),
+        "std": np.nanstd(x, axis=0, ddof=0) if n_events else np.full(out_shape, np.nan),
         "n_events": np.array(n_events, dtype=int),
         "n_finite": counts.astype(int),
     }
@@ -415,7 +455,7 @@ def summarize_event_tensor(x: np.ndarray) -> Dict[str, np.ndarray]:
 def tolerant_summary_ragged(arrays: Sequence[np.ndarray]) -> Dict[str, np.ndarray]:
     """
     arrays: list of (seq_len_i, n_syn, n_time)
-    Returns tolerant mean/std/count across ragged sequence position axis.
+    Returns tolerant mean/std/count across ragged sequence-position axis.
     """
     if len(arrays) == 0:
         return {
@@ -428,8 +468,7 @@ def tolerant_summary_ragged(arrays: Sequence[np.ndarray]) -> Dict[str, np.ndarra
     n_syn, n_time = arrays[0].shape[1], arrays[0].shape[2]
     stack = np.full((len(arrays), max_len, n_syn, n_time), np.nan, dtype=float)
     for i, a in enumerate(arrays):
-        L = a.shape[0]
-        stack[i, :L] = a
+        stack[i, : a.shape[0]] = a
 
     valid = np.isfinite(stack).any(axis=(2, 3))
     counts = valid.sum(axis=0).astype(int)
