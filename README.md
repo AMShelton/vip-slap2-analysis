@@ -1,14 +1,6 @@
 # vip-slap2-analysis
 
-`vip-slap2-analysis` is a notebook-friendly Python repository for loading, preprocessing, quality-controlling, and analyzing SLAP2-based datasets collected in the VIP Synaptic Dynamics project.
-
-The codebase is organized around a session-centric workflow spanning several data modalities:
-
-- **glutamate imaging** from SLAP2 experiment summaries
-- **somatic Ca2+ traces** extracted from user-defined ROIs in `SummaryLoCo**.mat`
-- **behavior / HARP alignment** for passive visual stimulation sessions
-- **voltage imaging** utilities under active development
-- **morphology** support for Fiji / SNT reconstructions of traced neurons
+Utilities for loading, processing, quality controlling, analyzing, and visualizing multimodal VIP SLAP2 datasets, including behavior, glutamate, calcium, voltage, and now morphology reconstructions.
 
 ## Contents
 
@@ -17,142 +9,110 @@ The codebase is organized around a session-centric workflow spanning several dat
 - [Data modalities & formats](#data-modalities--formats)
 - [Metadata](#metadata)
 - [Analysis, figures, and findings](#analysis-figures-and-findings)
-- [Morphology](#morphology)
-- [Repository layout](#repository-layout)
-- [Install (editable)](#install-editable)
 - [References](#references)
 - [Acknowledgements](#acknowledgements)
+- [Install (editable)](#install-editable)
 
 ## Experimental design with SLAP2
 
-The repository is intended for experiments in which VIP interneuron physiology is measured during passive visual stimulation and related post hoc analyses are performed on the same session. A common starting point is a session directory containing:
+This repository is organized around VIP synaptic dynamics experiments collected with SLAP2 in mouse visual cortex. The codebase is built to support alignment between behavior and physiology, source-extracted glutamate and calcium traces, session-level QC, and figure generation for downstream biological interpretation.
 
-- MATLAB-derived `SummaryLoCo**.mat` files from SLAP2 preprocessing
-- Bonsai event logs for visual stimulus timing
-- HARP registries containing acquisition clock and photodiode signals
-- optional morphology reference volumes and traced neuron reconstructions
+The main experimental context currently includes:
+
+- passive change-detection style visual stimulation
+- glutamate imaging with iGluSnFR
+- calcium imaging with RCaMP when present
+- SLAP2 reference volumes and reconstruction-derived morphology for selected sessions
+- session-level metadata pulled from spreadsheet registries and on-disk assets
 
 ## Pipeline
 
-At a high level, the repository supports the following staged workflow:
+The package is developing toward a modality-aware but shared pipeline:
 
-1. **Session resolution and loading**
-   - locate summary files, behavior logs, HARP data, and derived outputs
-2. **Physiology preprocessing / alignment**
-   - align Bonsai event times to HARP time
-   - identify valid epochs and acquisition intervals
-3. **Quality control**
-   - quantify session quality, synapse quality, and Ca2+ ROI quality
-4. **Stimulus-aligned extraction**
-   - generate stimulus-centered outputs for image, change, and omission events
-5. **Analysis and plotting**
-   - perform per-session and pooled analyses with shared plotting utilities
-6. **Morphology integration**
-   - ingest SNT / Fiji reconstructions, compute morphometry, and generate publication-quality graphics
+1. **Session discovery / registry**
+   - resolve session directories and expected assets
+2. **Behavior preprocessing**
+   - load BonVision / Bonsai and HARP outputs
+   - correct time bases and create event tables on a common clock
+3. **Physiology extraction**
+   - glutamate and calcium extraction aligned to behavior epochs
+4. **QC generation**
+   - metric tables and saved plots per session / modality
+5. **Analysis and figure generation**
+   - stimulus-aligned summaries, depth-aware comparisons, and publication-ready plots
+6. **Morphology**
+   - load SNT/SWC reconstructions, compute morphometrics, and export vector-friendly plots
+
+Current morphology code lives in `src/vip_slap2_analysis/morphology/` and supporting documentation lives in `docs/morphology/`.
 
 ## Data modalities & formats
 
+The repo currently works with several kinds of inputs:
+
+### Behavior
+- Bonsai / BonVision event logs (`bonsai_event_log.csv`)
+- HARP extracts and photodiode traces
+
 ### Glutamate
-
-Primary source:
-- `SummaryLoCo**.mat`
-
-Typical contents accessed through `vip_slap2_analysis.glutamate.summary.GlutamateSummary`:
-- trial-resolved synapse traces
-- trial validity and summary images per DMD
-- experiment metadata
-- user-defined ROI traces
+- `SummaryLoCo*.mat` and related SLAP2 outputs
+- source extraction products and aligned stimulus-response tables
 
 ### Calcium
+- extracted ROI or user-ROI tables from SLAP2 summary outputs
+- detrended / dF/F-like processed traces and QC summaries
 
-Current calcium support is centered on user-defined soma ROIs embedded in the glutamate experiment summary. Existing code covers extraction and QC for sessions that include an RCaMP channel.
-
-### Behavior / HARP
-
-Key session files:
-- `bonsai_event_log.csv`
-- `VCO1_Behavior.harp`
-- derived `photodiode.pkl`
-- optional saved `HARP_df.csv`
-
-These support Bonsai-to-HARP correction and subsequent stimulus alignment.
+### Voltage
+- voltage imaging summary / preprocessing code and downstream trace analysis
 
 ### Morphology
-
-Morphology inputs are expected to come from Fiji / SNT tracing workflows and may include:
-- `.swc`
-- `.traces`
-- `SNT_Measurements.csv`
+- SNT exported `.swc` reconstructions
+- `.traces` project files
 - `QuickMeasurements.csv`
-- `Sholl_Table-*.csv`
-- traced reference volume `.tif`
-
-The morphology subpackage currently establishes the architectural foundation for analysis, rendering, and export.
+- `SNT_Measurements.csv`
+- `Sholl_Table*.csv`
+- prepared TIFF stacks used for reconstruction
 
 ## Metadata
 
-The repository uses session-aware path handling and is designed to work with registry-style metadata tables for tracking subjects, sessions, and modality-specific assets.
+Session-level metadata is handled through a mix of on-disk discovery and registry tables. Existing code in `vip_slap2_analysis.io.session_registry` and `vip_slap2_analysis.common.session` provides the current foundation for locating session assets and keeping derived outputs organized.
 
-Important metadata themes in the project include:
-- subject / session identity
-- DMD identity
-- modality availability (glutamate, calcium, morphology, voltage)
-- acquisition and processing provenance
-- physical calibration information such as voxel size
+For morphology, the code is designed to keep a tight link between:
+
+- session ID
+- source image stack
+- reconstruction outputs
+- user notes / provenance
+- exported metrics and figures
 
 ## Analysis, figures, and findings
 
-The repository is structured so that reusable analysis code lives in `src/vip_slap2_analysis`, while exploratory and session-specific work can be done from Jupyter notebooks in `notebooks/`.
+The long-term goal of this repo is not just file IO, but interpretable analysis products. Existing and in-progress analysis targets include:
 
-Shared plotting utilities currently live under:
-- `vip_slap2_analysis.plotting.plot_utils`
-- `vip_slap2_analysis.plotting.qc_plots`
+- stimulus-aligned glutamate and calcium response summaries
+- session-level QC tables and saved figures
+- depth-aware and DMD-aware summaries
+- morphology-derived descriptors such as cable length, branch points, tips, branch order, and Sholl structure
+- clean batch-rendered figures suitable for review, talks, and Illustrator polishing
 
-The intended direction is to keep figure generation reproducible and move stable logic out of notebooks into the library.
+Morphology plotting utilities currently support:
 
-## Morphology
+- XY / XZ / ZY projections
+- display-only smoothing for anisotropic z sampling
+- PDF / SVG / PNG export for downstream figure editing
 
-Morphology support is being added for traced VIP neurons reconstructed in Fiji with the SNT plugin.
+## References
 
-Planned morphology capabilities:
-- discover morphology assets from a reconstruction folder
-- open and validate SWC + SNT tables
-- compute morphometric summary tables
-- generate XY / XZ / YZ / 3D morphology figures
-- export clean SVG and PDF files for Illustrator refinement
-- support display-only smoothing for visually stepped arbors caused by anisotropic z sampling
+Primary external tools and concepts currently reflected in this repository include:
 
-See:
-- `docs/morphology_architecture.md`
-- `docs/morphology_preprocessing_and_tracing.md`
-- `notebooks/morphology/README.md`
+- Fiji / ImageJ
+- SNT (Simple Neurite Tracer / SNT)
+- Sholl analysis workflows
+- SLAP2 preprocessing and summary outputs
+- Allen Institute behavior and metadata tooling used alongside these analyses
 
-## Repository layout
+## Acknowledgements
 
-```text
-src/vip_slap2_analysis/
-    behavior/
-    calcium/
-    common/
-    glutamate/
-    io/
-    morphology/
-    plotting/
-    utils/
-    voltage/
-
-notebooks/
-    behavior/
-    glutamate/
-    metadata/
-    morphology/
-    qc/
-    voltage/
-
-docs/
-    morphology_architecture.md
-    morphology_preprocessing_and_tracing.md
-```
+This codebase supports ongoing work on VIP synaptic dynamics and related multimodal physiology/morphology analysis. It reflects ongoing development across analysis notebooks, scripts, and reusable package code for the Podgorski / Svoboda context.
 
 ## Install (editable)
 
@@ -160,10 +120,22 @@ docs/
 python -m pip install -e .
 ```
 
-## References
+## Minimal morphology example
 
-External tools and resources relevant to this repository include Fiji, SNT, HARP-based behavioral acquisition workflows, and the MATLAB preprocessing code used to generate SLAP2 experiment summaries.
+```python
+from vip_slap2_analysis.morphology import (
+    load_snt_bundle,
+    compute_basic_metrics,
+    plot_morphology_triptych,
+)
 
-## Acknowledgements
+bundle = load_snt_bundle(r"path\to\reconstruction_folder")
+metrics = compute_basic_metrics(bundle.tree)
+print(metrics)
 
-This repository supports the VIP Synaptic Dynamics project and related analysis workflows for SLAP2-based physiology and morphology datasets.
+fig, axes = plot_morphology_triptych(
+    bundle.tree,
+    smooth=True,
+    save_path_stem=r"path\to\figures\cell01_triptych",
+)
+```
