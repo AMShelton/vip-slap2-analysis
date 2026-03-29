@@ -275,20 +275,48 @@ def _trial_trace_as_syn_by_time(
     *,
     signal: str = "dF",
     mode: str = "ls",
+    channel: int = 0,
 ) -> np.ndarray:
-    x = exp.get_traces(dmd=dmd, trial=trial, signal=signal, mode=mode, squeeze_channels=True)
+    """
+    Return a trial trace matrix as (n_synapses, n_time).
+
+    Accepts either:
+    - 2D traces: (time, roi) or (roi, time)
+    - 3D traces: (time, roi, channel)
+
+    For 3D traces, selects the requested channel (default: channel 0,
+    assumed glutamate/green for glutamate extraction).
+    """
+    x = exp.get_traces(
+        dmd=dmd,
+        trial=trial,
+        signal=signal,
+        mode=mode,
+        squeeze_channels=False,
+    )
+
+    x = np.asarray(x, dtype=float)
+
+    if x.ndim == 3:
+        if x.shape[2] <= channel:
+            raise ValueError(
+                f"Requested channel {channel} but trace shape is {x.shape}"
+            )
+        x = x[:, :, channel]
+
     if x.ndim != 2:
-        raise ValueError(f"Expected 2D trace matrix, got shape {x.shape}")
+        raise ValueError(f"Expected 2D trace matrix after channel selection, got shape {x.shape}")
 
     n0, n1 = x.shape
     expected_n_syn = int(exp.n_synapses[dmd - 1]) if len(exp.n_synapses) >= dmd else None
+
     if expected_n_syn is not None and n1 == expected_n_syn:
-        return np.asarray(x, dtype=float).T
+        return x.T
     if expected_n_syn is not None and n0 == expected_n_syn:
-        return np.asarray(x, dtype=float)
+        return x
     if n0 >= n1:
-        return np.asarray(x, dtype=float).T
-    return np.asarray(x, dtype=float)
+        return x.T
+    return x
 
 
 def reconstruct_dmd_session_traces(
@@ -314,7 +342,14 @@ def reconstruct_dmd_session_traces(
     for trial in range(1, n_trials + 1):
         if trial not in valid_set:
             continue
-        arr = _trial_trace_as_syn_by_time(exp, dmd=dmd, trial=trial, signal=signal, mode=mode)
+        arr = _trial_trace_as_syn_by_time(
+                exp,
+                dmd=dmd,
+                trial=trial,
+                signal=signal,
+                mode=mode,
+                channel=0,
+            )
         valid_trial_data[trial] = arr
         valid_lengths.append(arr.shape[1])
         if n_syn_expected is None:

@@ -154,6 +154,54 @@ def _evaluate_roi(metrics: Dict[str, float], thr: CalciumQcThresholds) -> Tuple[
     keep = all(checks.values())
     return keep, checks, fail_reasons
 
+def _has_readable_soma_ca_data(
+    exp: GlutamateSummary,
+    dmd: int,
+    *,
+    trace_type: str = "Fsvd",
+) -> Tuple[bool, Optional[str]]:
+    """
+    Check whether this DMD has readable exported manual soma ROI traces.
+
+    Returns
+    -------
+    ok : bool
+        True if a readable 2D/3D user-ROI trace matrix is found on at least one valid trial.
+    reason : Optional[str]
+        Human-readable failure reason when ok is False.
+    """
+    try:
+        keep = np.asarray(exp.keep_trials[dmd - 1], dtype=bool)
+        valid_trials = np.flatnonzero(keep)
+        if valid_trials.size == 0:
+            return False, "no valid trials"
+
+        last_err: Optional[Exception] = None
+
+        for t0 in valid_trials:
+            try:
+                x = exp.get_user_roi_traces(
+                    dmd=dmd,
+                    trial=int(t0) + 1,
+                    trace_type=trace_type,
+                    squeeze_channels=False,
+                )
+                x = np.asarray(x)
+
+                if x.ndim in (2, 3) and x.size > 0:
+                    return True, None
+
+            except Exception as e:
+                last_err = e
+                continue
+
+        reason = "no readable manual soma ROI traces in SummaryLoCo"
+        if last_err is not None:
+            reason += f"; last error={repr(last_err)}"
+        return False, reason
+
+    except Exception as e:
+        return False, f"failed to inspect soma ROI traces: {repr(e)}"
 
 def run_calcium_qc(
     asset: SessionAssets,
@@ -162,7 +210,7 @@ def run_calcium_qc(
     indicator_regex: str = DEFAULT_CAMP_REGEX,
     trace_type: str = "Fsvd",
     motion_correct: bool = False,
-    max_session_minutes = None,
+    max_session_minutes=None,
     thresholds: Optional[CalciumQcThresholds] = None,
     overwrite: bool = False,
     process_kwargs: Optional[Dict[str, Any]] = None,
@@ -203,7 +251,7 @@ def run_calcium_qc(
 
     if not should_process:
         obj = {
-            "schema_version": "0.2.0",
+            "schema_version": "0.2.1",
             "session_id": asset.session_id,
             "subject_id": int(asset.subject_id),
             "indicator2": indicator2,
@@ -228,18 +276,43 @@ def run_calcium_qc(
         keep_trials = np.asarray(exp.keep_trials[dmd - 1], dtype=bool)
         valid_trial_fraction = float(np.mean(keep_trials)) if keep_trials.size else 0.0
 
+        has_soma_data, missing_reason = _has_readable_soma_ca_data(
+            exp,
+            dmd=dmd,
+            trace_type=trace_type,
+        )
+
+        if not has_soma_data:
+            keep_mask = np.zeros((0,), dtype=bool)
+            np.save(keep_paths[label], keep_mask)
+            per_dmd[label] = {
+                "processed": False,
+                "skipped": True,
+                "reason": missing_reason,
+                "n_trials": int(np.sum(keep_trials)),
+                "n_rois_total": 0,
+                "n_rois_kept": 0,
+                "valid_trial_fraction": valid_trial_fraction,
+                "session_valid_trial_fraction_pass": bool(valid_trial_fraction >= thresholds.min_valid_trial_fraction),
+                "keep_mask_path": str(keep_paths[label]),
+                "thresholds": asdict(thresholds),
+                "roi_fail_reason_counts": {},
+            }
+            continue
+
         proc = exp.get_processed_soma_ca_all_trials(
             dmd=dmd,
             trace_type=trace_type,
             fs_hz=fs_hz,
             include_invalid=True,
             motion_correct=motion_correct,
-            max_session_minutes = max_session_minutes,
+            max_session_minutes=max_session_minutes,
             **process_kwargs,
         )
         dff = np.asarray(proc["dff"], dtype=float)
         if dff.ndim != 3:
             raise ValueError(f"Expected processed calcium dff shape (n_trials, n_rois, T), got {dff.shape}")
+
         n_trials, n_rois, trial_len = dff.shape
         concat = _concat_trials_with_nans(dff)
 
@@ -251,6 +324,7 @@ def run_calcium_qc(
             roi_id = f"{label}_roi{roi_index:04d}"
             metrics = _roi_metrics(concat[roi_index])
             keep, checks, fail_reasons = _evaluate_roi(metrics, thresholds)
+
             if not keep_due_to_session:
                 keep = False
                 fail_reasons = ["valid_trial_fraction"] + fail_reasons
@@ -284,6 +358,7 @@ def run_calcium_qc(
         np.save(keep_paths[label], keep_mask)
         per_dmd[label] = {
             "processed": True,
+            "skipped": False,
             "n_trials": int(n_trials),
             "n_rois_total": int(n_rois),
             "n_rois_kept": int(np.sum(keep_mask)),
@@ -295,31 +370,37 @@ def run_calcium_qc(
         }
 
     table = pd.DataFrame(rows)
-    table.to_csv(qc_csv, index=False)
+    if len(table) > 0:
+        table.to_csv(qc_csv, index=False)
+        qc_csv_str: Optional[str] = str(qc_csv)
+    else:
+        qc_csv_str = None
+
+    any_processed = any(v.get("processed", False) for v in per_dmd.values())
 
     obj = {
-        "schema_version": "0.2.0",
+        "schema_version": "0.2.1",
         "session_id": asset.session_id,
         "subject_id": int(asset.subject_id),
         "indicator2": indicator2,
         "indicator_regex": indicator_regex,
-        "should_process_calcium": True,
+        "should_process_calcium": bool(any_processed),
         "trace_type": trace_type,
         "motion_correct": bool(motion_correct),
         "fs_hz": float(fs_hz),
         "thresholds": asdict(thresholds),
         "per_dmd": per_dmd,
-        "qc_table_csv": str(qc_csv),
+        "qc_table_csv": qc_csv_str,
     }
     with open(qc_json, "w") as f:
         json.dump(obj, f, indent=2)
 
     return CalciumQcResult(
-        should_process_calcium=True,
+        should_process_calcium=bool(any_processed),
         indicator2=indicator2,
         indicator_regex=indicator_regex,
         qc_json=str(qc_json),
-        qc_table_csv=str(qc_csv),
+        qc_table_csv=qc_csv_str,
         keep_masks={k: str(v) for k, v in keep_paths.items()},
         per_dmd=per_dmd,
     )

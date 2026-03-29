@@ -1690,23 +1690,55 @@ class GlutamateSummary:
         roi_inds: Optional[Sequence[int]] = None,
     ) -> Tuple[int, int]:
         """
-        Determine (n_rois, n_time) from the first valid trial.
+        Determine (n_rois, n_time) from the first *readable* valid trial.
+
+        This is more defensive than the original implementation:
+        - it iterates over valid trials until it finds a usable user-ROI trace matrix
+        - it skips malformed/missing user-ROI exports
+        - it raises a clear error if no readable manual soma ROI traces exist
         """
         dmd0 = dmd - 1
-        t0 = self._first_valid_trial(dmd0)
-        if t0 is None:
+        keep = np.asarray(self.keep_trials[dmd0], dtype=bool)
+        valid_trials = np.flatnonzero(keep)
+
+        if valid_trials.size == 0:
             raise ValueError(f"No valid trials found for dmd={dmd}")
 
-        x = self.get_user_roi_traces(dmd=dmd, trial=t0 + 1, trace_type=trace_type, roi_inds=roi_inds)
-        if x.ndim == 3:
-            n_rois = x.shape[0]
-            n_time = x.shape[2]
-        elif x.ndim == 2:
-            n_rois = x.shape[0]
-            n_time = x.shape[1]
-        else:
-            raise ValueError(f"Unexpected user ROI trace shape: {x.shape}")
-        return int(n_rois), int(n_time)
+        last_err: Optional[Exception] = None
+
+        for t0 in valid_trials:
+            try:
+                x = self.get_user_roi_traces(
+                    dmd=dmd,
+                    trial=int(t0) + 1,
+                    trace_type=trace_type,
+                    roi_inds=roi_inds,
+                )
+                x = np.asarray(x)
+
+                if x.ndim == 3:
+                    n_rois = x.shape[0]
+                    n_time = x.shape[2]
+                    if n_rois > 0 and n_time > 0:
+                        return int(n_rois), int(n_time)
+
+                elif x.ndim == 2:
+                    n_rois = x.shape[0]
+                    n_time = x.shape[1]
+                    if n_rois > 0 and n_time > 0:
+                        return int(n_rois), int(n_time)
+
+            except Exception as e:
+                last_err = e
+                continue
+
+        msg = (
+            f"No readable user ROI trace matrices found for dmd={dmd}. "
+            f"This session may lack exported manual soma ROI traces in SummaryLoCo."
+        )
+        if last_err is not None:
+            msg += f" Last error: {repr(last_err)}"
+        raise ValueError(msg)
 
     def get_processed_soma_ca_all_trials(
         self,

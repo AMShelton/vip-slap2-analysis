@@ -131,6 +131,47 @@ def _build_sequence_output(
 
     return out
 
+def _has_readable_soma_ca_data(
+    exp: GlutamateSummary,
+    dmd: int,
+    *,
+    trace_type: str = "Fsvd",
+) -> Tuple[bool, Optional[str]]:
+    """
+    Check whether this DMD has readable exported manual soma ROI traces.
+    """
+    try:
+        keep = np.asarray(exp.keep_trials[dmd - 1], dtype=bool)
+        valid_trials = np.flatnonzero(keep)
+        if valid_trials.size == 0:
+            return False, "no valid trials"
+
+        last_err: Optional[Exception] = None
+
+        for t0 in valid_trials:
+            try:
+                x = exp.get_user_roi_traces(
+                    dmd=dmd,
+                    trial=int(t0) + 1,
+                    trace_type=trace_type,
+                    squeeze_channels=False,
+                )
+                x = np.asarray(x)
+
+                if x.ndim in (2, 3) and x.size > 0:
+                    return True, None
+
+            except Exception as e:
+                last_err = e
+                continue
+
+        reason = "no readable manual soma ROI traces in SummaryLoCo"
+        if last_err is not None:
+            reason += f"; last error={repr(last_err)}"
+        return False, reason
+
+    except Exception as e:
+        return False, f"failed to inspect soma ROI traces: {repr(e)}"
 
 def _reconstruct_ca_session_traces(
     exp: GlutamateSummary,
@@ -287,7 +328,7 @@ def process_calcium_extraction(
     tvecs = _time_vectors(windows, im_rate_hz)
 
     base_meta = {
-        "schema_version": "0.1.0",
+        "schema_version": "0.1.1",
         "session_id": asset.session_id,
         "subject_id": int(asset.subject_id),
         "summary_mat": str(asset.summary_mat),
@@ -310,7 +351,7 @@ def process_calcium_extraction(
     seq_pkg: Dict[str, Any] = {"metadata": base_meta, "timebase_sec": {"image": tvecs["image"]}, "DMD1": {}, "DMD2": {}}
 
     meta_out: Dict[str, Any] = {
-        "schema_version": "0.1.0",
+        "schema_version": "0.1.1",
         "session_id": asset.session_id,
         "indicator2": indicator2,
         "motion_correct": bool(motion_correct),
@@ -333,6 +374,14 @@ def process_calcium_extraction(
     seq_events = build_change_locked_sequences(ordered_images_f)
 
     for dmd in (1, 2):
+        has_soma_data, missing_reason = _has_readable_soma_ca_data(exp, dmd=dmd, trace_type="Fsvd")
+        if not has_soma_data:
+            meta_out["per_dmd"][f"DMD{dmd}"] = {
+                "skipped": True,
+                "reason": missing_reason,
+            }
+            continue
+
         bundle = _reconstruct_ca_session_traces(
             exp,
             dmd=dmd,
@@ -340,7 +389,7 @@ def process_calcium_extraction(
             epoch_start_sec=epoch_start_sec,
             motion_correct=motion_correct,
             use_glu=use_glu,
-            max_session_minutes = max_session_minutes,
+            max_session_minutes=max_session_minutes,
         )
         if bundle["traces"].size == 0:
             meta_out["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no calcium traces"}
@@ -424,6 +473,7 @@ def process_calcium_extraction(
         zero_count_ids = [img for img, cnt in image_count_by_id.items() if cnt == 0]
 
         meta_out["per_dmd"][f"DMD{dmd}"] = {
+            "skipped": False,
             "n_rois_total": n_rois_total,
             "n_rois_kept": n_rois_kept,
             "n_trials_total": int(len(bundle["trial_valid_mask"])),
