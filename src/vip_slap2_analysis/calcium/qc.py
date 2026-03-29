@@ -18,11 +18,11 @@ DEFAULT_CAMP_REGEX = r"(?i)^[A-Za-z]*CaMP\d+[A-Za-z0-9._-]*$"
 
 @dataclass
 class CalciumQcThresholds:
-    min_valid_trial_fraction: float = 0.75
-    min_finite_fraction: float = 0.85
-    min_dynamic_range: float = 0.15
-    min_abs_peak_p99: float = 0.18
-    min_snr_like: float = 4.0
+    min_valid_trial_fraction: float = 0.5
+    min_finite_fraction: float = 0.75
+    min_dynamic_range: float = 0.10
+    min_abs_peak_p99: float = 0.12
+    min_snr_like: float = 2.0
     max_abs_drift: float = 0.05
     max_drift_frac: float = 0.30
 
@@ -162,6 +162,7 @@ def run_calcium_qc(
     indicator_regex: str = DEFAULT_CAMP_REGEX,
     trace_type: str = "Fsvd",
     motion_correct: bool = False,
+    max_session_minutes = None,
     thresholds: Optional[CalciumQcThresholds] = None,
     overwrite: bool = False,
     process_kwargs: Optional[Dict[str, Any]] = None,
@@ -233,6 +234,7 @@ def run_calcium_qc(
             fs_hz=fs_hz,
             include_invalid=True,
             motion_correct=motion_correct,
+            max_session_minutes = max_session_minutes,
             **process_kwargs,
         )
         dff = np.asarray(proc["dff"], dtype=float)

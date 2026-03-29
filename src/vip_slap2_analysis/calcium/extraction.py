@@ -138,18 +138,29 @@ def _reconstruct_ca_session_traces(
     *,
     im_rate_hz: float,
     epoch_start_sec: float,
-    motion_correct: bool = False,
+    motion_correct: bool = True,
+    use_glu: bool = True,
+    max_session_minutes = None
 ) -> Dict[str, Any]:
     """
     Reconstruct session-wide soma Ca traces by concatenating all trials in order.
     Invalid trials are represented as NaN blocks.
+
+    Uses:
+        exp.get_processed_soma_ca_all_trials(... )["dff"]
+
+    Expected dff shape from your implementation:
+        (n_trials, n_rois, n_samples)
     """
-    ca = exp.get_processed_soma_ca_all_trials(
+    ca_dict = exp.get_processed_soma_ca_all_trials(
         dmd=dmd,
         motion_correct=motion_correct,
+        use_glu_as_motion_regressor=use_glu,
+        max_session_minutes = max_session_minutes
+
     )
 
-    if ca is None:
+    if ca_dict is None:
         return {
             "traces": np.empty((0, 0), dtype=float),
             "trial_valid_mask": np.zeros((0,), dtype=bool),
@@ -159,11 +170,22 @@ def _reconstruct_ca_session_traces(
             "reconstructed_duration_sec": 0.0,
         }
 
-    # expected shape: (n_rois, n_trials, n_samples)
-    if ca.ndim != 3:
-        raise ValueError(f"Expected Ca array shape (n_rois, n_trials, n_samples), got {ca.shape}")
+    if "dff" not in ca_dict:
+        raise KeyError(
+            "get_processed_soma_ca_all_trials(...) did not return key 'dff'. "
+            f"Available keys: {list(ca_dict.keys())}"
+        )
 
-    n_rois, n_trials, n_samples = ca.shape
+    ca = np.asarray(ca_dict["dff"], dtype=float)
+
+    # expected shape: (n_trials, n_rois, n_samples)
+    if ca.ndim != 3:
+        raise ValueError(
+            f"Expected Ca dff shape (n_trials, n_rois, n_samples), got {ca.shape}"
+        )
+
+    n_trials, n_rois, n_samples = ca.shape
+
     if n_rois == 0 or n_trials == 0 or n_samples == 0:
         return {
             "traces": np.empty((0, 0), dtype=float),
@@ -181,7 +203,8 @@ def _reconstruct_ca_session_traces(
 
     pos = 0
     for t in range(n_trials):
-        block = ca[:, t, :]
+        # block shape: (n_rois, n_samples)
+        block = ca[t, :, :]
         traces[:, pos:pos + n_samples] = block
         trial_valid_mask[t] = np.isfinite(block).any()
         pos += n_samples
@@ -189,8 +212,8 @@ def _reconstruct_ca_session_traces(
     timebase_sec = epoch_start_sec + np.arange(total_samples, dtype=float) / float(im_rate_hz)
 
     return {
-        "traces": traces,
-        "trial_valid_mask": trial_valid_mask,
+        "traces": traces,                       # (n_rois, total_samples)
+        "trial_valid_mask": trial_valid_mask,  # (n_trials,)
         "trial_lengths_samples": trial_lengths,
         "session_start_sec": float(epoch_start_sec),
         "timebase_sec": timebase_sec,
@@ -203,7 +226,9 @@ def process_calcium_extraction(
     *,
     metadata: Optional[Dict[str, Any]] = None,
     use_soma_qc: bool = True,
-    motion_correct: bool = False,
+    motion_correct: bool = True,
+    use_glu: bool = True,
+    max_session_minutes=None,
     overwrite: bool = False,
 ) -> Dict[str, Any]:
     metadata = metadata or {}
@@ -314,6 +339,8 @@ def process_calcium_extraction(
             im_rate_hz=im_rate_hz,
             epoch_start_sec=epoch_start_sec,
             motion_correct=motion_correct,
+            use_glu=use_glu,
+            max_session_minutes = max_session_minutes,
         )
         if bundle["traces"].size == 0:
             meta_out["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no calcium traces"}
@@ -331,21 +358,23 @@ def process_calcium_extraction(
         n_rois_kept = int(np.sum(roi_mask))
         roi_ids = np.array([f"DMD{dmd}_roi{i:04d}" for i in range(n_rois_total)])[roi_mask]
 
-        aligned_images = align_traces_to_session_intervals(
+        aligned_images, image_onsets = align_traces_to_session_intervals(
             bundle,
             image_times_f,
             im_rate_hz=im_rate_hz,
             pre_time=windows.image[0],
             post_time=windows.image[1],
         )
-        aligned_changes = align_traces_to_session_intervals(
+
+        aligned_changes, change_onsets = align_traces_to_session_intervals(
             bundle,
             change_times_f,
             im_rate_hz=im_rate_hz,
             pre_time=windows.change[0],
             post_time=windows.change[1],
         )
-        aligned_omissions = align_traces_to_session_intervals(
+
+        aligned_omissions, omission_onsets = align_traces_to_session_intervals(
             bundle,
             omission_times_f,
             im_rate_hz=im_rate_hz,

@@ -273,7 +273,7 @@ def process_glutamate_extraction(
             im_rate_hz=im_rate_hz,
             pre_time=windows.image[0],
             post_time=windows.image[1],
-            return_used_onsets=True,
+            return_used_onsets=True
         )
         aligned_changes, change_onsets_used = align_traces_to_session_intervals(
             bundle,
@@ -281,7 +281,7 @@ def process_glutamate_extraction(
             im_rate_hz=im_rate_hz,
             pre_time=windows.change[0],
             post_time=windows.change[1],
-            return_used_onsets=True,
+            return_used_onsets=True
         )
         aligned_omissions, omission_onsets_used = align_traces_to_session_intervals(
             bundle,
@@ -289,7 +289,7 @@ def process_glutamate_extraction(
             im_rate_hz=im_rate_hz,
             pre_time=windows.omission[0],
             post_time=windows.omission[1],
-            return_used_onsets=True,
+            return_used_onsets=True
         )
 
         aligned_images = {k: _apply_synapse_mask_to_array(v, syn_mask) for k, v in aligned_images.items()}

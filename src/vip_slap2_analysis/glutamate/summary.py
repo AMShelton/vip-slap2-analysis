@@ -212,14 +212,21 @@ def unmix_ca_with_glu_hp_regress(
     """
     Remove glutamate-shaped contamination from Ca by fitting on high-pass components:
       ca_hp ≈ beta * glu_hp + intercept
-    then subtract beta*glu from raw ca.
+    and subtracting only the fitted high-pass glutamate nuisance from the raw Ca trace.
+
+    Notes
+    -----
+    The fitted coefficient is estimated on high-pass traces, so we subtract
+    ``beta * glu_hp`` rather than ``beta * glu``. Subtracting the full glutamate
+    trace can introduce slow step-like offsets and remove meaningful biological
+    structure from the Ca signal.
     """
     ca = np.asarray(ca, float)
     glu = np.asarray(glu, float)
     if ca.shape != glu.shape or ca.ndim != 2:
         raise ValueError("ca and glu must be (n_rois, n_samples) and match shape")
 
-    n_rois, n = ca.shape
+    n_rois, _ = ca.shape
     win = max(3, int(round(hp_window_s * fs_hz)))
     if win % 2 == 0:
         win += 1
@@ -240,8 +247,10 @@ def unmix_ca_with_glu_hp_regress(
         ca_f[~np.isfinite(ca_f)] = np.nanmedian(ca_f[finite])
         glu_f[~np.isfinite(glu_f)] = np.nanmedian(glu_f[finite])
 
-        ca_hp = ca_f - _moving_average_reflect(ca_f, win)
-        glu_hp = glu_f - _moving_average_reflect(glu_f, win)
+        ca_lp = _moving_average_reflect(ca_f, win)
+        glu_lp = _moving_average_reflect(glu_f, win)
+        ca_hp = ca_f - ca_lp
+        glu_hp = glu_f - glu_lp
 
         x = glu_hp[finite]
         y = ca_hp[finite]
@@ -253,7 +262,7 @@ def unmix_ca_with_glu_hp_regress(
 
         beta[i] = b0
         intercept[i] = b1
-        out[i, finite] = ca_i[finite] - beta[i] * glu_i[finite]
+        out[i, finite] = ca_i[finite] - beta[i] * glu_hp[finite]
 
     return UnmixResult(out, beta, intercept, method="hp_regress")
 
@@ -1296,49 +1305,119 @@ class GlutamateSummary:
         n = min(glu2.shape[0], ca2.shape[0])
         return glu2[:n], ca2[:n]
     
-    def process_ca_trace_extended(
+    def _estimate_ca_baseline(
+        self,
+        x: np.ndarray,
+        fs_hz: float,
+        *,
+        baseline_method: Literal["hull", "percentile"] = "percentile",
+        denoise_window_s: float = 2.0,
+        hull_window_s: float = 90.0,
+        baseline_window_s: float = 20.0,
+        baseline_q: float = 15.0,
+        baseline_smooth_s: float = 2.0,
+        eps: float = 1e-6,
+        f0_floor_frac: float = 0.15,
+    ) -> np.ndarray:
+        """Estimate a fluorescence-domain baseline for one ROI trace."""
+        x = np.asarray(x, float)
+        finite = np.isfinite(x)
+        if finite.mean() < 0.5:
+            return np.full_like(x, np.nan, dtype=float)
+
+        if baseline_method == "hull":
+            denoise_w = max(3, int(round(denoise_window_s * fs_hz)))
+            hull_w = max(denoise_w + 1, int(round(hull_window_s * fs_hz)))
+            base = compute_f0(x, denoise_window=denoise_w, hull_window=hull_w).reshape(-1)
+            method = "hull"
+        else:
+            base = _baseline_percentile_filter(
+                x,
+                fs_hz=fs_hz,
+                window_s=baseline_window_s,
+                q=baseline_q,
+                smooth_s=baseline_smooth_s,
+                eps=eps,
+            )
+            method = "percentile_filter"
+
+        x_ref = np.nanpercentile(x[finite], 20) if np.any(finite) else np.nan
+        floor = max(eps, f0_floor_frac * x_ref) if np.isfinite(x_ref) else eps
+        base = np.maximum(base, floor)
+        base[~finite] = np.nan
+        return base
+
+    @staticmethod
+    def _glu_hp_nuisance(
+        glu: np.ndarray,
+        fs_hz: float,
+        hp_window_s: float,
+    ) -> np.ndarray:
+        """Build a standardized high-pass glutamate nuisance regressor."""
+        g = np.asarray(glu, float).reshape(-1)
+        win = max(3, int(round(hp_window_s * fs_hz)))
+        if win % 2 == 0:
+            win += 1
+
+        gf = g.copy()
+        finite = np.isfinite(gf)
+        if finite.any():
+            gf[~finite] = np.nanmedian(gf[finite])
+        else:
+            return np.zeros_like(gf)
+
+        g_hp = gf - _moving_average_reflect(gf, win)
+        mu = np.nanmean(g_hp)
+        sd = np.nanstd(g_hp)
+        if np.isfinite(sd) and sd > 0:
+            g_hp = (g_hp - mu) / (sd + 1e-12)
+        else:
+            g_hp = np.zeros_like(g_hp)
+        return g_hp
+
+    def _process_soma_ca_trial(
         self,
         ca: np.ndarray,
         fs_hz: float,
         glu: Optional[np.ndarray] = None,
         *,
-        # artifact masking (ported)
+        X_motion: Optional[np.ndarray] = None,
+        motion_names: Optional[Sequence[str]] = None,
         mask_artifacts: bool = True,
         std_factor: float = 20.0,
         nan_pad: int = 10,
-        # unmixing
         unmix: bool = True,
         hp_window_s: float = 0.2,
         ridge: float = 1e-6,
-        # motion regression
         motion_correct: bool = True,
-        motion_ridge: float = 1e-2,
-        use_motion_fields: Sequence[str] = ("onlineXshift","onlineYshift","motionDSr","motionDSc"),
-        use_glu_as_motion_regressor: bool = True,
+        motion_ridge: float = 1e-1,
+        use_glu_as_motion_regressor: bool = False,
         glu_motion_hp_window_s: float = 0.5,
-        # baseline + dff
+        motion_regress_on: Literal["dF", "F"] = "dF",
         compute_dff: bool = True,
-        baseline_window_s: float = 4.0,
+        baseline_method: Literal["hull", "percentile"] = "percentile",
+        denoise_window_s: float = 2.0,
+        hull_window_s: float = 90.0,
+        f0_floor_frac: float = 0.05,
+        baseline_window_s: float = 10.0,
         baseline_q: float = 10.0,
         baseline_smooth_s: float = 1.0,
         eps: float = 1e-6,
     ) -> Dict[str, Any]:
         """
-        Extended Ca processing:
-          (optional) artifact masking
-          (optional) unmix Ca using Glu
-          (optional) baseline + dF/F
-        Inputs:
-          ca: (n_rois, n_samples)
-          glu: (n_rois, n_samples) if unmixing
+        Process one trial of paired soma Ca / glutamate traces while preserving
+        the legacy return contract used by extraction and QC.
         """
         ca = np.asarray(ca, float)
         if ca.ndim != 2:
             raise ValueError("ca must be (n_rois, n_samples)")
 
-        n_rois, n = ca.shape
+        n_rois, n_time = ca.shape
+        if glu is not None:
+            glu = np.asarray(glu, float)
+            if glu.shape != ca.shape:
+                raise ValueError(f"glu must match ca shape; got {glu.shape} vs {ca.shape}")
 
-        # 1) artifact masking (per ROI)
         ca_clean = ca.copy()
         if mask_artifacts:
             for i in range(n_rois):
@@ -1347,58 +1426,218 @@ class GlutamateSummary:
                         ca_clean[i], std_factor=std_factor, nan_pad=nan_pad
                     )
 
-        # 2) unmixing
         unmix_res: Optional[UnmixResult] = None
-        ca_unmixed = ca_clean
+        ca_unmixed = ca_clean.copy()
         if unmix:
             if glu is None:
                 raise ValueError("glu must be provided when unmix=True")
-            glu = np.asarray(glu, float)
-            if glu.shape != ca.shape:
-                raise ValueError(f"glu must match ca shape; got {glu.shape} vs {ca.shape}")
             unmix_res = unmix_ca_with_glu_hp_regress(
-                ca=ca_clean, glu=glu, fs_hz=fs_hz,
-                hp_window_s=hp_window_s, ridge=ridge
+                ca=ca_clean,
+                glu=glu,
+                fs_hz=fs_hz,
+                hp_window_s=hp_window_s,
+                ridge=ridge,
             )
             ca_unmixed = unmix_res.ca_unmixed
 
-        # 2.5) motion decorrelation (trace-space "motion correction")
+        motion_names_list = list(motion_names) if motion_names is not None else []
+        beta_motion = None
+
+        if X_motion is None:
+            X_motion = np.zeros((n_time, 0), dtype=float)
+        else:
+            X_motion = np.asarray(X_motion, float)
+            if X_motion.ndim == 1:
+                X_motion = X_motion[:, None]
+            if X_motion.shape[0] != n_time:
+                raise ValueError(
+                    f"X_motion must have shape (n_time, P) with n_time={n_time}; got {X_motion.shape}"
+                )
+
+        baseline = np.full_like(ca_unmixed, np.nan, dtype=float)
+        dff = np.full_like(ca_unmixed, np.nan, dtype=float)
         ca_mc = ca_unmixed.copy()
-        motion_betas = None
-        motion_names = None
+        dff_method = baseline_method if baseline_method == "hull" else "percentile_filter"
 
-        if motion_correct:
-            # X_motion must be provided externally (per-trial) OR built by caller;
-            # easiest: have caller pass X_motion.
-            pass
+        if motion_correct and motion_regress_on == "dF":
+            dF = np.full_like(ca_unmixed, np.nan, dtype=float)
+            dF_mc = np.full_like(ca_unmixed, np.nan, dtype=float)
+            beta_rows: List[np.ndarray] = []
+            names_out = list(motion_names_list)
+            if use_glu_as_motion_regressor:
+                names_out = names_out + ["glu_hp"]
 
-        # 3) baseline + dF/F
-        dff_res: Optional[DffResult] = None
-        if compute_dff:
-            baseline = np.full_like(ca_unmixed, np.nan)
-            dff = np.full_like(ca_unmixed, np.nan)
             for i in range(n_rois):
-                xi = ca_unmixed[i]
-                finite = np.isfinite(xi)
-                if finite.mean() < 0.5:
-                    continue
-                base = _baseline_percentile_filter(
-                    xi, fs_hz=fs_hz,
-                    window_s=baseline_window_s,
-                    q=baseline_q,
-                    smooth_s=baseline_smooth_s,
-                    eps=eps
+                base = self._estimate_ca_baseline(
+                    ca_unmixed[i],
+                    fs_hz,
+                    baseline_method=baseline_method,
+                    denoise_window_s=denoise_window_s,
+                    hull_window_s=hull_window_s,
+                    baseline_window_s=baseline_window_s,
+                    baseline_q=baseline_q,
+                    baseline_smooth_s=baseline_smooth_s,
+                    eps=eps,
+                    f0_floor_frac=f0_floor_frac,
                 )
                 baseline[i] = base
-                dff[i, finite] = (xi[finite] - base[finite]) / base[finite]
-            dff_res = DffResult(dff=dff, baseline=baseline, method="percentile_filter")
+                finite = np.isfinite(ca_unmixed[i]) & np.isfinite(base)
+                if finite.mean() < 0.5:
+                    beta_rows.append(np.full((X_motion.shape[1] + (1 if use_glu_as_motion_regressor else 0) + 1,), np.nan))
+                    continue
+
+                dF_i = np.full(n_time, np.nan, dtype=float)
+                dF_i[finite] = ca_unmixed[i, finite] - base[finite]
+                dF[i] = dF_i
+
+                Xi = X_motion
+                if use_glu_as_motion_regressor:
+                    if glu is None:
+                        raise ValueError("glu must be provided when use_glu_as_motion_regressor=True")
+                    g_hp = self._glu_hp_nuisance(glu[i], fs_hz=fs_hz, hp_window_s=glu_motion_hp_window_s)
+                    Xi = np.column_stack([Xi, g_hp]) if Xi.size else g_hp[:, None]
+
+                y_resid, b_mc = regress_out_(dF_i, Xi, ridge=motion_ridge)
+                dF_mc[i] = y_resid
+                beta_rows.append(b_mc)
+
+                finite2 = np.isfinite(y_resid) & np.isfinite(base)
+                if finite2.mean() >= 0.5:
+                    dff[i, finite2] = y_resid[finite2] / base[finite2]
+                    ca_mc[i, finite2] = base[finite2] + y_resid[finite2]
+                    ca_mc[i, ~finite2] = np.nan
+                else:
+                    ca_mc[i] = np.nan
+
+            beta_motion = np.stack(beta_rows, axis=0) if beta_rows else None
+            motion_names_list = names_out
+
+        else:
+            if motion_correct and X_motion.size:
+                beta_rows = []
+                names_out = list(motion_names_list)
+                if use_glu_as_motion_regressor:
+                    names_out = names_out + ["glu_hp"]
+
+                for i in range(n_rois):
+                    Xi = X_motion
+                    if use_glu_as_motion_regressor:
+                        if glu is None:
+                            raise ValueError("glu must be provided when use_glu_as_motion_regressor=True")
+                        g_hp = self._glu_hp_nuisance(glu[i], fs_hz=fs_hz, hp_window_s=glu_motion_hp_window_s)
+                        Xi = np.column_stack([Xi, g_hp]) if Xi.size else g_hp[:, None]
+                    y_resid, b_mc = regress_out_(ca_unmixed[i], Xi, ridge=motion_ridge)
+                    ca_mc[i] = y_resid
+                    beta_rows.append(b_mc)
+                beta_motion = np.stack(beta_rows, axis=0) if beta_rows else None
+                motion_names_list = names_out
+
+            if compute_dff:
+                for i in range(n_rois):
+                    base = self._estimate_ca_baseline(
+                        ca_mc[i],
+                        fs_hz,
+                        baseline_method=baseline_method,
+                        denoise_window_s=denoise_window_s,
+                        hull_window_s=hull_window_s,
+                        baseline_window_s=baseline_window_s,
+                        baseline_q=baseline_q,
+                        baseline_smooth_s=baseline_smooth_s,
+                        eps=eps,
+                        f0_floor_frac=f0_floor_frac,
+                    )
+                    baseline[i] = base
+                    finite = np.isfinite(ca_mc[i]) & np.isfinite(base)
+                    if finite.mean() < 0.5:
+                        continue
+                    dff[i, finite] = (ca_mc[i, finite] - base[finite]) / base[finite]
+
+        dff_res: Optional[DffResult]
+        if compute_dff:
+            dff_res = DffResult(dff=dff, baseline=baseline, method=dff_method)
+        else:
+            dff_res = None
 
         return {
             "ca_clean": ca_clean,
             "unmix": unmix_res,
             "ca_unmixed": ca_unmixed,
+            "ca_mc": ca_mc,
+            "beta_motion": beta_motion,
+            "motion_names": motion_names_list,
             "dff": dff_res,
         }
+
+    def process_ca_trace_extended(
+        self,
+        ca: np.ndarray,
+        fs_hz: float,
+        glu: Optional[np.ndarray] = None,
+        *,
+        mask_artifacts: bool = True,
+        std_factor: float = 20.0,
+        nan_pad: int = 10,
+        unmix: bool = True,
+        hp_window_s: float = 0.2,
+        ridge: float = 1e-6,
+        motion_correct: bool = True,
+        motion_ridge: float = 1e-1,
+        use_motion_fields: Sequence[str] = ("onlineXshift", "onlineYshift", "motionDSr", "motionDSc"),
+        use_glu_as_motion_regressor: bool = False,
+        glu_motion_hp_window_s: float = 0.5,
+        compute_dff: bool = True,
+        motion_regress_on: Literal["dF", "F"] = "dF",
+        baseline_method: Literal["hull", "percentile"] = "percentile",
+        denoise_window_s: float = 2.0,
+        hull_window_s: float = 90.0,
+        f0_floor_frac: float = 0.15,
+        baseline_window_s: float = 20.0,
+        baseline_q: float = 15.0,
+        baseline_smooth_s: float = 2.0,
+        eps: float = 1e-6,
+        X_motion: Optional[np.ndarray] = None,
+        motion_names: Optional[Sequence[str]] = None,
+        **_: Any,
+    ) -> Dict[str, Any]:
+        """
+        Backward-compatible public wrapper for single-trial Ca processing.
+
+        Notes
+        -----
+        - Glutamate loading and return keys are preserved.
+        - Motion correction now operates when `X_motion` is supplied.
+        - `use_motion_fields` is retained for API compatibility, but motion-field
+        construction is handled by `get_processed_soma_ca(...)` /
+        `get_processed_soma_ca_all_trials(...)`.
+        """
+        _ = use_motion_fields
+        return self._process_soma_ca_trial(
+            ca=ca,
+            glu=glu,
+            fs_hz=fs_hz,
+            X_motion=X_motion,
+            motion_names=motion_names,
+            mask_artifacts=mask_artifacts,
+            std_factor=std_factor,
+            nan_pad=nan_pad,
+            unmix=unmix,
+            hp_window_s=hp_window_s,
+            ridge=ridge,
+            motion_correct=motion_correct,
+            motion_ridge=motion_ridge,
+            use_glu_as_motion_regressor=use_glu_as_motion_regressor,
+            glu_motion_hp_window_s=glu_motion_hp_window_s,
+            motion_regress_on=motion_regress_on,
+            compute_dff=compute_dff,
+            baseline_method=baseline_method,
+            denoise_window_s=denoise_window_s,
+            hull_window_s=hull_window_s,
+            f0_floor_frac=f0_floor_frac,
+            baseline_window_s=baseline_window_s,
+            baseline_q=baseline_q,
+            baseline_smooth_s=baseline_smooth_s,
+            eps=eps,
+        )
 
     def get_processed_soma_ca(
         self,
@@ -1407,19 +1646,36 @@ class GlutamateSummary:
         trace_type: str = "Fsvd",
         roi_inds: Optional[Sequence[int]] = None,
         fs_hz: Optional[float] = None,
+        motion_correct: bool = True,
+        motion_use_fields: Sequence[str] = ("onlineXshift", "onlineYshift", "onlineZshift", "motionDSr", "motionDSc"),
+        motion_step_thresh_z: float = 3.0,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """
-        Loads soma ROI Glu/Ca traces from the summary file and runs processing.
-        """
+        """Load one trial of soma ROI Glu/Ca traces and run processing."""
         if fs_hz is None:
             fs_hz = float(self.metadata.get("analyzeHz", np.nan))
         if not np.isfinite(fs_hz) or fs_hz <= 0:
             raise ValueError("fs_hz must be provided or present in metadata['analyzeHz'].")
 
         glu, ca = self.get_soma_glu_ca_traces(dmd=dmd, trial=trial, trace_type=trace_type, roi_inds=roi_inds)
-        return self.process_ca_trace_extended(ca=ca, glu=glu, fs_hz=fs_hz, **kwargs)
-    
+        X_motion, mot_names = self._get_motion_regressors(
+            dmd=dmd,
+            trial=trial,
+            target_len=ca.shape[1],
+            use_fields=motion_use_fields,
+            motion_step_thresh_z=motion_step_thresh_z,
+        ) if motion_correct else (None, None)
+
+        return self.process_ca_trace_extended(
+            ca=ca,
+            glu=glu,
+            fs_hz=fs_hz,
+            motion_correct=motion_correct,
+            X_motion=X_motion,
+            motion_names=mot_names,
+            **kwargs,
+        )
+
     def _first_valid_trial(self, dmd0: int) -> Optional[int]:
         """Return 0-based trial index of first valid trial for this DMD, else None."""
         v = np.argwhere(self.keep_trials[dmd0])
@@ -1442,7 +1698,6 @@ class GlutamateSummary:
             raise ValueError(f"No valid trials found for dmd={dmd}")
 
         x = self.get_user_roi_traces(dmd=dmd, trial=t0 + 1, trace_type=trace_type, roi_inds=roi_inds)
-        # x is (n_rois, n_ch, n_time) or (n_rois, n_time) if squeeze_channels True (not used here)
         if x.ndim == 3:
             n_rois = x.shape[0]
             n_time = x.shape[2]
@@ -1452,6 +1707,7 @@ class GlutamateSummary:
         else:
             raise ValueError(f"Unexpected user ROI trace shape: {x.shape}")
         return int(n_rois), int(n_time)
+
     def get_processed_soma_ca_all_trials(
         self,
         dmd: int = 1,
@@ -1461,37 +1717,31 @@ class GlutamateSummary:
         pad_to: Literal["ref", "max_valid", "none"] = "ref",
         include_invalid: bool = True,
         *,
-        # --- motion regression options ---
         motion_correct: bool = True,
         motion_ridge: float = 1e-1,
         motion_use_fields: Sequence[str] = ("onlineXshift", "onlineYshift", "onlineZshift", "motionDSr", "motionDSc"),
         motion_step_thresh_z: float = 3.0,
         use_glu_as_motion_regressor: bool = False,
         glu_motion_hp_window_s: float = 0.5,
-        # --- baseline / dff options ---
         eps: float = 1e-6,
         motion_regress_on: Literal["dF", "F"] = "dF",
-        # --- baseline method options ---
-        baseline_method: Literal["hull", "percentile"] = "hull",
+        baseline_method: Literal["hull", "percentile"] = "percentile",
         denoise_window_s: float = 2.0,
         hull_window_s: float = 90.0,
-        f0_floor_frac: float = 0.05,  # floor as fraction of median fluorescence (recommended)
-        # percentile fallback
-        baseline_window_s: float = 10.0,
-        baseline_q: float = 10.0,
-        baseline_smooth_s: float = 1.0,
+        f0_floor_frac: float = 0.15,
+        baseline_window_s: float = 20.0,
+        baseline_q: float = 15.0,
+        baseline_smooth_s: float = 2.0,
+        max_session_minutes: Optional[float] = None,
         **proc_kwargs: Any,
     ) -> Dict[str, Any]:
         """
-        Process soma ROI Ca traces across ALL trials (invalid trials preserved as NaNs).
+        Process soma ROI Ca traces across all trials while preserving the existing
+        return contract used by QC and data extraction.
 
-        Recommended path (default): motion_regress_on="dF"
-        - compute baseline F0 on fluorescence-domain ca_unmixed (compute_f0 by default)
-        - dF = ca_unmixed - F0
-        - regress nuisance out of dF
-        - dF/F = dF_mc / F0
-
-        Returns dict with arrays shaped (n_trials, n_rois, Tpad) when pad_to != "none".
+        Returns arrays shaped (n_trials, n_rois, Tpad) when pad_to != "none".
+        When `max_session_minutes` is provided, later samples are left as NaN once
+        the cumulative kept duration exceeds that cutoff.
         """
         if fs_hz is None:
             fs_hz = float(self.metadata.get("analyzeHz", np.nan))
@@ -1515,18 +1765,13 @@ class GlutamateSummary:
         else:
             raise ValueError(f"pad_to must be 'ref', 'max_valid', or 'none'. Got: {pad_to}")
 
-        # If doing dF regression path, don't let process_ca_trace_extended compute dF/F
-        if motion_correct and motion_regress_on == "dF":
-            proc_kwargs = dict(proc_kwargs)
-            proc_kwargs.setdefault("compute_dff", False)
-
         if pad_to == "none":
             ca_clean_list: List[Optional[np.ndarray]] = [None] * self.n_trials
             ca_unmixed_list: List[Optional[np.ndarray]] = [None] * self.n_trials
             ca_mc_list: List[Optional[np.ndarray]] = [None] * self.n_trials
             baseline_list: List[Optional[np.ndarray]] = [None] * self.n_trials
             dff_list: List[Optional[np.ndarray]] = [None] * self.n_trials
-            beta_unmix = np.full((self.n_trials, n_rois_ref), np.nan)
+            beta_unmix = np.full((self.n_trials, n_rois_ref), np.nan, dtype=float)
         else:
             ca_clean = np.full((self.n_trials, n_rois_ref, Tpad), np.nan, dtype=float)
             ca_unmixed = np.full((self.n_trials, n_rois_ref, Tpad), np.nan, dtype=float)
@@ -1538,141 +1783,83 @@ class GlutamateSummary:
         beta_motion: List[Optional[np.ndarray]] = [None] * self.n_trials
         motion_names: List[Optional[List[str]]] = [None] * self.n_trials
 
-        denoise_w = max(3, int(round(denoise_window_s * fs_hz)))
-        hull_w = max(denoise_w + 1, int(round(hull_window_s * fs_hz)))
+        remaining_samples: Optional[int]
+        if max_session_minutes is None:
+            remaining_samples = None
+        else:
+            remaining_samples = max(0, int(round(float(max_session_minutes) * 60.0 * fs_hz)))
 
         for tr in range(1, self.n_trials + 1):
             valid = bool(self.keep_trials[dmd - 1, tr - 1])
-
             if not valid:
                 if not include_invalid:
                     if pad_to != "none":
                         raise ValueError("include_invalid=False requires pad_to='none' (so invalid can be None).")
                     continue
-                continue  # keep NaNs
+                continue
 
             glu, ca = self.get_soma_glu_ca_traces(dmd=dmd, trial=tr, trace_type=trace_type, roi_inds=roi_inds)
-
             if glu.shape[0] != n_rois_ref:
                 n_use = min(glu.shape[0], n_rois_ref)
                 glu = glu[:n_use]
                 ca = ca[:n_use]
 
-            out = self.process_ca_trace_extended(ca=ca, glu=glu, fs_hz=fs_hz, **proc_kwargs)
+            Ttr = ca.shape[1]
+            Xmot, mot_names = self._get_motion_regressors(
+                dmd=dmd,
+                trial=tr,
+                target_len=Ttr,
+                use_fields=motion_use_fields,
+                motion_step_thresh_z=motion_step_thresh_z,
+            ) if motion_correct else (None, None)
+
+            out = self._process_soma_ca_trial(
+                ca=ca,
+                glu=glu,
+                fs_hz=fs_hz,
+                X_motion=Xmot,
+                motion_names=mot_names,
+                motion_correct=motion_correct,
+                motion_ridge=motion_ridge,
+                use_glu_as_motion_regressor=use_glu_as_motion_regressor,
+                glu_motion_hp_window_s=glu_motion_hp_window_s,
+                motion_regress_on=motion_regress_on,
+                compute_dff=True,
+                baseline_method=baseline_method,
+                denoise_window_s=denoise_window_s,
+                hull_window_s=hull_window_s,
+                f0_floor_frac=f0_floor_frac,
+                baseline_window_s=baseline_window_s,
+                baseline_q=baseline_q,
+                baseline_smooth_s=baseline_smooth_s,
+                eps=eps,
+                **proc_kwargs,
+            )
+
             ca_clean_tr = out["ca_clean"]
             ca_unmixed_tr = out["ca_unmixed"]
+            ca_mc_tr = out["ca_mc"]
+            dff_res = out.get("dff", None)
+            baseline_tr = dff_res.baseline if dff_res is not None else None
+            dff_tr = dff_res.dff if dff_res is not None else None
 
             beta_tr = out["unmix"].beta if out.get("unmix", None) is not None else None
             if beta_tr is not None:
                 beta_unmix[tr - 1, : beta_tr.shape[0]] = beta_tr
+            beta_motion[tr - 1] = out.get("beta_motion", None)
+            motion_names[tr - 1] = list(out.get("motion_names", [])) if out.get("motion_names", None) is not None else None
 
-            # ------------------- dF regression path -------------------
-            if motion_correct and motion_regress_on == "dF":
-                # Baseline on fluorescence (unmixed Ca)
-                F0_tr = np.full_like(ca_unmixed_tr, np.nan, dtype=float)
-                dF_tr = np.full_like(ca_unmixed_tr, np.nan, dtype=float)
+            if remaining_samples is not None:
+                keep_this_trial = max(0, min(Ttr, remaining_samples))
+                remaining_samples -= keep_this_trial
+                if keep_this_trial < Ttr:
+                    for arr in (ca_clean_tr, ca_unmixed_tr, ca_mc_tr):
+                        arr[:, keep_this_trial:] = np.nan
+                    if baseline_tr is not None:
+                        baseline_tr[:, keep_this_trial:] = np.nan
+                    if dff_tr is not None:
+                        dff_tr[:, keep_this_trial:] = np.nan
 
-                for iroi in range(ca_unmixed_tr.shape[0]):
-                    xi = ca_unmixed_tr[iroi]
-                    finite = np.isfinite(xi)
-                    if finite.mean() < 0.5:
-                        continue
-
-                    if baseline_method == "hull":
-                        base = compute_f0(xi, denoise_window=denoise_w, hull_window=hull_w).reshape(-1)
-                    else:
-                        base = _baseline_percentile_filter(
-                            xi,
-                            fs_hz=fs_hz,
-                            window_s=baseline_window_s,
-                            q=baseline_q,
-                            smooth_s=baseline_smooth_s,
-                            eps=eps,
-                        )
-
-                    # IMPORTANT: floor based on fluorescence scale, not baseline scale
-                    xi_med = np.nanmedian(xi[finite])
-                    floor = max(eps, f0_floor_frac * xi_med) if np.isfinite(xi_med) else eps
-                    base = np.maximum(base, floor)
-
-                    # Be honest near missing data
-                    base[~finite] = np.nan
-
-                    F0_tr[iroi] = base
-                    dF_tr[iroi, finite] = xi[finite] - base[finite]
-
-                # Motion regression on dF
-                dF_mc_tr = dF_tr.copy()
-                Ttr = ca_unmixed_tr.shape[1]
-                Xmot, mot_names = self._get_motion_regressors(
-                    dmd=dmd,
-                    trial=tr,
-                    target_len=Ttr,
-                    use_fields=motion_use_fields,
-                    motion_step_thresh_z=motion_step_thresh_z,
-                )
-
-                win_g = max(3, int(round(glu_motion_hp_window_s * fs_hz)))
-                if win_g % 2 == 0:
-                    win_g += 1
-
-                betas_tr: List[np.ndarray] = []
-                names_i = list(mot_names)
-
-                for iroi in range(dF_tr.shape[0]):
-                    Xi = Xmot
-                    names_i = list(mot_names)
-
-                    if use_glu_as_motion_regressor:
-                        g = np.asarray(glu[iroi], float)
-                        if g.size != Ttr:
-                            if g.size > Ttr:
-                                g = g[:Ttr]
-                            else:
-                                gg = np.full(Ttr, np.nan, float)
-                                gg[: g.size] = g
-                                g = gg
-
-                        gf = g.copy()
-                        fin_g = np.isfinite(gf)
-                        if fin_g.any():
-                            gf[~fin_g] = np.nanmedian(gf[fin_g])
-                        else:
-                            gf[:] = 0.0
-
-                        g_hp = gf - _moving_average_reflect(gf, win_g)
-                        mu = np.nanmean(g_hp)
-                        sd = np.nanstd(g_hp)
-                        g_hp = (g_hp - mu) / (sd + 1e-12) if np.isfinite(sd) and sd > 0 else np.zeros_like(g_hp)
-
-                        Xi = np.column_stack([Xi, g_hp]) if Xi.size else g_hp[:, None]
-                        names_i.append("glu_hp")
-
-                    y_resid, b_mc = regress_out_(dF_tr[iroi], Xi, ridge=motion_ridge)
-                    dF_mc_tr[iroi] = y_resid
-                    betas_tr.append(b_mc)
-
-                beta_motion[tr - 1] = np.stack(betas_tr, axis=0) if betas_tr else None
-                motion_names[tr - 1] = names_i
-
-                # dF/F with fluorescence-domain baseline
-                dff_tr = np.full_like(dF_mc_tr, np.nan, dtype=float)
-                for iroi in range(dF_mc_tr.shape[0]):
-                    finite2 = np.isfinite(dF_mc_tr[iroi]) & np.isfinite(F0_tr[iroi])
-                    if finite2.mean() < 0.5:
-                        continue
-                    dff_tr[iroi, finite2] = dF_mc_tr[iroi, finite2] / F0_tr[iroi, finite2]
-
-                ca_mc_tr = F0_tr + dF_mc_tr
-                baseline_tr = F0_tr
-
-            else:
-                # non-dF paths: fall back to existing behavior
-                ca_mc_tr = ca_unmixed_tr
-                baseline_tr = out["dff"].baseline if out.get("dff", None) is not None else None
-                dff_tr = out["dff"].dff if out.get("dff", None) is not None else None
-
-            # Store outputs
             if pad_to == "none":
                 ca_clean_list[tr - 1] = ca_clean_tr
                 ca_unmixed_list[tr - 1] = ca_unmixed_tr
@@ -1680,14 +1867,11 @@ class GlutamateSummary:
                 baseline_list[tr - 1] = baseline_tr
                 dff_list[tr - 1] = dff_tr
             else:
-                Ttr = ca_clean_tr.shape[1]
                 tcopy = min(Ttr, Tpad)
                 rcopy = min(ca_clean_tr.shape[0], n_rois_ref)
-
                 ca_clean[tr - 1, :rcopy, :tcopy] = ca_clean_tr[:rcopy, :tcopy]
                 ca_unmixed[tr - 1, :rcopy, :tcopy] = ca_unmixed_tr[:rcopy, :tcopy]
                 ca_mc[tr - 1, :rcopy, :tcopy] = ca_mc_tr[:rcopy, :tcopy]
-
                 if baseline_tr is not None:
                     baseline[tr - 1, :rcopy, :tcopy] = baseline_tr[:rcopy, :tcopy]
                 if dff_tr is not None:
@@ -1703,6 +1887,7 @@ class GlutamateSummary:
                 "beta_unmix": beta_unmix,
                 "beta_motion": beta_motion,
                 "motion_names": motion_names,
+                "session_sample_stop": None if max_session_minutes is None else max(0, int(round(float(max_session_minutes) * 60.0 * fs_hz))),
             }
 
         return {
@@ -1714,6 +1899,7 @@ class GlutamateSummary:
             "beta_unmix": beta_unmix,
             "beta_motion": beta_motion,
             "motion_names": motion_names,
+            "session_sample_stop": None if max_session_minutes is None else max(0, int(round(float(max_session_minutes) * 60.0 * fs_hz))),
         }
 
 #---------------- Motion regression --------------------------------------

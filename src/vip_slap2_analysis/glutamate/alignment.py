@@ -375,57 +375,57 @@ def reconstruct_dmd_session_traces(
 # -----------------------------------------------------------------------------
 
 def align_traces_to_session_intervals(
-    bundle: ReconstructedTraceBundle,
-    stim_times: Union[StimIntervalDict, StimIntervalList],
+    bundle,
+    stim_times,
     *,
     im_rate_hz: float,
     pre_time: float,
     post_time: float,
-    return_used_onsets: bool = False,
-) -> Union[
-    Dict[str, np.ndarray],
-    np.ndarray,
-    Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]],
-    Tuple[np.ndarray, np.ndarray],
-]:
-    """
-    Align session-wide reconstructed traces to event onsets.
-
-    If return_used_onsets is True, also returns the event onset times that were
-    actually used for extraction after out-of-bounds filtering.
-    """
+    return_used_onsets: bool = True,
+):
     n_pre = int(round(pre_time * im_rate_hz))
     n_post = int(round(post_time * im_rate_hz))
     n_win = n_pre + n_post
 
-    def _extract_one_list(intervals: StimIntervalList) -> Tuple[np.ndarray, np.ndarray]:
-        snippets: List[np.ndarray] = []
-        used_onsets: List[float] = []
+    # support both dataclass bundles and dict bundles
+    if isinstance(bundle, dict):
+        traces = bundle["traces"]
+        session_start_sec = float(bundle["session_start_sec"])
+    else:
+        traces = bundle.traces
+        session_start_sec = float(bundle.session_start_sec)
+
+    def _extract_one_list(intervals):
+        snippets = []
+        kept_onsets = []
+
         for onset, _ in intervals:
-            center = int(round((float(onset) - bundle.session_start_sec) * im_rate_hz))
+            center = int(round((float(onset) - session_start_sec) * im_rate_hz))
             start = center - n_pre
             stop = start + n_win
-            if start < 0 or stop > bundle.traces.shape[1]:
+            if start < 0 or stop > traces.shape[1]:
                 continue
-            snippets.append(bundle.traces[:, start:stop])
-            used_onsets.append(float(onset))
+            snippets.append(traces[:, start:stop])
+            kept_onsets.append(float(onset))
+
         if len(snippets) == 0:
-            arr = np.full((0, bundle.traces.shape[0], n_win), np.nan, dtype=float)
-            onsets = np.empty((0,), dtype=float)
+            arr = np.full((0, traces.shape[0], n_win), np.nan, dtype=float)
+            onsets = np.array([], dtype=float)
         else:
             arr = np.stack(snippets, axis=0)
-            onsets = np.asarray(used_onsets, dtype=float)
+            onsets = np.asarray(kept_onsets, dtype=float)
+
         return arr, onsets
 
     if isinstance(stim_times, dict):
-        aligned: Dict[str, np.ndarray] = {}
-        used: Dict[str, np.ndarray] = {}
+        aligned = {}
+        onset_dict = {}
         for k, v in stim_times.items():
             arr, onsets = _extract_one_list(v)
             aligned[k] = arr
-            used[k] = onsets
+            onset_dict[k] = onsets
         if return_used_onsets:
-            return aligned, used
+            return aligned, onset_dict
         return aligned
 
     arr, onsets = _extract_one_list(stim_times)
