@@ -2,16 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence, Tuple, Union, Literal
+from typing import Literal, Optional, Sequence, Tuple, Union
 
 import imageio.v3 as iio
 import numpy as np
 import tifffile
 from PIL import Image, ImageDraw, ImageFont
-from scipy.ndimage import gaussian_filter1d, median_filter
+from scipy.ndimage import gaussian_filter, gaussian_filter1d, median_filter
 from scipy.signal import butter, filtfilt
 
 PathLike = Union[str, Path]
+ChannelSpec = Union[int, Literal["auto"]]
 
 
 @dataclass
@@ -23,20 +24,21 @@ class MovieRenderConfig:
     output_frame_rate_hz: float = 10.0
     downsample_factor_time: int = 0
     baseline_window_s: float = 0.25
-    baseline_mode: str = "fast"
+    baseline_mode: str = "fast"  # {"fast", "full"}
     channel_index: int = 0
     padding_px: int = 20
     activity_percentile: float = 99.5
     structure_percentile: float = 99.5
     median_filter_xy: int = 3
     gamma: float = 1.2
-    quality: int = 8
     codec: str = "libx264"
+
+    # Orientation transforms in display space
     transpose_xy: bool = False
     flip_ud: bool = False
     flip_lr: bool = False
 
-    # Overlay settings
+    # Overlays
     show_timer: bool = True
     show_scale_bar: bool = True
     pixel_size_um: float = 0.25
@@ -47,45 +49,14 @@ class MovieRenderConfig:
     overlay_text_color: Tuple[int, int, int] = (255, 255, 255)
     overlay_bar_color: Tuple[int, int, int] = (255, 255, 255)
 
-ChannelSpec = Union[int, Literal["auto"]]
-
-
-def infer_page_stack_channels(
-    arr: np.ndarray,
-    *,
-    requested_n_channels: ChannelSpec = "auto",
-    verbose: bool = False,
-) -> int:
-    """
-    Infer the number of interleaved channels in a page-stacked TIFF.
-
-    Rules
-    -----
-    - If requested_n_channels is an int, use it directly.
-    - If "auto":
-        * if page count is divisible by 2, prefer 2
-        * otherwise fall back to 1
-
-    This matches the common cases in your registered TIFF outputs.
-    """
-    if arr.ndim != 3:
-        raise ValueError(f"Expected page stack with shape (pages, Y, X), got {arr.shape}")
-
-    if isinstance(requested_n_channels, int):
-        if requested_n_channels < 1:
-            raise ValueError("n_channels must be >= 1")
-        return requested_n_channels
-
-    n_pages = arr.shape[0]
-
-    if n_pages % 2 == 0:
-        if verbose:
-            print(f"Auto-detected n_channels=2 from page count {n_pages}")
-        return 2
-
-    if verbose:
-        print(f"Auto-detected n_channels=1 from page count {n_pages}")
-    return 1
+    # High-quality rendering options
+    activity_gaussian_sigma_px: float = 0.8
+    structure_gaussian_sigma_px: float = 0.6
+    activity_temporal_sigma_frames: float = 0.75
+    upsample_factor: float = 1.0
+    upsample_mode: str = "bicubic"  # {"nearest", "bilinear", "bicubic"}
+    video_crf: int = 12
+    video_preset: str = "slow"
 
 
 def _vprint(verbose: bool, msg: str) -> None:
@@ -129,6 +100,39 @@ def _read_tiff_memmap(path: PathLike, *, verbose: bool = False) -> np.ndarray:
         return arr
 
 
+def infer_page_stack_channels(
+    arr: np.ndarray,
+    *,
+    requested_n_channels: ChannelSpec = "auto",
+    verbose: bool = False,
+) -> int:
+    """
+    Infer channel count for page-stacked TIFFs.
+
+    If explicitly provided as int, use that.
+    If "auto":
+      - prefer 2 when page count is divisible by 2
+      - otherwise use 1
+    """
+    if arr.ndim != 3:
+        raise ValueError(f"Expected page stack with shape (pages, Y, X), got {arr.shape}")
+
+    if isinstance(requested_n_channels, int):
+        if requested_n_channels < 1:
+            raise ValueError("n_channels must be >= 1")
+        return requested_n_channels
+
+    n_pages = arr.shape[0]
+    if n_pages % 2 == 0:
+        if verbose:
+            print(f"Auto-detected n_channels=2 from page count {n_pages}")
+        return 2
+
+    if verbose:
+        print(f"Auto-detected n_channels=1 from page count {n_pages}")
+    return 1
+
+
 def apply_orientation_transform(
     arr: np.ndarray,
     *,
@@ -136,6 +140,14 @@ def apply_orientation_transform(
     flip_ud: bool = False,
     flip_lr: bool = False,
 ) -> np.ndarray:
+    """
+    Apply orientation transforms in display space.
+
+    Supported shapes:
+    - (Y, X)
+    - (Y, X, T)
+    - (Y, X, C, T)
+    """
     if arr.ndim == 2:
         if transpose_xy:
             arr = arr.T
@@ -206,12 +218,11 @@ def _load_page_stack_subset(
     verbose: bool = False,
 ) -> np.ndarray:
     """
-    Load a subset of a page-stacked TIFF and return shape (Y, X, C, T).
+    Load subset of a page-stacked TIFF and return (Y, X, C, T).
 
     Expected TIFF layout:
-    (pages, Y, X), with either:
-    - 1-channel: t0, t1, t2, ...
-    - 2-channel: t0-ch0, t0-ch1, t1-ch0, t1-ch1, ...
+    - 1-channel: (pages, Y, X) with pages = time
+    - 2-channel: page order t0-ch0, t0-ch1, t1-ch0, t1-ch1, ...
     """
     arr = _read_tiff_memmap(path, verbose=verbose)
 
@@ -232,7 +243,6 @@ def _load_page_stack_subset(
         )
 
     n_timepoints = n_pages // resolved_n_channels
-
     start_frame = 0 if start_frame is None else max(0, start_frame)
     end_frame = n_timepoints if end_frame is None else min(n_timepoints, end_frame)
 
@@ -246,7 +256,7 @@ def _load_page_stack_subset(
     _vprint(
         verbose,
         f"Loading frames [{start_frame}:{end_frame}] -> pages [{start_page}:{end_page}] "
-        f"from total {n_timepoints} frames with {resolved_n_channels} channel(s)",
+        f"from total {n_timepoints} frames with {resolved_n_channels} channel(s)"
     )
 
     if crop_bbox is None:
@@ -257,7 +267,6 @@ def _load_page_stack_subset(
 
     n_subset_pages, y_sub, x_sub = subset.shape
     t = n_subset_pages // resolved_n_channels
-
     subset = subset.reshape(t, resolved_n_channels, y_sub, x_sub)   # (T, C, Y, X)
     subset = np.transpose(subset, (2, 3, 1, 0))                     # (Y, X, C, T)
 
@@ -278,6 +287,11 @@ def load_slap2_movie_from_tiffs(
     dmd_selection: str = "both",
     verbose: bool = False,
 ) -> np.ndarray:
+    """
+    Load SLAP2 TIFF movie(s) into (Y, X, C, T).
+
+    crop_bbox here is interpreted in raw TIFF page coordinates.
+    """
     dmd_selection = dmd_selection.lower()
     if dmd_selection not in {"dmd1", "dmd2", "both"}:
         raise ValueError("dmd_selection must be one of {'dmd1', 'dmd2', 'both'}")
@@ -474,6 +488,9 @@ def _compute_structure_and_activity(
     activity_percentile: float,
     structure_percentile: float,
     median_filter_xy: int,
+    activity_gaussian_sigma_px: float,
+    structure_gaussian_sigma_px: float,
+    activity_temporal_sigma_frames: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
     movie_filled, mean_image, setnan = _fill_nans_with_mean_image(movie)
 
@@ -509,7 +526,31 @@ def _compute_structure_and_activity(
     st[np.repeat(setnan[:, :, None], movie.shape[2], axis=2)] = 0.0
     st = np.clip(st, 0.0, 1.0)
 
-    return st.astype(np.float32), act.astype(np.float32)
+    # High-quality smoothing
+    if activity_gaussian_sigma_px > 0:
+        act = np.stack(
+            [gaussian_filter(act[:, :, i], sigma=activity_gaussian_sigma_px) for i in range(act.shape[2])],
+            axis=2,
+        )
+
+    if structure_gaussian_sigma_px > 0:
+        st = np.stack(
+            [gaussian_filter(st[:, :, i], sigma=structure_gaussian_sigma_px) for i in range(st.shape[2])],
+            axis=2,
+        )
+
+    if activity_temporal_sigma_frames > 0:
+        act = gaussian_filter1d(
+            act,
+            sigma=activity_temporal_sigma_frames,
+            axis=2,
+            mode="nearest",
+        )
+
+    act = np.clip(act, 0.0, 1.0).astype(np.float32)
+    st = np.clip(st, 0.0, 1.0).astype(np.float32)
+
+    return st, act
 
 
 def _compose_rgb_frames(
@@ -551,6 +592,40 @@ def _pad_rgb_frames_to_even(rgb: np.ndarray) -> np.ndarray:
     out = np.zeros((y + pad_y, x + pad_x, t, c), dtype=rgb.dtype)
     out[:y, :x, :, :] = rgb
     return out
+
+
+def _get_pil_resample(mode: str):
+    mode = mode.lower()
+    if mode == "nearest":
+        return Image.Resampling.NEAREST
+    if mode == "bilinear":
+        return Image.Resampling.BILINEAR
+    if mode == "bicubic":
+        return Image.Resampling.BICUBIC
+    raise ValueError("upsample_mode must be one of {'nearest', 'bilinear', 'bicubic'}")
+
+
+def _upsample_frames(
+    frames: np.ndarray,
+    factor: float,
+    mode: str,
+) -> np.ndarray:
+    if factor == 1.0:
+        return frames
+    if factor <= 0:
+        raise ValueError("upsample_factor must be > 0")
+
+    resample = _get_pil_resample(mode)
+    out = []
+    for i in range(frames.shape[0]):
+        img = Image.fromarray(frames[i])
+        new_size = (
+            int(round(img.size[0] * factor)),
+            int(round(img.size[1] * factor)),
+        )
+        img = img.resize(new_size, resample=resample)
+        out.append(np.asarray(img))
+    return np.stack(out, axis=0)
 
 
 def crop_movie_to_bbox(movie: np.ndarray, bbox: Tuple[int, int, int, int]) -> np.ndarray:
@@ -673,10 +748,7 @@ def _draw_timer(
     elapsed_s = frame_idx / native_frame_rate_hz
     text = f"t = {elapsed_s:0.3f} s"
     font = _get_default_font(fontsize)
-
-    x = margin_px
-    y = margin_px
-    draw.text((x, y), text, font=font, fill=text_color)
+    draw.text((margin_px, margin_px), text, font=font, fill=text_color)
 
 
 def _draw_scale_bar(
@@ -699,13 +771,11 @@ def _draw_scale_bar(
     font = _get_default_font(fontsize)
     label = f"{int(scale_bar_um) if float(scale_bar_um).is_integer() else scale_bar_um:g} µm"
 
-    # Lower-right placement, invariant to crop aside from pixel scaling of the image itself.
     x1 = width_px - margin_px
     x0 = max(margin_px, x1 - bar_len_px)
-    y1 = height_px - margin_px
-    y0 = y1
+    y = height_px - margin_px
 
-    draw.line((x0, y0, x1, y1), fill=bar_color, width=linewidth)
+    draw.line((x0, y, x1, y), fill=bar_color, width=linewidth)
 
     try:
         bbox = draw.textbbox((0, 0), label, font=font)
@@ -715,7 +785,7 @@ def _draw_scale_bar(
         text_w, text_h = font.getsize(label)
 
     tx = x1 - text_w
-    ty = y0 - text_h - max(4, linewidth + 2)
+    ty = y - text_h - max(4, linewidth + 2)
     draw.text((tx, ty), label, font=font, fill=text_color)
 
 
@@ -727,14 +797,7 @@ def _apply_overlays_to_frames(
     verbose: bool = False,
 ) -> np.ndarray:
     """
-    Apply timer and scale-bar overlays.
-
-    Parameters
-    ----------
-    frames
-        Array of shape (T, Y, X, 3)
-    native_frame_rate_hz
-        Native data rate after any temporal downsampling.
+    Apply timer and scale bar overlays to frames of shape (T, Y, X, 3).
     """
     if frames.ndim != 4 or frames.shape[-1] != 3:
         raise ValueError(f"Expected frames with shape (T, Y, X, 3), got {frames.shape}")
@@ -801,6 +864,15 @@ def render_glutamate_df_movie(
     draw_timestamp: bool = False,
     verbose: bool = False,
 ) -> Path:
+    """
+    Render a cyan/red glutamate movie.
+
+    Behavior:
+    - If orientation transforms are requested, crop_bbox is interpreted
+      in final displayed coordinates.
+    - If no orientation transforms are requested, crop_bbox may be used
+      during load for speed.
+    """
     del draw_timestamp
 
     total_steps = 8
@@ -959,15 +1031,24 @@ def render_glutamate_df_movie(
         activity_percentile=config.activity_percentile,
         structure_percentile=config.structure_percentile,
         median_filter_xy=config.median_filter_xy,
+        activity_gaussian_sigma_px=config.activity_gaussian_sigma_px,
+        structure_gaussian_sigma_px=config.structure_gaussian_sigma_px,
+        activity_temporal_sigma_frames=config.activity_temporal_sigma_frames,
     )
 
     step += 1
-    _progress(verbose, step, total_steps, "Composing RGB / overlays / writing video")
+    _progress(verbose, step, total_steps, "Composing RGB / upsampling / overlays / writing video")
     rgb = _compose_rgb_frames(structure, activity, gamma=config.gamma)
     rgb = _pad_rgb_frames_to_even(rgb)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     frames = np.transpose(rgb, (2, 0, 1, 3))  # (T, Y, X, 3)
+
+    if config.upsample_factor != 1.0:
+        _vprint(
+            verbose,
+            f"Upsampling frames by {config.upsample_factor}x using {config.upsample_mode}"
+        )
+        frames = _upsample_frames(frames, config.upsample_factor, config.upsample_mode)
 
     frames = _apply_overlays_to_frames(
         frames,
@@ -975,6 +1056,8 @@ def render_glutamate_df_movie(
         config=config,
         verbose=verbose,
     )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     _vprint(verbose, f"Writing {frames.shape[0]} frames to: {output_path}")
     _vprint(verbose, f"Output frame size: {frames.shape[2]} x {frames.shape[1]}")
@@ -984,6 +1067,11 @@ def render_glutamate_df_movie(
         fps=config.output_frame_rate_hz,
         codec=config.codec,
         macro_block_size=1,
+        ffmpeg_params=[
+            "-crf", str(config.video_crf),
+            "-preset", str(config.video_preset),
+            "-pix_fmt", "yuv420p",
+        ],
     )
 
     _vprint(verbose, f"Done: {output_path}")
