@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import imageio.v3 as iio
 import numpy as np
@@ -10,8 +10,6 @@ import tifffile
 from scipy.ndimage import gaussian_filter1d, median_filter
 from scipy.signal import butter, filtfilt
 
-
-ArrayLike = np.ndarray
 PathLike = Union[str, Path]
 
 
@@ -27,8 +25,7 @@ class MovieRenderConfig:
     output_frame_rate_hz
         Frame rate of the output video.
     downsample_factor_time
-        Number of factor-2 temporal downsampling steps. A value of 2 means
-        the movie is averaged in time twice, so effective time compression is 4x.
+        Number of factor-2 temporal downsampling steps.
     baseline_window_s
         Approximate temporal window for slow baseline estimation.
     channel_index
@@ -44,22 +41,121 @@ class MovieRenderConfig:
     gamma
         Gamma correction applied to final RGB frames.
     quality
-        Video quality for ffmpeg-backed writers if supported.
+        Kept for API compatibility; imageio/ffmpeg may ignore this depending
+        on backend.
     codec
-        Video codec. "libx264" is a good default for mp4.
+        Video codec for mp4 writing.
     """
     input_frame_rate_hz: float
     output_frame_rate_hz: float = 10.0
-    downsample_factor_time: int = 2
+    downsample_factor_time: int = 0
     baseline_window_s: float = 0.25
     channel_index: int = 0
     padding_px: int = 20
-    activity_percentile: float = 99.97
-    structure_percentile: float = 99.99
+    activity_percentile: float = 99.5
+    structure_percentile: float = 99.5
     median_filter_xy: int = 3
-    gamma: float = 1.0
+    gamma: float = 1.2
     quality: int = 8
     codec: str = "libx264"
+
+
+def inspect_tiff_layout(path: PathLike) -> None:
+    """
+    Print TIFF layout information for debugging axis order.
+
+    This is especially useful for large multi-page TIFFs written by
+    multiRoiRegSLAP2-style MATLAB code.
+    """
+    path = str(path)
+    with tifffile.TiffFile(path) as tf:
+        print(f"path: {path}")
+        print("series count:", len(tf.series))
+        for i, s in enumerate(tf.series):
+            print(f"series {i}: shape={s.shape}, axes={getattr(s, 'axes', None)}")
+        print("pages:", len(tf.pages))
+
+    arr = tifffile.memmap(path)
+    print("memmap shape:", arr.shape, "dtype:", arr.dtype)
+
+
+def _read_tiff_memmap(path: PathLike) -> np.ndarray:
+    """
+    Read TIFF lazily when possible.
+    """
+    path = str(path)
+    try:
+        return tifffile.memmap(path)
+    except Exception:
+        return tifffile.imread(path)
+
+
+def _coerce_tiff_to_yxct(
+    arr: np.ndarray,
+    *,
+    n_channels: int = 2,
+) -> np.ndarray:
+    """
+    Convert TIFF-like arrays into shape (Y, X, C, T).
+
+    Supported cases
+    ---------------
+    - (pages, Y, X) where pages = T * C
+    - (T, Y, X) with channel interleave along T
+    - (Y, X, T) with channel interleave along T
+    - (T, C, Y, X)
+    - (C, T, Y, X)
+    - (Y, X, C, T)
+
+    Notes
+    -----
+    For 3D arrays there is some ambiguity between (pages, Y, X), (T, Y, X),
+    and (Y, X, T). We use heuristics biased toward page stacks from the
+    MATLAB registration output, but you should verify with inspect_tiff_layout().
+    """
+    arr = np.asarray(arr)
+
+    if arr.ndim == 4:
+        # Already (Y, X, C, T)
+        if arr.shape[2] == n_channels:
+            return arr
+
+        # (T, C, Y, X) -> (Y, X, C, T)
+        if arr.shape[1] == n_channels:
+            return np.transpose(arr, (2, 3, 1, 0))
+
+        # (C, T, Y, X) -> (Y, X, C, T)
+        if arr.shape[0] == n_channels:
+            return np.transpose(arr, (2, 3, 0, 1))
+
+        raise ValueError(f"Could not interpret 4D TIFF shape {arr.shape}")
+
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3D or 4D TIFF array, got shape {arr.shape}")
+
+    s0, s1, s2 = arr.shape
+
+    # Prefer page-stack interpretation when first dim is much smaller than
+    # spatial dimensions or when tifffile memmap gives a classic page stack.
+    if s0 % n_channels == 0 and (s0 < s1 or s0 < s2):
+        t = s0 // n_channels
+        out = arr.reshape(t, n_channels, s1, s2)   # (T, C, Y, X)
+        return np.transpose(out, (2, 3, 1, 0))     # (Y, X, C, T)
+
+    # (Y, X, frames)
+    if s2 % n_channels == 0 and (s0 > 16 and s1 > 16):
+        t = s2 // n_channels
+        return arr.reshape(s0, s1, n_channels, t)
+
+    # (T, Y, X)
+    if s0 % n_channels == 0:
+        t = s0 // n_channels
+        out = arr.reshape(t, n_channels, s1, s2)
+        return np.transpose(out, (2, 3, 1, 0))
+
+    raise ValueError(
+        f"Could not infer TIFF axis order for shape {arr.shape} with n_channels={n_channels}"
+    )
 
 
 def load_slap2_movie_from_tiffs(
@@ -68,59 +164,41 @@ def load_slap2_movie_from_tiffs(
     *,
     n_channels: int = 2,
     combine_dmds: bool = True,
+    dtype: np.dtype = np.float32,
 ) -> np.ndarray:
     """
-    Load SLAP2 TIFF movie(s).
+    Load SLAP2 registered TIFF movie(s) into shape (Y, X, C, T).
 
-    Returns
-    -------
-    movie : np.ndarray
-        Shape:
-        - (Y, X, C, T) if TIFF(s) contain interleaved channels
-        - combined vertically across DMDs if combine_dmds=True and dmd2_tiff is provided
+    This is intended for registered/downsampled TIFFs written page-by-page
+    by the MATLAB workflow you shared, where each timepoint is written as
+    channel 1 then channel 2. 
     """
-    dmd1 = np.asarray(tifffile.imread(dmd1_tiff), dtype=np.float32)
-    if dmd1.ndim != 3:
-        raise ValueError(f"Expected DMD1 TIFF to be 3D (Y, X, frames), got {dmd1.shape}")
-
-    def _reshape_channels(arr: np.ndarray, n_ch: int) -> np.ndarray:
-        y, x, n_frames = arr.shape
-        usable = (n_frames // n_ch) * n_ch
-        if usable == 0:
-            raise ValueError("Movie has too few frames to reshape into channels.")
-        if usable != n_frames:
-            arr = arr[:, :, :usable]
-        return arr.reshape(y, x, n_ch, usable // n_ch)
-
-    dmd1 = _reshape_channels(dmd1, n_channels)
+    dmd1_raw = _read_tiff_memmap(dmd1_tiff)
+    dmd1 = _coerce_tiff_to_yxct(dmd1_raw, n_channels=n_channels).astype(dtype, copy=False)
 
     if dmd2_tiff is None:
         return dmd1
 
-    dmd2 = np.asarray(tifffile.imread(dmd2_tiff), dtype=np.float32)
-    if dmd2.ndim != 3:
-        raise ValueError(f"Expected DMD2 TIFF to be 3D (Y, X, frames), got {dmd2.shape}")
-    dmd2 = _reshape_channels(dmd2, n_channels)
+    dmd2_raw = _read_tiff_memmap(dmd2_tiff)
+    dmd2 = _coerce_tiff_to_yxct(dmd2_raw, n_channels=n_channels).astype(dtype, copy=False)
 
-    # Match X and T dimensions.
     y1, x1, c1, t1 = dmd1.shape
     y2, x2, c2, t2 = dmd2.shape
+
     if c1 != c2:
-        raise ValueError(f"Channel mismatch between DMD1 ({c1}) and DMD2 ({c2})")
+        raise ValueError(f"Channel mismatch: DMD1 has {c1}, DMD2 has {c2}")
 
     x_max = max(x1, x2)
     t_min = min(t1, t2)
 
-    def _pad_x(arr: np.ndarray, x_target: int) -> np.ndarray:
+    def _pad_x(arr: np.ndarray, x_target: int, t_target: int) -> np.ndarray:
         y, x, c, t = arr.shape
-        if x == x_target:
-            return arr[:, :, :, :t_min]
-        out = np.full((y, x_target, c, t_min), np.nan, dtype=arr.dtype)
-        out[:, :x, :, :] = arr[:, :, :, :t_min]
+        out = np.full((y, x_target, c, t_target), np.nan, dtype=arr.dtype)
+        out[:, :x, :, :] = arr[:, :, :, :t_target]
         return out
 
-    dmd1 = _pad_x(dmd1, x_max)
-    dmd2 = _pad_x(dmd2, x_max)
+    dmd1 = _pad_x(dmd1, x_max, t_min)
+    dmd2 = _pad_x(dmd2, x_max, t_min)
 
     if combine_dmds:
         return np.concatenate([dmd1, dmd2], axis=0)
@@ -141,6 +219,7 @@ def _downsample_time_by_2(movie: np.ndarray) -> np.ndarray:
     usable = (t // 2) * 2
     if usable == 0:
         raise ValueError("Movie too short to downsample by factor 2.")
+
     movie = movie[:, :, :usable]
     return 0.5 * (movie[:, :, 0::2] + movie[:, :, 1::2])
 
@@ -159,13 +238,18 @@ def temporal_downsample(movie: np.ndarray, n_steps: int) -> np.ndarray:
 
 def _fill_nans_with_mean_image(movie: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Replace NaNs in a movie with mean image values for baseline estimation.
+    Replace NaNs in a movie with mean-image values for baseline estimation.
 
     Returns
     -------
-    movie_filled, mean_image, setnan
+    movie_filled : np.ndarray
+    mean_image : np.ndarray
+    setnan : np.ndarray
+        Pixels with very high NaN fraction.
     """
-    mean_image = np.nanmean(movie, axis=2)
+    with np.errstate(invalid="ignore"):
+        mean_image = np.nanmean(movie, axis=2)
+
     mean_image = np.where(np.isnan(mean_image), 0.0, mean_image)
 
     nan_fraction = np.mean(np.isnan(movie), axis=2)
@@ -188,30 +272,32 @@ def _compute_f0_movie(
     butter_order: int = 4,
 ) -> np.ndarray:
     """
-    Approximate Kaspar's MATLAB F0 estimation:
-    - light temporal smoothing
+    Approximate slow baseline F0 estimation.
+
+    Steps
+    -----
+    - light temporal gaussian smoothing
     - temporal median filter
-    - repeated low-pass filtfilt on min(smoothed, F0)
+    - repeated low-pass refinement of min(smoothed, f0)
 
     Expects NaN-free movie of shape (Y, X, T).
     """
     if movie.ndim != 3:
         raise ValueError(f"Expected (Y, X, T), got {movie.shape}")
 
-    y, x, t = movie.shape
+    _, _, t = movie.shape
     if t < 5:
         raise ValueError("Movie too short for baseline estimation.")
 
-    # mild temporal smoothing
     e1 = gaussian_filter1d(movie, sigma=1.0, axis=2, mode="nearest")
 
-    # median over time
     med_win = max(3, min(25, t if t % 2 == 1 else t - 1))
     f0 = median_filter(e1, size=(1, 1, med_win), mode="nearest")
 
     cutoff = min(0.99, max(1e-4, baseline_window_frames / max(2, t)))
     b, a = butter(butter_order, cutoff, btype="low")
 
+    padlen = min(3 * max(len(a), len(b)), t - 1)
     for _ in range(3):
         f0 = filtfilt(
             b,
@@ -219,7 +305,7 @@ def _compute_f0_movie(
             np.minimum(e1, f0),
             axis=2,
             padtype="odd",
-            padlen=min(3 * max(len(a), len(b)), t - 1),
+            padlen=padlen,
         )
 
     lead = int(np.ceil(baseline_window_frames))
@@ -233,6 +319,7 @@ def _normalize_percentile(arr: np.ndarray, q: float, eps: float = 1e-8) -> np.nd
     finite = np.isfinite(arr)
     if not np.any(finite):
         return np.zeros_like(arr, dtype=np.float32)
+
     scale = np.nanpercentile(arr[finite], q)
     scale = max(scale, eps)
     out = arr / scale
@@ -248,7 +335,7 @@ def _compute_structure_and_activity(
     median_filter_xy: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute structure (cyan) and activity (red) channels.
+    Compute normalized structure (cyan) and activity (red) volumes.
 
     Returns
     -------
@@ -263,7 +350,6 @@ def _compute_structure_and_activity(
 
     soma_im = np.maximum(50.0, mean_image + 50.0)
 
-    # activity map
     if median_filter_xy > 1:
         act = median_filter(df, size=(median_filter_xy, median_filter_xy, 1), mode="nearest")
     else:
@@ -276,7 +362,6 @@ def _compute_structure_and_activity(
     act = act / np.maximum(soma_im[:, :, None], 1e-8)
     act = _normalize_percentile(act, activity_percentile)
 
-    # structure map
     st = np.sqrt(np.maximum(0.0, f0 / np.maximum(soma_im[:, :, None], 1e-8)))
     finite_st = np.isfinite(st)
     if np.any(finite_st):
@@ -296,9 +381,9 @@ def _compose_rgb_frames(
     gamma: float = 1.0,
 ) -> np.ndarray:
     """
-    Compose RGB frames:
-    red = activity
-    green/blue = cyan structure attenuated by activity
+    Compose RGB frames with:
+    - red = activity
+    - green/blue = cyan structure attenuated by activity
     """
     red = np.clip(activity, 0.0, 1.0)
     cyan = np.clip(structure, 0.0, 1.0)
@@ -322,6 +407,7 @@ def _compose_rgb_frames(
 def crop_movie_to_bbox(movie: np.ndarray, bbox: Tuple[int, int, int, int]) -> np.ndarray:
     """
     Crop movie to (y0, y1, x0, x1).
+
     Supports (Y, X, T) or (Y, X, C, T).
     """
     y0, y1, x0, x1 = bbox
@@ -334,7 +420,7 @@ def crop_movie_to_bbox(movie: np.ndarray, bbox: Tuple[int, int, int, int]) -> np
 
 def bbox_from_mask(mask: np.ndarray, padding_px: int = 0) -> Tuple[int, int, int, int]:
     """
-    Bounding box from a 2D boolean mask.
+    Compute bounding box from a 2D boolean mask.
     """
     yy, xx = np.where(mask > 0)
     if len(yy) == 0:
@@ -380,7 +466,9 @@ def select_movie_time_window(
     end_frame: Optional[int] = None,
 ) -> np.ndarray:
     """
-    Subselect movie in time. Works on (Y, X, T) and (Y, X, C, T).
+    Subselect movie in time.
+
+    Works on (Y, X, T) and (Y, X, C, T).
     """
     if movie.ndim == 3:
         t_dim = 2
@@ -436,7 +524,7 @@ def render_glutamate_df_movie(
         - (Y, X, T), or
         - (Y, X, C, T)
     dmd1_tiff, dmd2_tiff
-        Optional TIFF inputs if movie is not provided.
+        TIFF inputs if movie is not provided.
     n_channels
         Number of interleaved channels in TIFF input.
     start_s, end_s
@@ -450,15 +538,12 @@ def render_glutamate_df_movie(
     crop_bbox
         Explicit crop box (y0, y1, x0, x1).
     overwrite
-        Whether to overwrite existing output.
+        Whether to overwrite an existing output file.
     draw_timestamp
-        Placeholder switch; currently timestamp text is not burned in.
-
-    Returns
-    -------
-    Path
-        Output movie path.
+        Currently unused placeholder.
     """
+    del draw_timestamp  # placeholder for future timestamp overlays
+
     output_path = Path(output_path)
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"{output_path} already exists. Set overwrite=True to replace it.")
@@ -485,7 +570,6 @@ def render_glutamate_df_movie(
     elif movie.ndim != 3:
         raise ValueError(f"Expected movie shape (Y, X, T) or (Y, X, C, T), got {movie.shape}")
 
-    # Time window in native frames
     movie = select_movie_time_window(
         movie,
         frame_rate_hz=config.input_frame_rate_hz,
@@ -495,7 +579,9 @@ def render_glutamate_df_movie(
         end_frame=end_frame,
     )
 
-    # Crop
+    if movie.shape[2] < 2:
+        raise ValueError("Selected movie window is too short.")
+
     if crop_bbox is not None:
         movie = crop_movie_to_bbox(movie, crop_bbox)
     elif roi_mask is not None:
@@ -509,10 +595,12 @@ def render_glutamate_df_movie(
         )
         movie = crop_movie_to_bbox(movie, bbox)
 
-    # Temporal downsample
-    movie_ds = temporal_downsample(movie, config.downsample_factor_time)
-    eff_frame_rate = config.input_frame_rate_hz / (2 ** config.downsample_factor_time)
+    if config.downsample_factor_time > 0:
+        movie_ds = temporal_downsample(movie, config.downsample_factor_time)
+    else:
+        movie_ds = movie
 
+    eff_frame_rate = config.input_frame_rate_hz / (2 ** config.downsample_factor_time)
     baseline_window_frames = max(3, int(np.ceil(config.baseline_window_s * eff_frame_rate)))
 
     structure, activity = _compute_structure_and_activity(
@@ -527,12 +615,15 @@ def render_glutamate_df_movie(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # imageio expects frames as iterable of (Y, X, 3)
+    # imageio expects frames as (T, Y, X, 3)
+    frames = np.transpose(rgb, (2, 0, 1, 3))
+
     iio.imwrite(
         output_path,
-        rgb.transpose(2, 0, 1, 3),  # -> (T, Y, X, 3)
+        frames,
         fps=config.output_frame_rate_hz,
         codec=config.codec,
+        macro_block_size=1,
     )
 
     return output_path
