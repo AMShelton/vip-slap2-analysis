@@ -101,17 +101,14 @@ def _coerce_tiff_to_yxct(
     Supported cases
     ---------------
     - (pages, Y, X) where pages = T * C
-    - (T, Y, X) with channel interleave along T
-    - (Y, X, T) with channel interleave along T
     - (T, C, Y, X)
     - (C, T, Y, X)
     - (Y, X, C, T)
 
     Notes
     -----
-    For 3D arrays there is some ambiguity between (pages, Y, X), (T, Y, X),
-    and (Y, X, T). We use heuristics biased toward page stacks from the
-    MATLAB registration output, but you should verify with inspect_tiff_layout().
+    For your registered multiRoiRegSLAP2 TIFFs, the expected case is:
+    (pages, Y, X) with pages written as channel 1, then channel 2, for each timepoint.
     """
     arr = np.asarray(arr)
 
@@ -130,32 +127,18 @@ def _coerce_tiff_to_yxct(
 
         raise ValueError(f"Could not interpret 4D TIFF shape {arr.shape}")
 
-    if arr.ndim != 3:
-        raise ValueError(f"Expected 3D or 4D TIFF array, got shape {arr.shape}")
+    if arr.ndim == 3:
+        n_pages, y, x = arr.shape
+        if n_pages % n_channels != 0:
+            raise ValueError(
+                f"Page stack has {n_pages} pages, which is not divisible by n_channels={n_channels}"
+            )
 
-    s0, s1, s2 = arr.shape
+        t = n_pages // n_channels
+        out = arr.reshape(t, n_channels, y, x)   # (T, C, Y, X)
+        return np.transpose(out, (2, 3, 1, 0))   # (Y, X, C, T)
 
-    # Prefer page-stack interpretation when first dim is much smaller than
-    # spatial dimensions or when tifffile memmap gives a classic page stack.
-    if s0 % n_channels == 0 and (s0 < s1 or s0 < s2):
-        t = s0 // n_channels
-        out = arr.reshape(t, n_channels, s1, s2)   # (T, C, Y, X)
-        return np.transpose(out, (2, 3, 1, 0))     # (Y, X, C, T)
-
-    # (Y, X, frames)
-    if s2 % n_channels == 0 and (s0 > 16 and s1 > 16):
-        t = s2 // n_channels
-        return arr.reshape(s0, s1, n_channels, t)
-
-    # (T, Y, X)
-    if s0 % n_channels == 0:
-        t = s0 // n_channels
-        out = arr.reshape(t, n_channels, s1, s2)
-        return np.transpose(out, (2, 3, 1, 0))
-
-    raise ValueError(
-        f"Could not infer TIFF axis order for shape {arr.shape} with n_channels={n_channels}"
-    )
+    raise ValueError(f"Expected 3D or 4D TIFF array, got shape {arr.shape}")
 
 
 def load_slap2_movie_from_tiffs(
