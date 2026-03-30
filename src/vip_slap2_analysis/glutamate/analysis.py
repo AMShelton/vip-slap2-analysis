@@ -4,7 +4,8 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
-
+from io import BytesIO
+import zipfile
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -106,10 +107,67 @@ def _basename_stimulus(stim_name: str) -> str:
 
 
 def _load_npz_dict(path: str | Path) -> dict[str, Any]:
-    arr = np.load(Path(path), allow_pickle=True)
-    if "data" not in arr.files:
-        raise KeyError(f"Expected top-level key 'data' in {path}, found {arr.files}")
-    return arr["data"].item()
+    """
+    Robustly load the top-level dict stored in our derived .npz files.
+
+    We avoid NumPy's lazy zip-member access because it can be unreliable on some
+    network/UNC paths for object arrays. Instead, we explicitly read `data.npy`
+    from the zip archive into memory, then load from BytesIO.
+    """
+    path = Path(path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"NPZ not found: {path}")
+
+    # First try the standard path.
+    try:
+        with np.load(path, allow_pickle=True) as arr:
+            if "data" not in arr.files:
+                raise KeyError(f"Expected top-level key 'data' in {path}, found {arr.files}")
+            obj = arr["data"]
+            if getattr(obj, "dtype", None) != object:
+                raise TypeError(
+                    f"Expected object array under 'data' in {path}, got dtype={getattr(obj, 'dtype', None)}"
+                )
+            return obj.item()
+    except Exception as first_err:
+        # Fallback: explicitly read zip member bytes, then unpickle from memory.
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                names = zf.namelist()
+                member = None
+                if "data.npy" in names:
+                    member = "data.npy"
+                elif "data" in names:
+                    member = "data"
+                else:
+                    raise KeyError(
+                        f"Expected zip member 'data.npy' in {path}, found {names}"
+                    )
+
+                payload = zf.read(member)
+
+            with np.load(BytesIO(payload), allow_pickle=True) as arr2:
+                # If arr2 is an NpzFile-like object, handle similarly.
+                if hasattr(arr2, "files"):
+                    key = "data" if "data" in arr2.files else arr2.files[0]
+                    obj = arr2[key]
+                else:
+                    obj = arr2
+
+            if getattr(obj, "dtype", None) != object:
+                raise TypeError(
+                    f"Expected object array when loading {path}, got dtype={getattr(obj, 'dtype', None)}"
+                )
+
+            return obj.item()
+
+        except Exception as second_err:
+            raise RuntimeError(
+                f"Failed to load analysis npz dict from {path}\n"
+                f"Standard np.load error: {first_err}\n"
+                f"Zip-member fallback error: {second_err}"
+            ) from second_err
 
 
 def resolve_glutamate_analysis_paths(
@@ -119,7 +177,7 @@ def resolve_glutamate_analysis_paths(
     base = Path(session_dir_or_analysis_dir)
     analysis_dir = base if base.name == "analysis" else base / "analysis"
     derived = analysis_dir / "derived" / "glutamate"
-    out = Path(output_dir) if output_dir is not None else analysis_dir / "derived" / "glutamate_analysis"
+    out = Path(output_dir) if output_dir is not None else analysis_dir / "derived" / "glutamate" / "glutamate_analysis"
     return GlutamateAnalysisPaths(
         single_trial_npz=derived / "glutamate_single_trial_df.npz",
         mean_npz=derived / "glutamate_mean_df.npz",

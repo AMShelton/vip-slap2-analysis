@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union, Literal
 
 import imageio.v3 as iio
 import numpy as np
@@ -46,6 +46,46 @@ class MovieRenderConfig:
     overlay_linewidth: int = 4
     overlay_text_color: Tuple[int, int, int] = (255, 255, 255)
     overlay_bar_color: Tuple[int, int, int] = (255, 255, 255)
+
+ChannelSpec = Union[int, Literal["auto"]]
+
+
+def infer_page_stack_channels(
+    arr: np.ndarray,
+    *,
+    requested_n_channels: ChannelSpec = "auto",
+    verbose: bool = False,
+) -> int:
+    """
+    Infer the number of interleaved channels in a page-stacked TIFF.
+
+    Rules
+    -----
+    - If requested_n_channels is an int, use it directly.
+    - If "auto":
+        * if page count is divisible by 2, prefer 2
+        * otherwise fall back to 1
+
+    This matches the common cases in your registered TIFF outputs.
+    """
+    if arr.ndim != 3:
+        raise ValueError(f"Expected page stack with shape (pages, Y, X), got {arr.shape}")
+
+    if isinstance(requested_n_channels, int):
+        if requested_n_channels < 1:
+            raise ValueError("n_channels must be >= 1")
+        return requested_n_channels
+
+    n_pages = arr.shape[0]
+
+    if n_pages % 2 == 0:
+        if verbose:
+            print(f"Auto-detected n_channels=2 from page count {n_pages}")
+        return 2
+
+    if verbose:
+        print(f"Auto-detected n_channels=1 from page count {n_pages}")
+    return 1
 
 
 def _vprint(verbose: bool, msg: str) -> None:
@@ -158,25 +198,41 @@ def _resolve_frame_window(
 def _load_page_stack_subset(
     path: PathLike,
     *,
-    n_channels: int = 2,
+    n_channels: ChannelSpec = "auto",
     start_frame: Optional[int] = None,
     end_frame: Optional[int] = None,
     crop_bbox: Optional[tuple[int, int, int, int]] = None,
     dtype=np.float32,
     verbose: bool = False,
 ) -> np.ndarray:
+    """
+    Load a subset of a page-stacked TIFF and return shape (Y, X, C, T).
+
+    Expected TIFF layout:
+    (pages, Y, X), with either:
+    - 1-channel: t0, t1, t2, ...
+    - 2-channel: t0-ch0, t0-ch1, t1-ch0, t1-ch1, ...
+    """
     arr = _read_tiff_memmap(path, verbose=verbose)
 
     if arr.ndim != 3:
         raise ValueError(f"Expected page stack with shape (pages, Y, X), got {arr.shape}")
 
     n_pages, _, _ = arr.shape
-    if n_pages % n_channels != 0:
+    resolved_n_channels = infer_page_stack_channels(
+        arr,
+        requested_n_channels=n_channels,
+        verbose=verbose,
+    )
+
+    if n_pages % resolved_n_channels != 0:
         raise ValueError(
-            f"Page stack has {n_pages} pages, which is not divisible by n_channels={n_channels}"
+            f"Page stack has {n_pages} pages, which is not divisible by "
+            f"n_channels={resolved_n_channels}"
         )
 
-    n_timepoints = n_pages // n_channels
+    n_timepoints = n_pages // resolved_n_channels
+
     start_frame = 0 if start_frame is None else max(0, start_frame)
     end_frame = n_timepoints if end_frame is None else min(n_timepoints, end_frame)
 
@@ -185,11 +241,12 @@ def _load_page_stack_subset(
             f"Invalid frame window [{start_frame}, {end_frame}) for movie with {n_timepoints} frames."
         )
 
-    start_page, end_page = _time_to_page_range(start_frame, end_frame, n_channels)
+    start_page, end_page = _time_to_page_range(start_frame, end_frame, resolved_n_channels)
+
     _vprint(
         verbose,
         f"Loading frames [{start_frame}:{end_frame}] -> pages [{start_page}:{end_page}] "
-        f"from total {n_timepoints} frames",
+        f"from total {n_timepoints} frames with {resolved_n_channels} channel(s)",
     )
 
     if crop_bbox is None:
@@ -199,9 +256,10 @@ def _load_page_stack_subset(
         subset = np.asarray(arr[start_page:end_page, y0:y1, x0:x1], dtype=dtype)
 
     n_subset_pages, y_sub, x_sub = subset.shape
-    t = n_subset_pages // n_channels
-    subset = subset.reshape(t, n_channels, y_sub, x_sub)
-    subset = np.transpose(subset, (2, 3, 1, 0))  # (Y, X, C, T)
+    t = n_subset_pages // resolved_n_channels
+
+    subset = subset.reshape(t, resolved_n_channels, y_sub, x_sub)   # (T, C, Y, X)
+    subset = np.transpose(subset, (2, 3, 1, 0))                     # (Y, X, C, T)
 
     _vprint(verbose, f"Loaded subset shape: {subset.shape}")
     return subset
@@ -211,7 +269,7 @@ def load_slap2_movie_from_tiffs(
     dmd1_tiff: Optional[PathLike] = None,
     dmd2_tiff: Optional[PathLike] = None,
     *,
-    n_channels: int = 2,
+    n_channels: ChannelSpec = "auto",
     combine_dmds: bool = True,
     dtype: np.dtype = np.float32,
     start_frame: Optional[int] = None,
@@ -730,7 +788,7 @@ def render_glutamate_df_movie(
     movie: Optional[np.ndarray] = None,
     dmd1_tiff: Optional[PathLike] = None,
     dmd2_tiff: Optional[PathLike] = None,
-    n_channels: int = 2,
+    n_channels: ChannelSpec = "auto",
     start_s: Optional[float] = None,
     end_s: Optional[float] = None,
     start_frame: Optional[int] = None,
