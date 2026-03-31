@@ -22,8 +22,8 @@ def _moving_average(arr: np.ndarray, window: int = 5) -> np.ndarray:
 
 def smooth_polyline(
     xyz_um: np.ndarray,
-    points_per_segment: int = 8,
-    spline_smoothness: float = 1.0,
+    points_per_segment: int = 20,
+    spline_smoothness: float = 10,
 ) -> np.ndarray:
     """Generate a visually smoother branch polyline.
 
@@ -49,8 +49,8 @@ def smooth_polyline(
 
 def smooth_branch_segments(
     tree: MorphologyTree,
-    points_per_segment: int = 8,
-    spline_smoothness: float = 1.0,
+    points_per_segment: int = 20,
+    spline_smoothness: float = 10,
 ) -> List[pd.DataFrame]:
     out: List[pd.DataFrame] = []
     for seg in tree.branch_segments():

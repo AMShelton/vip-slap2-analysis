@@ -547,8 +547,8 @@ def run_session_synapse_qc(
 
     if score_weights is None:
         score_weights = {
-            "support_score": 0.20,
-            "finite_score": 0.20,
+            "support_score": 0.15,
+            "finite_score": 0.15,
             "range_score": 0.25,
             "residual_snr_score": 0.35,
         }
