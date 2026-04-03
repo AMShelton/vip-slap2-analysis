@@ -1330,6 +1330,9 @@ class GlutamateSummary:
                 if mean_im.shape[0] <= 4:
                     ch_idx = _resolve_channel(mean_channel, mean_im.shape[0])
                     mean_im = mean_im[ch_idx]
+                elif mean_im.shape[1] <= 4:
+                    ch_idx = _resolve_channel(mean_channel, mean_im.shape[1])
+                    mean_im = mean_im[:,ch_idx,:]
                 elif mean_im.shape[-1] <= 4:
                     ch_idx = _resolve_channel(mean_channel, mean_im.shape[-1])
                     mean_im = mean_im[..., ch_idx]
@@ -1347,15 +1350,27 @@ class GlutamateSummary:
                     raise ValueError(f"{act_image_type} must resolve to 2D for DMD {dmd}, got shape {act_im.shape}")
 
             if mean_im.shape != act_im.shape:
-                raise ValueError(
-                    f"mean and activity images do not match for DMD {dmd}: "
-                    f"{mean_im.shape} vs {act_im.shape}"
-                )
+                if act_im.ndim == 2 and act_im.shape == mean_im.T.shape:
+                    act_im = act_im.T
+                elif mean_im.ndim == 2 and mean_im.shape == act_im.T.shape:
+                    mean_im = mean_im.T
+                else:
+                    raise ValueError(
+                        f"mean and activity images do not match for DMD {dmd}: "
+                        f"{mean_im.shape} vs {act_im.shape}"
+                    )
 
             if mask_to_selpix:
                 try:
                     sel = np.asarray(self.get_sel_pix(dmd)).astype(bool)
-                    if sel.shape == mean_im.shape:
+
+                    if sel.shape != mean_im.shape:
+                        if sel.ndim == 2 and sel.shape == mean_im.T.shape:
+                            sel = sel.T
+                        else:
+                            sel = None
+
+                    if sel is not None and sel.shape == mean_im.shape:
                         mean_im = np.where(sel, mean_im, np.nan)
                         act_im = np.where(sel, act_im, np.nan)
                 except Exception:
