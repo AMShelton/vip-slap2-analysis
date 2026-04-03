@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
@@ -28,7 +29,7 @@ def _session_export_root(
 ) -> Path:
     if base_dir is not None:
         root = Path(base_dir)
-    elif asset.derived_dir is not None:
+    elif getattr(asset, "derived_dir", None) is not None:
         root = Path(asset.derived_dir) / "packaged" / package_name
     else:
         root = Path(asset.session_dir) / "analysis" / "derived" / "packaged" / package_name
@@ -38,22 +39,46 @@ def _session_export_root(
 def _safe_jsonable(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {str(k): _safe_jsonable(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
+
+    if isinstance(obj, (list, tuple, set)):
         return [_safe_jsonable(v) for v in obj]
+
     if isinstance(obj, Path):
         return str(obj)
+
     if isinstance(obj, np.ndarray):
         return obj.tolist()
+
     if isinstance(obj, (np.integer, np.floating, np.bool_)):
         return obj.item()
+
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+
     try:
-        import pandas as pd  # local import to avoid hard dependency here
+        import pandas as pd  # local import to avoid hard dependency
+
+        if isinstance(obj, pd.Timestamp):
+            return obj.isoformat()
+
+        if isinstance(obj, pd.Timedelta):
+            return obj.isoformat()
+
+        if obj is pd.NaT:
+            return None
 
         if pd.isna(obj):
             return None
     except Exception:
         pass
-    return obj
+
+    if obj is None:
+        return None
+
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+
+    return str(obj)
 
 
 def _write_json(path: str | Path, payload: Mapping[str, Any]) -> Path:
@@ -65,6 +90,7 @@ def _write_json(path: str | Path, payload: Mapping[str, Any]) -> Path:
 
 
 def _detect_dmd_depth_um(asset: SessionAssets, dmd: int) -> Optional[float]:
+    metadata = getattr(asset, "metadata", {}) or {}
     candidates = (
         f"dmd{dmd}_depth_um",
         f"dmd{dmd}_depth",
@@ -74,8 +100,8 @@ def _detect_dmd_depth_um(asset: SessionAssets, dmd: int) -> Optional[float]:
         f"DMD{dmd}_depth",
     )
     for key in candidates:
-        if key in asset.metadata:
-            val = asset.metadata.get(key)
+        if key in metadata:
+            val = metadata.get(key)
             try:
                 if val is None:
                     return None
@@ -86,6 +112,7 @@ def _detect_dmd_depth_um(asset: SessionAssets, dmd: int) -> Optional[float]:
 
 
 def _guess_session_label(asset: SessionAssets) -> Optional[str]:
+    metadata = getattr(asset, "metadata", {}) or {}
     candidates = (
         "session_type",
         "experience_level",
@@ -94,8 +121,8 @@ def _guess_session_label(asset: SessionAssets) -> Optional[str]:
         "image_set",
     )
     for key in candidates:
-        if key in asset.metadata:
-            val = asset.metadata.get(key)
+        if key in metadata:
+            val = metadata.get(key)
             if val is not None and str(val) != "nan":
                 return str(val)
     return None
@@ -114,10 +141,12 @@ def _load_raw_soma_calcium_trials(
 ) -> list[np.ndarray | None]:
     trials: list[np.ndarray | None] = []
     keep = _valid_trial_mask(gs, dmd)
+
     for trial in range(1, gs.n_trials + 1):
         if not keep[trial - 1]:
             trials.append(None)
             continue
+
         _, ca = gs.get_soma_glu_ca_traces(
             dmd=dmd,
             trial=trial,
@@ -125,11 +154,15 @@ def _load_raw_soma_calcium_trials(
             roi_inds=roi_inds,
         )
         ca = np.asarray(ca, dtype=float)
+
         if ca.ndim != 2:
             raise ValueError(
-                f"Expected raw calcium trial array with shape (n_rois, time). Got {ca.shape} for dmd={dmd}, trial={trial}."
+                f"Expected raw calcium trial array with shape (n_rois, time). "
+                f"Got {ca.shape} for dmd={dmd}, trial={trial}."
             )
+
         trials.append(ca)
+
     return trials
 
 
@@ -143,6 +176,7 @@ def _load_processed_soma_calcium_trials(
     process_kwargs: Optional[Mapping[str, Any]] = None,
 ) -> list[np.ndarray | None]:
     process_kwargs = dict(process_kwargs or {})
+
     out = gs.get_processed_soma_ca_all_trials(
         dmd=dmd,
         trace_type=trace_type,
@@ -152,11 +186,13 @@ def _load_processed_soma_calcium_trials(
         include_invalid=True,
         **process_kwargs,
     )
+
     dff_trials = out["dff"]
     if len(dff_trials) != gs.n_trials:
         raise ValueError(
             f"Expected {gs.n_trials} processed trials for dmd={dmd}; got {len(dff_trials)}."
         )
+
     cleaned: list[np.ndarray | None] = []
     for tr in dff_trials:
         if tr is None:
@@ -164,8 +200,11 @@ def _load_processed_soma_calcium_trials(
         else:
             arr = np.asarray(tr, dtype=float)
             if arr.ndim != 2:
-                raise ValueError(f"Expected processed calcium trial with shape (n_rois, time). Got {arr.shape}.")
+                raise ValueError(
+                    f"Expected processed calcium trial with shape (n_rois, time). Got {arr.shape}."
+                )
             cleaned.append(arr)
+
     return cleaned
 
 
@@ -177,10 +216,14 @@ def _package_trace_family(
     trial_stack = stack_trials_padded(trials)
     concat = concatenate_trial_stack(trial_stack)
     fill_length = int(trial_stack.shape[-1])
+
     return {
         "trial_stack": trial_stack,
         "session_concat": concat,
-        "trial_lengths_samples": np.asarray(trial_lengths(trials, invalid_fill_length=fill_length), dtype=int),
+        "trial_lengths_samples": np.asarray(
+            trial_lengths(trials, invalid_fill_length=fill_length),
+            dtype=int,
+        ),
         "trial_start_times_s": np.arange(trial_stack.shape[0], dtype=float) * (fill_length / float(fs_hz)),
         "fill_length_samples": fill_length,
         "n_rois": int(trial_stack.shape[1]),
@@ -199,6 +242,7 @@ def _write_trace_npz(
 ) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
     np.savez_compressed(
         output_path,
         trial_stack=np.asarray(trace_payload["trial_stack"], dtype=float),
@@ -218,15 +262,19 @@ def _write_trace_npz(
 
 def _common_session_metadata(asset: SessionAssets, gs: GlutamateSummary) -> Dict[str, Any]:
     return {
-        "session_id": asset.session_id,
-        "subject_id": asset.subject_id,
-        "session_dir": str(asset.session_dir),
-        "summary_mat": None if asset.summary_mat is None else str(asset.summary_mat),
-        "bonsai_event_log_csv": None if asset.bonsai_event_log_csv is None else str(asset.bonsai_event_log_csv),
+        "session_id": getattr(asset, "session_id", None),
+        "subject_id": getattr(asset, "subject_id", None),
+        "session_dir": str(getattr(asset, "session_dir", "")),
+        "summary_mat": None if getattr(asset, "summary_mat", None) is None else str(asset.summary_mat),
+        "bonsai_event_log_csv": (
+            None
+            if getattr(asset, "bonsai_event_log_csv", None) is None
+            else str(asset.bonsai_event_log_csv)
+        ),
         "session_label": _guess_session_label(asset),
         "sampling_rate_hz": float(gs.metadata.get("analyzeHz", np.nan)),
         "n_trials": int(gs.n_trials),
-        "asset_metadata": asset.metadata,
+        "asset_metadata": getattr(asset, "metadata", {}) or {},
     }
 
 
@@ -241,9 +289,9 @@ def package_session_soma_calcium(
     event_time_col: str = DEFAULT_EVENT_TIME_COLUMN,
     overwrite: bool = False,
 ) -> Dict[str, Any]:
-    if asset.summary_mat is None:
+    if getattr(asset, "summary_mat", None) is None:
         raise FileNotFoundError(f"No SummaryLoCo .mat file was resolved for session {asset.session_id}.")
-    if asset.bonsai_event_log_csv is None:
+    if getattr(asset, "bonsai_event_log_csv", None) is None:
         raise FileNotFoundError(f"No bonsai_event_log.csv was resolved for session {asset.session_id}.")
 
     session_root = _session_export_root(asset, base_dir=output_root)
@@ -265,14 +313,15 @@ def package_session_soma_calcium(
         session_meta["dmd_exports"] = {}
 
         for dmd in dmds:
-            dmd_dir = session_root / f"DMD{int(dmd)}"
+            dmd = int(dmd)
+            dmd_dir = session_root / f"DMD{dmd}"
             raw_npz = dmd_dir / "raw_soma_calcium.npz"
             proc_npz = dmd_dir / "processed_soma_calcium_dff.npz"
 
             if not overwrite and raw_npz.exists() and proc_npz.exists():
-                session_meta["dmd_exports"][f"DMD{int(dmd)}"] = {
+                session_meta["dmd_exports"][f"DMD{dmd}"] = {
                     "status": "exists",
-                    "depth_um": _detect_dmd_depth_um(asset, int(dmd)),
+                    "depth_um": _detect_dmd_depth_um(asset, dmd),
                     "raw_output": str(raw_npz),
                     "processed_output": str(proc_npz),
                 }
@@ -281,13 +330,14 @@ def package_session_soma_calcium(
             try:
                 raw_trials = _load_raw_soma_calcium_trials(
                     gs,
-                    dmd=int(dmd),
+                    dmd=dmd,
                     trace_type=trace_type,
                     roi_inds=roi_inds,
                 )
+
                 processed_trials = _load_processed_soma_calcium_trials(
                     gs,
-                    dmd=int(dmd),
+                    dmd=dmd,
                     trace_type=trace_type,
                     roi_inds=roi_inds,
                     fs_hz=fs_hz,
@@ -298,35 +348,43 @@ def package_session_soma_calcium(
                 proc_payload = _package_trace_family(processed_trials, fs_hz=fs_hz)
 
                 dmd_dir.mkdir(parents=True, exist_ok=True)
+
                 _write_trace_npz(
                     raw_npz,
                     trace_payload=raw_payload,
                     trace_kind="raw_calcium",
-                    dmd=int(dmd),
+                    dmd=dmd,
                     fs_hz=fs_hz,
                 )
+
                 _write_trace_npz(
                     proc_npz,
                     trace_payload=proc_payload,
                     trace_kind="processed_calcium_dff",
-                    dmd=int(dmd),
+                    dmd=dmd,
                     fs_hz=fs_hz,
                 )
 
-                session_meta["dmd_exports"][f"DMD{int(dmd)}"] = {
+                session_meta["dmd_exports"][f"DMD{dmd}"] = {
                     "status": "exported",
-                    "depth_um": _detect_dmd_depth_um(asset, int(dmd)),
+                    "depth_um": _detect_dmd_depth_um(asset, dmd),
                     "n_rois": int(raw_payload["n_rois"]),
                     "fill_length_samples": int(raw_payload["fill_length_samples"]),
                     "raw_output": str(raw_npz),
                     "processed_output": str(proc_npz),
                 }
+
             except Exception as exc:
-                session_meta["dmd_exports"][f"DMD{int(dmd)}"] = {
+                session_meta["dmd_exports"][f"DMD{dmd}"] = {
                     "status": "skipped",
-                    "depth_um": _detect_dmd_depth_um(asset, int(dmd)),
+                    "depth_um": _detect_dmd_depth_um(asset, dmd),
                     "reason": repr(exc),
                 }
+
+    finally:
+        close_fn = getattr(gs, "close", None)
+        if callable(close_fn):
+            close_fn()
 
     _write_json(session_root / "session_metadata.json", session_meta)
     return session_meta
