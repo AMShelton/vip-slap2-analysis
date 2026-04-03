@@ -1147,6 +1147,286 @@ class GlutamateSummary:
             img = np.swapaxes(img, 0, 1)
         return img
 
+    @staticmethod
+    def _normalize_image_for_overlay(
+        image: np.ndarray,
+        *,
+        max_val: Optional[float] = None,
+        q: float = 0.99,
+        clip: bool = True,
+        gamma: float = 1.0,
+        fill_value: float = 0.0,
+    ) -> np.ndarray:
+        """
+        Robustly normalize a 2D image for RGB overlay display.
+
+        Parameters
+        ----------
+        image : ndarray
+            2D image.
+        max_val : float, optional
+            Explicit normalization ceiling. If None, uses nanquantile(image, q).
+        q : float, default 0.99
+            Quantile used when max_val is None.
+        clip : bool, default True
+            If True, clip normalized image to [0, 1].
+        gamma : float, default 1.0
+            Gamma applied after normalization. Values < 1 brighten dim structure;
+            values > 1 increase contrast of bright features.
+        fill_value : float, default 0.0
+            Value used to replace NaNs/Infs after normalization.
+
+        Returns
+        -------
+        out : ndarray
+            Float32 normalized image with shape matching input.
+        """
+        x = np.asarray(image, dtype=np.float32)
+
+        if x.ndim != 2:
+            raise ValueError(f"_normalize_image_for_overlay expects a 2D image, got shape {x.shape}")
+
+        finite = np.isfinite(x)
+        if not finite.any():
+            return np.full_like(x, fill_value, dtype=np.float32)
+
+        if max_val is None:
+            max_val = float(np.nanquantile(x, q))
+
+        if not np.isfinite(max_val) or max_val <= 0:
+            max_val = float(np.nanmax(x[finite]))
+            if not np.isfinite(max_val) or max_val <= 0:
+                return np.full_like(x, fill_value, dtype=np.float32)
+
+        out = x / max_val
+
+        if clip:
+            out = np.clip(out, 0.0, 1.0)
+
+        if gamma != 1.0:
+            out = np.power(out, gamma)
+
+        out = np.nan_to_num(out, nan=fill_value, posinf=1.0 if clip else fill_value, neginf=fill_value)
+        return out.astype(np.float32, copy=False)
+
+    def overlay_summary_images(
+        self,
+        *,
+        dmds: Optional[Sequence[int]] = None,
+        mean_image_type: str = "meanIM",
+        act_image_type: str = "actIM",
+        mean_channel: Union[int, str] = 0,
+        q_mean: float = 0.99,
+        q_act: float = 0.999,
+        mean_max_val: Optional[float] = None,
+        act_max_val: Optional[float] = None,
+        use_shared_scale: bool = True,
+        mean_gamma: float = 1.0,
+        act_gamma: float = 1.0,
+        mean_rgb: Tuple[float, float, float] = (0.0, 1.0, 1.0),
+        act_rgb: Tuple[float, float, float] = (1.0, 0.0, 1.0),
+        background_rgb: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        alpha_mean: float = 1.0,
+        alpha_act: float = 1.0,
+        clip: bool = True,
+        mask_to_selpix: bool = False,
+        return_dict: bool = False,
+        dtype: np.dtype = np.float32,
+    ) -> Union[List[np.ndarray], Dict[int, np.ndarray]]:
+        """
+        Generate RGB overlays of structural and activity summary images for each DMD.
+
+        By default, this reproduces the classic cyan (meanIM) + magenta (actIM)
+        overlay used to visualize dendritic structure and glutamatergic synapse
+        activity, while exposing substantially more control over scaling and color.
+
+        Parameters
+        ----------
+        dmds : sequence of int, optional
+            DMD numbers to process. Defaults to all available DMDs.
+        mean_image_type : str, default "meanIM"
+            Summary image used for structure.
+        act_image_type : str, default "actIM"
+            Summary image used for activity.
+        mean_channel : int or str, default 0
+            Channel to use if mean image is multi-channel.
+            Accepts python-style 0-based channel indices, or strings such as
+            "green"/"glutamate" -> 0 and "red"/"calcium" -> 1.
+        q_mean : float, default 0.99
+            Quantile for structural image normalization if mean_max_val is None.
+        q_act : float, default 0.999
+            Quantile for activity image normalization if act_max_val is None.
+        mean_max_val : float, optional
+            Explicit normalization ceiling for mean image. Overrides q_mean.
+        act_max_val : float, optional
+            Explicit normalization ceiling for act image. Overrides q_act.
+        use_shared_scale : bool, default True
+            If True, compute one shared normalization ceiling across requested DMDs
+            for each image type. This makes DMD-to-DMD comparisons more consistent.
+            If False, normalize each DMD independently.
+        mean_gamma : float, default 1.0
+            Gamma applied to normalized structural image.
+        act_gamma : float, default 1.0
+            Gamma applied to normalized activity image.
+        mean_rgb : tuple of float, default (0, 1, 1)
+            RGB color assigned to the structural image.
+        act_rgb : tuple of float, default (1, 0, 1)
+            RGB color assigned to the activity image.
+        background_rgb : tuple of float, default (0, 0, 0)
+            Base RGB background color before adding overlays.
+        alpha_mean : float, default 1.0
+            Weight of structural image contribution.
+        alpha_act : float, default 1.0
+            Weight of activity image contribution.
+        clip : bool, default True
+            Clip final RGB image to [0, 1].
+        mask_to_selpix : bool, default False
+            If True, zero pixels outside exptSummary/selPix for each DMD when available.
+            Useful when you want the overlay restricted to analyzed SLAP2 pixels.
+        return_dict : bool, default False
+            If True, return {dmd: rgb_image}. Otherwise return a list ordered by dmds.
+        dtype : np.dtype, default np.float32
+            Output dtype.
+
+        Returns
+        -------
+        overlays : list of ndarray or dict
+            RGB overlay images with shape (y, x, 3), one per DMD.
+        """
+        if dmds is None:
+            dmds = list(range(1, self.n_dmds + 1))
+        else:
+            dmds = [int(d) for d in dmds]
+
+        if len(dmds) == 0:
+            return {} if return_dict else []
+
+        def _resolve_channel(ch: Union[int, str], n_channels: int) -> int:
+            if isinstance(ch, str):
+                c = ch.lower()
+                if c in ("green", "glu", "glutamate", "g"):
+                    idx = 0
+                elif c in ("red", "ca", "calcium", "rcamp", "r"):
+                    idx = 1
+                else:
+                    raise ValueError(f"Unknown mean_channel specifier: {ch}")
+            else:
+                idx = int(ch)
+
+            if idx < 0 or idx >= n_channels:
+                raise ValueError(f"Requested mean_channel={idx}, but image has {n_channels} channels")
+            return idx
+
+        mean_images: Dict[int, np.ndarray] = {}
+        act_images: Dict[int, np.ndarray] = {}
+
+        for dmd in dmds:
+            mean_im = np.asarray(self.get_summary_image(dmd, mean_image_type))
+            act_im = np.asarray(self.get_summary_image(dmd, act_image_type))
+
+            if mean_im.ndim == 3:
+                # Support either (channel, y, x) or (y, x, channel). In this class,
+                # get_summary_image typically returns swapped arrays but not a fixed channel convention.
+                if mean_im.shape[0] <= 4:
+                    ch_idx = _resolve_channel(mean_channel, mean_im.shape[0])
+                    mean_im = mean_im[ch_idx]
+                elif mean_im.shape[-1] <= 4:
+                    ch_idx = _resolve_channel(mean_channel, mean_im.shape[-1])
+                    mean_im = mean_im[..., ch_idx]
+                else:
+                    raise ValueError(
+                        f"Could not infer channel axis for {mean_image_type} in DMD {dmd}; shape={mean_im.shape}"
+                    )
+
+            if act_im.ndim != 2:
+                if act_im.ndim == 3 and act_im.shape[0] == 1:
+                    act_im = act_im[0]
+                elif act_im.ndim == 3 and act_im.shape[-1] == 1:
+                    act_im = act_im[..., 0]
+                else:
+                    raise ValueError(f"{act_image_type} must resolve to 2D for DMD {dmd}, got shape {act_im.shape}")
+
+            if mean_im.shape != act_im.shape:
+                raise ValueError(
+                    f"mean and activity images do not match for DMD {dmd}: "
+                    f"{mean_im.shape} vs {act_im.shape}"
+                )
+
+            if mask_to_selpix:
+                try:
+                    sel = np.asarray(self.get_sel_pix(dmd)).astype(bool)
+                    if sel.shape == mean_im.shape:
+                        mean_im = np.where(sel, mean_im, np.nan)
+                        act_im = np.where(sel, act_im, np.nan)
+                except Exception:
+                    pass
+
+            mean_images[dmd] = mean_im
+            act_images[dmd] = act_im
+
+        if mean_max_val is None and use_shared_scale:
+            mean_candidates = [
+                float(np.nanquantile(im, q_mean))
+                for im in mean_images.values()
+                if np.isfinite(im).any()
+            ]
+            mean_scale = min(mean_candidates) if len(mean_candidates) else None
+        else:
+            mean_scale = mean_max_val
+
+        if act_max_val is None and use_shared_scale:
+            act_candidates = [
+                float(np.nanquantile(im, q_act))
+                for im in act_images.values()
+                if np.isfinite(im).any()
+            ]
+            act_scale = min(act_candidates) if len(act_candidates) else None
+        else:
+            act_scale = act_max_val
+
+        mean_rgb_arr = np.asarray(mean_rgb, dtype=np.float32).reshape(1, 1, 3)
+        act_rgb_arr = np.asarray(act_rgb, dtype=np.float32).reshape(1, 1, 3)
+        bg_rgb_arr = np.asarray(background_rgb, dtype=np.float32).reshape(1, 1, 3)
+
+        overlays: Dict[int, np.ndarray] = {}
+        for dmd in dmds:
+            this_mean_scale = mean_scale
+            this_act_scale = act_scale
+
+            if not use_shared_scale:
+                if mean_max_val is None:
+                    this_mean_scale = float(np.nanquantile(mean_images[dmd], q_mean))
+                if act_max_val is None:
+                    this_act_scale = float(np.nanquantile(act_images[dmd], q_act))
+
+            mean_norm = self._normalize_image_for_overlay(
+                mean_images[dmd],
+                max_val=this_mean_scale,
+                q=q_mean,
+                clip=clip,
+                gamma=mean_gamma,
+            )
+            act_norm = self._normalize_image_for_overlay(
+                act_images[dmd],
+                max_val=this_act_scale,
+                q=q_act,
+                clip=clip,
+                gamma=act_gamma,
+            )
+
+            rgb = np.broadcast_to(bg_rgb_arr, (*mean_norm.shape, 3)).copy()
+            rgb += alpha_mean * mean_norm[..., None] * mean_rgb_arr
+            rgb += alpha_act * act_norm[..., None] * act_rgb_arr
+
+            if clip:
+                rgb = np.clip(rgb, 0.0, 1.0)
+
+            overlays[dmd] = rgb.astype(dtype, copy=False)
+
+        if return_dict:
+            return overlays
+        return [overlays[dmd] for dmd in dmds]
+
     def get_sel_pix(self, dmd: int) -> np.ndarray:
         dmd0 = dmd - 1
         node = self._cell_item("selPix", dmd0)
