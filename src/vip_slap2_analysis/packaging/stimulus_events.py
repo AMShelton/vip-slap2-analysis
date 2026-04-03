@@ -10,7 +10,7 @@ import pandas as pd
 
 DEFAULT_EVENT_TIME_COLUMN = "corrected_timestamps"
 DEFAULT_EVENT_VALUE_COLUMN = "Value"
-DEFAULT_SPECIAL_EVENTS = ("Change", "Omission")
+DEFAULT_SPECIAL_EVENTS = ("ChangeFlash", "Omission")
 
 
 def load_bonsai_event_log(csv_path: str | Path) -> pd.DataFrame:

@@ -20,6 +20,75 @@ from vip_slap2_analysis.packaging.trial_concat import (
     trial_lengths,
 )
 
+import glob
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import pandas as pd
+
+def _load_imaging_epoch_metadata(asset) -> Optional[Dict[str, Any]]:
+    """
+    Load imaging epoch metadata from:
+        <asset.qc_dir>/behavior/imaging_epochs.csv
+
+    Expected columns in the example file:
+        start_idx, end_idx, start_time, end_time, duration_s
+
+    Returns
+    -------
+    dict or None
+        JSON-friendly dictionary containing the epoch table, plus a compact
+        summary of the full imaging span. Returns None if no file is found.
+    """
+    qc_dir = getattr(asset, "qc_dir", None)
+    if qc_dir is None:
+        return None
+
+    matches = glob.glob(os.path.join(str(qc_dir), "behavior", "imaging_epochs.csv"))
+    if not matches:
+        return None
+
+    path = Path(matches[0])
+    df = pd.read_csv(path)
+
+    if df.empty:
+        return {
+            "source_csv": str(path),
+            "n_epochs": 0,
+            "epochs": [],
+            "session_imaging_start_time_s": None,
+            "session_imaging_end_time_s": None,
+            "total_imaged_duration_s": None,
+        }
+
+    required_cols = {"start_idx", "end_idx", "start_time", "end_time", "duration_s"}
+    missing = required_cols.difference(df.columns)
+    if missing:
+        raise ValueError(
+            f"imaging_epochs.csv is missing required columns: {sorted(missing)}"
+        )
+
+    epochs = []
+    for _, row in df.iterrows():
+        epochs.append(
+            {
+                "start_idx": int(row["start_idx"]),
+                "end_idx": int(row["end_idx"]),
+                "start_time_s": float(row["start_time"]),
+                "end_time_s": float(row["end_time"]),
+                "duration_s": float(row["duration_s"]),
+            }
+        )
+
+    return {
+        "source_csv": str(path),
+        "n_epochs": int(len(df)),
+        "epochs": epochs,
+        "session_imaging_start_time_s": float(df["start_time"].min()),
+        "session_imaging_end_time_s": float(df["end_time"].max()),
+        "total_imaged_duration_s": float(df["duration_s"].sum()),
+    }
 
 def _session_export_root(
     asset: SessionAssets,
@@ -275,6 +344,7 @@ def _common_session_metadata(asset: SessionAssets, gs: GlutamateSummary) -> Dict
         "sampling_rate_hz": float(gs.metadata.get("analyzeHz", np.nan)),
         "n_trials": int(gs.n_trials),
         "asset_metadata": getattr(asset, "metadata", {}) or {},
+        "imaging_epochs": _load_imaging_epoch_metadata(asset),
     }
 
 
