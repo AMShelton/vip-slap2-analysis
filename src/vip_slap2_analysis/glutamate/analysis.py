@@ -133,7 +133,7 @@ def resolve_glutamate_analysis_paths(
     base = Path(session_dir_or_analysis_dir)
     analysis_dir = base if base.name == "analysis" else base / "analysis"
     derived = analysis_dir / "derived" / "glutamate"
-    out = Path(output_dir) if output_dir is not None else analysis_dir / "derived" / "glutamate_analysis"
+    out = Path(output_dir) if output_dir is not None else analysis_dir / "derived" / 'glutamate' / "glutamate_analysis"
     return GlutamateAnalysisPaths(
         single_trial_npz=derived / "glutamate_single_trial_df.npz",
         mean_npz=derived / "glutamate_mean_df.npz",
