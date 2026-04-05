@@ -84,7 +84,7 @@ def downsample(data, factor):
     data = data[:trimmed_frames]
     return data.reshape(-1, factor, data.shape[1], data.shape[2]).mean(axis=1)
     
-def normalize(image, max_val=None):
+def normalize_image(image, max_val=None):
 
     """
     Normalize an image/array to [0, 1] with clipping and NaN safety.
@@ -107,9 +107,9 @@ def normalize(image, max_val=None):
     image = image / max_val
     return image
 
-def normalize_timeseries(arr):
+def normalize(arr):
     
-    arr = (arr-arr.min())/(arr.max()-arr.min())
+    arr = (arr-np.min(arr))/(np.max(arr)-np.min(arr))
 
     return arr
 
