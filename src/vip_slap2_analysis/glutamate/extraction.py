@@ -142,12 +142,22 @@ def _jsonify_onset_array(x: np.ndarray) -> List[float]:
     return [float(v) for v in x.tolist()]
 
 
+def _trace_suffix(trace_signal: str, trace_mode: Optional[str]) -> str:
+    signal = str(trace_signal)
+    if signal == "F0":
+        return "F0"
+    mode = "none" if trace_mode is None else str(trace_mode)
+    return f"{signal}_{mode}"
+
+
 def process_glutamate_extraction(
     asset: SessionAssets,
     *,
     metadata: Optional[Dict[str, Any]] = None,
     use_synapse_qc: bool = True,
     overwrite: bool = False,
+    trace_signal: str = "dF",
+    trace_mode: Optional[str] = "ls",
 ) -> Dict[str, Any]:
     metadata = metadata or {}
     pp = metadata.get("prepost_sec", {})
@@ -170,9 +180,10 @@ def process_glutamate_extraction(
     glut_dir.mkdir(parents=True, exist_ok=True)
     glut_qc_dir.mkdir(parents=True, exist_ok=True)
 
-    mean_npz = glut_dir / "glutamate_mean_df.npz"
-    single_npz = glut_dir / "glutamate_single_trial_df.npz"
-    seq_npz = glut_dir / "glutamate_sequence_df.npz"
+    trace_suffix = _trace_suffix(trace_signal, trace_mode)
+    mean_npz = glut_dir / f"glutamate_mean_{trace_suffix}.npz"
+    single_npz = glut_dir / f"glutamate_single_trial_{trace_suffix}.npz"
+    seq_npz = glut_dir / f"glutamate_sequence_{trace_suffix}.npz"
     qc_json = glut_qc_dir / "glutamate_extraction_qc.json"
 
     if all(p.exists() for p in [mean_npz, single_npz, seq_npz, qc_json]) and not overwrite:
@@ -218,6 +229,9 @@ def process_glutamate_extraction(
         "use_synapse_qc": bool(use_synapse_qc),
         "epoch_start_sec": epoch_start_sec,
         "epoch_end_sec": epoch_end_sec,
+        "trace_signal": str(trace_signal),
+        "trace_mode": None if trace_mode is None else str(trace_mode),
+        "trace_suffix": trace_suffix,
     }
 
     mean_pkg: Dict[str, Any] = {"metadata": base_meta, "timebase_sec": tvecs, "DMD1": {}, "DMD2": {}}
@@ -230,6 +244,9 @@ def process_glutamate_extraction(
         "summary_mat": str(asset.summary_mat),
         "bonsai_event_log_csv": str(asset.bonsai_event_log_csv),
         "use_synapse_qc": bool(use_synapse_qc),
+        "trace_signal": str(trace_signal),
+        "trace_mode": None if trace_mode is None else str(trace_mode),
+        "trace_suffix": trace_suffix,
         "windows_sec": base_meta["windows_sec"],
         "event_counts": {
             "image_total": int(sum(len(v) for v in image_times.values())),
@@ -253,8 +270,8 @@ def process_glutamate_extraction(
             dmd=dmd,
             im_rate_hz=im_rate_hz,
             epoch_start_sec=epoch_start_sec,
-            signal="dF",
-            mode="ls",
+            signal=trace_signal,
+            mode=trace_mode,
         )
         if bundle.traces.size == 0:
             qc["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no valid traces"}

@@ -766,6 +766,158 @@ class GlutamateSummary:
             return x[:, :, 0]
         return x
 
+
+    @staticmethod
+    def _safe_divide_dff(
+        dF: np.ndarray,
+        F0: np.ndarray,
+        *,
+        eps: float = 1e-8,
+    ) -> np.ndarray:
+        """
+        Compute dF/F0 with guarded division.
+        Invalid or tiny F0 values are returned as NaN.
+        """
+        dF = np.asarray(dF, dtype=float)
+        F0 = np.asarray(F0, dtype=float)
+
+        if dF.ndim == 3 and F0.ndim == 2:
+            F0 = F0[:, :, None]
+        elif dF.ndim == 2 and F0.ndim == 3 and F0.shape[2] == 1:
+            F0 = F0[:, :, 0]
+
+        if dF.shape != F0.shape:
+            raise ValueError(
+                f"dF and F0 must match after normalization; got {dF.shape} vs {F0.shape}"
+            )
+
+        out = np.full(dF.shape, np.nan, dtype=float)
+        valid = np.isfinite(dF) & np.isfinite(F0) & (np.abs(F0) > float(eps))
+        np.divide(dF, F0, out=out, where=valid)
+        return out
+
+    def get_requested_traces(
+        self,
+        dmd: int = 1,
+        trial: int = 1,
+        signal: str = "dF",
+        mode: str = "ls",
+        channels: ChannelSpec = None,
+        t_slice: Optional[slice] = None,
+        roi_inds: Optional[Sequence[int]] = None,
+        drop_discarded: bool = False,
+        return_frame_lines: bool = False,
+        dtype: Optional[np.dtype] = None,
+        force_n_channels: Optional[int] = None,
+        pad_value: float = np.nan,
+        drop_nan_channels: bool = False,
+        squeeze_channels: bool = True,
+        dff_eps: float = 1e-8,
+    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        """
+        Resolve a stored or derived trace request.
+
+        Supported requests
+        ------------------
+        - signal='dF'  : stored dF/<mode>
+        - signal='F0'  : stored F0
+        - signal='dFF' : stored dFF/<mode> if present, otherwise derived as
+                         dF/<mode> divided by F0 using safe division.
+        """
+        signal = str(signal)
+
+        if signal != "dFF":
+            return self.get_traces(
+                dmd=dmd,
+                trial=trial,
+                signal=signal,
+                mode=mode,
+                channels=channels,
+                t_slice=t_slice,
+                roi_inds=roi_inds,
+                drop_discarded=drop_discarded,
+                return_frame_lines=return_frame_lines,
+                dtype=dtype,
+                force_n_channels=force_n_channels,
+                pad_value=pad_value,
+                drop_nan_channels=drop_nan_channels,
+                squeeze_channels=squeeze_channels,
+            )
+
+        dmd0, trial0 = dmd - 1, trial - 1
+        if trial <= 0 or dmd <= 0:
+            raise ValueError("dmd and trial must be 1-indexed positive integers")
+        if not self.keep_trials[dmd0, trial0]:
+            raise ValueError(f"Trial {trial} is invalid in DMD {dmd}")
+
+        g = self._E_group(dmd0, trial0)
+        has_stored_dff = ("dFF" in g) and isinstance(g["dFF"], h5py.Group) and (mode in g["dFF"])
+
+        if has_stored_dff:
+            return self.get_traces(
+                dmd=dmd,
+                trial=trial,
+                signal="dFF",
+                mode=mode,
+                channels=channels,
+                t_slice=t_slice,
+                roi_inds=roi_inds,
+                drop_discarded=drop_discarded,
+                return_frame_lines=return_frame_lines,
+                dtype=dtype,
+                force_n_channels=force_n_channels,
+                pad_value=pad_value,
+                drop_nan_channels=drop_nan_channels,
+                squeeze_channels=squeeze_channels,
+            )
+
+        dF_out = self.get_traces(
+            dmd=dmd,
+            trial=trial,
+            signal="dF",
+            mode=mode,
+            channels=channels,
+            t_slice=t_slice,
+            roi_inds=roi_inds,
+            drop_discarded=drop_discarded,
+            return_frame_lines=return_frame_lines,
+            dtype=dtype,
+            force_n_channels=force_n_channels,
+            pad_value=pad_value,
+            drop_nan_channels=drop_nan_channels,
+            squeeze_channels=False,
+        )
+        if return_frame_lines:
+            dF, frame_lines = dF_out
+        else:
+            dF = dF_out
+            frame_lines = None
+
+        F0 = self.get_traces(
+            dmd=dmd,
+            trial=trial,
+            signal="F0",
+            channels=None,
+            t_slice=t_slice,
+            roi_inds=roi_inds,
+            drop_discarded=drop_discarded,
+            return_frame_lines=False,
+            dtype=dtype,
+            force_n_channels=None,
+            pad_value=pad_value,
+            drop_nan_channels=False,
+            squeeze_channels=False,
+        )
+
+        dff = self._safe_divide_dff(dF, F0, eps=dff_eps)
+        if dtype is not None:
+            dff = dff.astype(dtype, copy=False)
+
+        out = self._squeeze_channels(dff, squeeze_channels=squeeze_channels)
+        if return_frame_lines:
+            return out, frame_lines
+        return out
+
     def _get_motion_regressors(
         self,
         dmd: int,
@@ -941,7 +1093,8 @@ class GlutamateSummary:
         Parameters
         ----------
         signal : {'dF','dFF','F0'}
-            Note: many LoCo outputs do NOT contain dFF. If missing, raises KeyError.
+            Raw loader for stored datasets. For a derived dFF request that falls
+            back to dF/F0 when dFF is not stored, use `get_requested_traces(...)`.
         mode : e.g. 'ls', 'denoised', 'events'
         """
         dmd0, trial0 = dmd - 1, trial - 1
@@ -960,39 +1113,104 @@ class GlutamateSummary:
             except Exception:
                 frame_lines = None
 
-        # Determine number of channels for this dataset:
+        # Determine number of channels for this dataset.
         # Many files reserve 2 channels (second is NaNs). If the dataset is 2D => 1 channel.
-        # We'll infer from shape.
+        # If requested dFF is not stored, derive it as dF/F0.
         if signal == "F0":
             ds = g["F0"]
-        elif signal in ("dF", "dFF"):
-            if signal not in g:
+
+            ds_shape = tuple(ds.shape)
+            n_channels_struct = 1 if len(ds_shape) == 2 else (2 if 2 in ds_shape else 1)
+            ch_sel = self._normalize_channels(channels, n_channels_struct)
+
+            raw = self._read_trace_dataset(
+                ds,
+                frame_lines=frame_lines,
+                n_channels=n_channels_struct,
+                channels=ch_sel,
+                t_slice=t_slice,
+                roi_inds=roi_inds,
+            )  # (time, rois, ch)
+
+        elif signal == "dF":
+            if "dF" not in g:
                 raise KeyError(
-                    f"'{signal}' not found for dmd={dmd}, trial={trial}. "
+                    f"'dF' not found for dmd={dmd}, trial={trial}. "
                     f"Available top-level keys: {list(g.keys())}"
                 )
-            if mode not in g[signal]:
+            if mode not in g["dF"]:
                 raise KeyError(
-                    f"Mode '{mode}' not found under '{signal}' for dmd={dmd}, trial={trial}. "
-                    f"Available modes: {list(g[signal].keys())}"
+                    f"Mode '{mode}' not found under 'dF' for dmd={dmd}, trial={trial}. "
+                    f"Available modes: {list(g['dF'].keys())}"
                 )
-            ds = g[signal][mode]
+            ds = g["dF"][mode]
+
+            ds_shape = tuple(ds.shape)
+            n_channels_struct = 1 if len(ds_shape) == 2 else (2 if 2 in ds_shape else 1)
+            ch_sel = self._normalize_channels(channels, n_channels_struct)
+
+            raw = self._read_trace_dataset(
+                ds,
+                frame_lines=frame_lines,
+                n_channels=n_channels_struct,
+                channels=ch_sel,
+                t_slice=t_slice,
+                roi_inds=roi_inds,
+            )  # (time, rois, ch)
+
+        elif signal == "dFF":
+            has_stored_dff = ("dFF" in g) and isinstance(g["dFF"], h5py.Group) and (mode in g["dFF"])
+            if has_stored_dff:
+                ds = g["dFF"][mode]
+
+                ds_shape = tuple(ds.shape)
+                n_channels_struct = 1 if len(ds_shape) == 2 else (2 if 2 in ds_shape else 1)
+                ch_sel = self._normalize_channels(channels, n_channels_struct)
+
+                raw = self._read_trace_dataset(
+                    ds,
+                    frame_lines=frame_lines,
+                    n_channels=n_channels_struct,
+                    channels=ch_sel,
+                    t_slice=t_slice,
+                    roi_inds=roi_inds,
+                )  # (time, rois, ch)
+            else:
+                dF = self.get_traces(
+                    dmd=dmd,
+                    trial=trial,
+                    signal="dF",
+                    mode=mode,
+                    channels=channels,
+                    t_slice=t_slice,
+                    roi_inds=roi_inds,
+                    drop_discarded=False,
+                    return_frame_lines=False,
+                    dtype=dtype,
+                    force_n_channels=force_n_channels,
+                    pad_value=pad_value,
+                    drop_nan_channels=drop_nan_channels,
+                    squeeze_channels=False,
+                )
+                F0 = self.get_traces(
+                    dmd=dmd,
+                    trial=trial,
+                    signal="F0",
+                    mode="ls",
+                    channels=None,
+                    t_slice=t_slice,
+                    roi_inds=roi_inds,
+                    drop_discarded=False,
+                    return_frame_lines=False,
+                    dtype=dtype,
+                    force_n_channels=None,
+                    pad_value=pad_value,
+                    drop_nan_channels=False,
+                    squeeze_channels=False,
+                )
+                raw = self._safe_divide_dff(dF, F0, eps=1e-8)
         else:
             raise ValueError(f"Unknown signal '{signal}'. Expected 'dF', 'dFF', or 'F0'.")
-
-        # infer structural channels from dataset shape (not from content)
-        ds_shape = tuple(ds.shape)
-        n_channels_struct = 1 if len(ds_shape) == 2 else (2 if 2 in ds_shape else 1)
-        ch_sel = self._normalize_channels(channels, n_channels_struct)
-
-        raw = self._read_trace_dataset(
-            ds,
-            frame_lines=frame_lines,
-            n_channels=n_channels_struct,
-            channels=ch_sel,
-            t_slice=t_slice,
-            roi_inds=roi_inds,
-        )  # (time, rois, ch)
 
         if drop_discarded and "discardFrames" in g:
             df = np.asarray(g["discardFrames"][()])
