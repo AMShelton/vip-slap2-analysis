@@ -1690,7 +1690,9 @@ class GlutamateSummary:
 
         if fp.ndim == 2:
             sel = self.get_sel_pix(dmd)
-            sel_flat = sel.reshape(-1)
+
+            # MATLAB-style linear indexing
+            sel_flat = sel.reshape(-1, order="F")
             true_ind = np.where(sel_flat > 0)[0]
 
             if fp.shape[1] == len(true_ind):
@@ -1703,7 +1705,10 @@ class GlutamateSummary:
             n_rois = fp_rois_by_sel.shape[0]
             recon = np.full((n_rois, sel_flat.size), np.nan, dtype=float)
             recon[:, true_ind] = fp_rois_by_sel
-            fp3 = recon.reshape((n_rois, sel.shape[0], sel.shape[1]))
+
+            fp3 = np.empty((n_rois, sel.shape[0], sel.shape[1]), dtype=float)
+            for i in range(n_rois):
+                fp3[i] = recon[i].reshape(sel.shape, order="F")
 
         elif fp.ndim == 3:
             # (n_rois, y, x) or (y, x, n_rois)
@@ -1721,6 +1726,115 @@ class GlutamateSummary:
 
         return fp3
 
+    import numpy as np
+
+    def mean_footprints_across_trials(self, dmd: int, trials=None, dtype=np.float32) -> np.ndarray:
+        """
+        Average synapse footprints across trials for one DMD without stacking all trials.
+
+        Parameters
+        ----------
+        dmd : int
+            DMD index, typically 1 or 2.
+        trials : sequence of int or None
+            Trials to include. If None, uses self.valid_trials[dmd - 1].
+        dtype : numpy dtype
+            Accumulator dtype. float32 is usually sufficient and saves memory.
+
+        Returns
+        -------
+        mean_footprints : np.ndarray
+            Array of shape (n_synapses, ny, nx), averaged across trials with NaNs ignored.
+        """
+        if trials is None:
+            trials = self.valid_trials[dmd - 1]
+
+        trials = list(trials)
+        if len(trials) == 0:
+            raise ValueError(f"No trials provided for dmd={dmd}")
+
+        sum_footprints = None
+        count_footprints = None
+
+        for trial in trials:
+            fp = self.get_footprints(dmd=dmd, trial=trial)
+            fp = np.asarray(fp, dtype=dtype)
+
+            if fp.ndim != 3:
+                raise ValueError(
+                    f"Expected 3D footprint array for trial {trial}, got shape {fp.shape}"
+                )
+
+            if sum_footprints is None:
+                sum_footprints = np.zeros_like(fp, dtype=dtype)
+                count_footprints = np.zeros_like(fp, dtype=np.uint16)
+
+            valid = ~np.isnan(fp)
+            sum_footprints[valid] += fp[valid]
+            count_footprints[valid] += 1
+
+        mean_footprints = np.full_like(sum_footprints, np.nan, dtype=dtype)
+        valid_mean = count_footprints > 0
+        mean_footprints[valid_mean] = (
+            sum_footprints[valid_mean] / count_footprints[valid_mean]
+        )
+
+        return mean_footprints
+
+    def footprint_centroids(self, footprints: np.ndarray, weighted: bool = True) -> np.ndarray:
+        """
+        Compute centroids for a stack of synapse footprint images.
+
+        Parameters
+        ----------
+        footprints : np.ndarray
+            Array of shape (n_synapses, ny, nx) or (n_synapses, nx, ny).
+            Background should be NaN, and footprint pixels should contain values
+            such as 0-255.
+        weighted : bool, default=True
+            If True, compute an intensity-weighted centroid.
+            If False, compute the centroid of the non-NaN footprint mask.
+
+        Returns
+        -------
+        centroids : np.ndarray
+            Array of shape (n_synapses, 2), where each row is (y, x) in pixel coordinates.
+            Empty footprints return [np.nan, np.nan].
+        """
+        footprints = np.asarray(footprints)
+        if footprints.ndim != 3:
+            raise ValueError(
+                f"`footprints` must be a 3D array of shape (n_synapses, ny, nx); got shape {footprints.shape}"
+            )
+
+        n_syn, ny, nx = footprints.shape
+        centroids = np.full((n_syn, 2), np.nan, dtype=float)
+
+        yy, xx = np.indices((ny, nx))
+
+        for i in range(n_syn):
+            fp = footprints[i]
+            valid = ~np.isnan(fp)
+
+            if not np.any(valid):
+                continue
+
+            if weighted:
+                weights = np.where(valid, fp, 0.0).astype(float)
+                wsum = weights.sum()
+
+                if wsum <= 0:
+                    continue
+
+                cy = (yy * weights).sum() / wsum
+                cx = (xx * weights).sum() / wsum
+            else:
+                cy = yy[valid].mean()
+                cx = xx[valid].mean()
+
+            centroids[i] = [cy, cx]
+
+        return centroids
     # ----------------- convenience -----------------
 
     def timebase(self, dmd: int, trial: int, hz_key: str = "analyzeHz") -> np.ndarray:
