@@ -37,6 +37,12 @@ DEFAULT_X_TICK_PARAMS = dict(axis="x", which="major", reset=True, top=False, lab
 DEFAULT_Y_TICK_PARAMS = dict(axis="y", which="major", reset=True, right=False, labelsize=12)
 
 
+# =============================================================================
+
+# RASTER PLOT OF SINGLE SLAP2 IMAGING SESSION
+
+# =============================================================================
+
 # -----------------------------------------------------------------------------
 # small utilities
 # -----------------------------------------------------------------------------
@@ -650,10 +656,10 @@ def plot_glutamate_session(
     wheel_radius_cm: float = 8.0,
     encoder_units: str = "cm",
     speed_units: str = "cm/s",
-    running_median_filter_kernel: int = 51,
+    running_median_filter_kernel: int = 75,
     running_absolute_speed: bool = True,
     ticks_per_revolution: Optional[float] = None,
-    running_smooth_speed_sigma: Optional[float] = 3.0,
+    running_smooth_speed_sigma: Optional[float] = 12.0,
     image_flash_duration: float = 0.25,
     im_colors=IM_COLORS,
     cmap_session: str = "Greens",
@@ -1143,3 +1149,321 @@ def plot_stimulus_locked_heatmaps(
         "dmd_per_image": dmd_per_image,
         "feature_cbar": cb,
     }
+
+
+# =============================================================================
+
+# MEAN IMAGE HEATMAPS
+
+# =============================================================================
+
+def compute_mean_image_response_by_identity(
+    asset,
+    dmds=None,
+    signal: str = "dF",
+    mode: str = "ls",
+    channels: str = "glutamate",
+    normalize_rows: str | None = None,
+    t_pre: float = 0.5,
+    t_post: float = 1.0,
+    baseline_subtract: bool = True,
+    baseline_window: tuple[float, float] = (-0.25, 0.0),
+    smooth_sigma: float = 0.0,
+):
+    """
+    Compute mean stimulus-aligned response matrices for each image identity.
+
+    Returns
+    -------
+    dict with keys:
+        summary
+        unique_images
+        t_rel_by_dmd
+        per_image_synapse_traces
+        per_image_mean
+        per_image_sem
+    """
+    summary, dmd_mats, dmd_timebases, dmd_dt = build_session_glutamate_mats(
+        asset=asset,
+        signal=signal,
+        mode=mode,
+        channels=channels,
+        normalize_rows=normalize_rows,
+    )
+
+    stim = load_stimulus_events(asset)
+    ordered_images = stim["ordered_images"]
+    session_start_sec = stim["session_start_sec"]
+
+    if dmds is None:
+        dmds = sorted(dmd_mats.keys())
+    else:
+        dmds = list(dmds)
+
+    image_names = [evt.image_name for evt in ordered_images]
+    unique_images = list(dict.fromkeys(image_names))
+
+    image_to_times = {
+        img: [float(evt.onset) - float(session_start_sec) for evt in ordered_images if evt.image_name == img]
+        for img in unique_images
+    }
+
+    per_image_synapse_traces = {}
+    per_image_mean = {}
+    per_image_sem = {}
+    t_rel_by_dmd = {}
+
+    for dmd in dmds:
+        mat = dmd_mats[dmd]
+        t = dmd_timebases[dmd]
+        dt = dmd_dt[dmd]
+
+        per_image_synapse_traces[dmd] = {}
+        per_image_mean[dmd] = {}
+        per_image_sem[dmd] = {}
+
+        for img in unique_images:
+            stack, t_rel = _extract_triggered_stack(
+                session_mat=mat,
+                session_t=t,
+                event_times_rel=image_to_times[img],
+                t_pre=t_pre,
+                t_post=t_post,
+                dt=dt,
+            )
+
+            if baseline_subtract:
+                stack = _baseline_subtract_stack(
+                    stack,
+                    t_rel,
+                    baseline_window=baseline_window,
+                )
+
+            # stack shape: (n_trials, n_synapses, n_time)
+            if stack.size == 0:
+                syn_mat = np.full((mat.shape[0], len(t_rel)), np.nan)
+            else:
+                syn_mat = np.nanmean(stack, axis=0)
+
+            if smooth_sigma is not None and smooth_sigma > 0:
+                syn_mat = _smooth_rows(syn_mat, smooth_sigma)
+
+            mean_trace = np.nanmean(syn_mat, axis=0)
+
+            n_eff = np.sum(np.isfinite(syn_mat), axis=0)
+            sem_trace = np.nanstd(syn_mat, axis=0) / np.sqrt(np.maximum(n_eff, 1))
+
+            per_image_synapse_traces[dmd][img] = syn_mat
+            per_image_mean[dmd][img] = mean_trace
+            per_image_sem[dmd][img] = sem_trace
+            t_rel_by_dmd[dmd] = t_rel
+
+    return {
+        "summary": summary,
+        "unique_images": unique_images,
+        "t_rel_by_dmd": t_rel_by_dmd,
+        "per_image_synapse_traces": per_image_synapse_traces,
+        "per_image_mean": per_image_mean,
+        "per_image_sem": per_image_sem,
+    }
+
+
+def _plot_single_image_response_axis(
+    ax,
+    t_rel,
+    syn_mat,
+    mean_trace,
+    sem_trace=None,
+    color="k",
+    plot_synapses=False,
+    synapse_color="0.7",
+    synapse_alpha=0.2,
+    lw_syn=0.7,
+    lw_mean=2.0,
+    show_sem=True,
+    sem_alpha=0.25,
+    onset_line=True,
+    onset_line_kwargs=None,
+):
+    """
+    Plot one image-aligned response axis.
+    """
+    onset_line_kwargs = onset_line_kwargs or {"color": "k", "lw": 0.8, "alpha": 0.8}
+
+    if plot_synapses:
+        for i in range(syn_mat.shape[0]):
+            y = syn_mat[i]
+            if np.all(~np.isfinite(y)):
+                continue
+            ax.plot(
+                t_rel,
+                y,
+                color=synapse_color,
+                alpha=synapse_alpha,
+                lw=lw_syn,
+                zorder=1,
+            )
+
+    ax.plot(t_rel, mean_trace, color=color, lw=lw_mean, zorder=3)
+
+    if show_sem and sem_trace is not None:
+        ax.fill_between(
+            t_rel,
+            mean_trace - sem_trace,
+            mean_trace + sem_trace,
+            color=color,
+            alpha=sem_alpha,
+            zorder=2,
+        )
+
+    if onset_line:
+        ax.axvline(0, **onset_line_kwargs)
+
+
+def plot_mean_image_responses(
+    asset,
+    dmd: int = 1,
+    image_name: str | None = None,
+    as_grid: bool = False,
+    nrows: int = 2,
+    ncols: int = 4,
+    signal: str = "dF",
+    mode: str = "ls",
+    channels: str = "glutamate",
+    normalize_rows: str | None = None,
+    t_pre: float = 0.5,
+    t_post: float = 1.0,
+    baseline_subtract: bool = True,
+    baseline_window: tuple[float, float] = (-0.25, 0.0),
+    smooth_sigma: float = 0.0,
+    plot_synapses: bool = False,
+    show_sem: bool = True,
+    color="k",
+    image_colors: dict | None = None,
+    figsize: tuple[float, float] | None = None,
+    xlabel: str = "Time from image onset (s)",
+    ylabel: str = "Average glutamate response",
+    title_prefix: str = "",
+    label_kwargs: dict | None = None,
+    title_kwargs: dict | None = None,
+    x_tick_params: dict | None = None,
+    y_tick_params: dict | None = None,
+):
+    """
+    Plot mean image-aligned glutamate responses for one DMD.
+
+    Modes
+    -----
+    - image_name is not None, as_grid=False:
+        plot a single image
+    - as_grid=True:
+        plot all images in a 2 x 4-style grid
+    """
+    label_kwargs = label_kwargs or {}
+    title_kwargs = title_kwargs or {}
+    x_tick_params = _merge_kwargs(DEFAULT_X_TICK_PARAMS, x_tick_params)
+    y_tick_params = _merge_kwargs(DEFAULT_Y_TICK_PARAMS, y_tick_params)
+
+    out = compute_mean_image_response_by_identity(
+        asset=asset,
+        dmds=[dmd],
+        signal=signal,
+        mode=mode,
+        channels=channels,
+        normalize_rows=normalize_rows,
+        t_pre=t_pre,
+        t_post=t_post,
+        baseline_subtract=baseline_subtract,
+        baseline_window=baseline_window,
+        smooth_sigma=smooth_sigma,
+    )
+
+    unique_images = out["unique_images"]
+    t_rel = out["t_rel_by_dmd"][dmd]
+    syn_traces = out["per_image_synapse_traces"][dmd]
+    mean_traces = out["per_image_mean"][dmd]
+    sem_traces = out["per_image_sem"][dmd]
+
+    if image_colors is None:
+        image_colors = {
+            img: IM_COLORS[i % len(IM_COLORS)]
+            for i, img in enumerate(unique_images)
+        }
+
+    if as_grid:
+        if figsize is None:
+            figsize = (12, 5.5)
+
+        fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+        axes_flat = axes.ravel()
+
+        for i, img in enumerate(unique_images):
+            ax = axes_flat[i]
+            _plot_single_image_response_axis(
+                ax=ax,
+                t_rel=t_rel,
+                syn_mat=syn_traces[img],
+                mean_trace=mean_traces[img],
+                sem_trace=sem_traces[img],
+                color=image_colors.get(img, "k"),
+                plot_synapses=plot_synapses,
+                show_sem=show_sem,
+            )
+
+            ax.set_title(_short_image_label(img, max_len=18), **title_kwargs)
+            ax.set_xlabel(xlabel, **label_kwargs)
+            ax.set_ylabel(ylabel, **label_kwargs)
+            ax.tick_params(**x_tick_params)
+            ax.tick_params(**y_tick_params)
+
+        # hide unused axis (8th panel in 2x4 grid)
+        for j in range(len(unique_images), len(axes_flat)):
+            axes_flat[j].axis("off")
+
+        if title_prefix:
+            fig.suptitle(f"{title_prefix}DMD {dmd}", y=1.02, **title_kwargs)
+
+        return {
+            "fig": fig,
+            "axes": axes,
+            "data": out,
+        }
+
+    else:
+        if image_name is None:
+            raise ValueError("Provide image_name for single-image plotting, or set as_grid=True.")
+
+        if image_name not in mean_traces:
+            raise KeyError(f"{image_name} not found. Available images: {list(mean_traces.keys())}")
+
+        if figsize is None:
+            figsize = (4, 3)
+
+        fig, ax = plt.subplots(figsize=figsize)
+
+        _plot_single_image_response_axis(
+            ax=ax,
+            t_rel=t_rel,
+            syn_mat=syn_traces[image_name],
+            mean_trace=mean_traces[image_name],
+            sem_trace=sem_traces[image_name],
+            color=image_colors.get(image_name, "k"),
+            plot_synapses=plot_synapses,
+            show_sem=show_sem,
+        )
+
+        title = _short_image_label(image_name, max_len=24)
+        if title_prefix:
+            title = f"{title_prefix}{title}"
+
+        ax.set_title(title, **title_kwargs)
+        ax.set_xlabel(xlabel, **label_kwargs)
+        ax.set_ylabel(ylabel, **label_kwargs)
+        ax.tick_params(**x_tick_params)
+        ax.tick_params(**y_tick_params)
+
+        return {
+            "fig": fig,
+            "ax": ax,
+            "data": out,
+        }
