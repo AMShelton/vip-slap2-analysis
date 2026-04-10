@@ -43,9 +43,9 @@ class MovieRenderConfig:
     show_scale_bar: bool = True
     pixel_size_um: float = 0.25
     scale_bar_um: float = 20.0
-    overlay_margin_px: int = 12
-    overlay_fontsize: int = 16
-    overlay_linewidth: int = 4
+    overlay_margin_px: int = 50
+    overlay_fontsize: int = 120
+    overlay_linewidth: int = 20
     overlay_text_color: Tuple[int, int, int] = (255, 255, 255)
     overlay_bar_color: Tuple[int, int, int] = (255, 255, 255)
 
@@ -62,7 +62,15 @@ class MovieRenderConfig:
 def _vprint(verbose: bool, msg: str) -> None:
     if verbose:
         print(msg)
+        
+def _resolve_overlay_fontsize(config: MovieRenderConfig, frame_h: int) -> int:
+    return max(config.overlay_fontsize, int(round(0.045 * frame_h)))
 
+def _resolve_overlay_linewidth(config: MovieRenderConfig, frame_h: int, frame_w: int) -> int:
+    return max(config.overlay_linewidth, int(round(0.006 * min(frame_h, frame_w))))
+
+def _resolve_overlay_margin(config: MovieRenderConfig, frame_h: int, frame_w: int) -> int:
+    return max(config.overlay_margin_px, int(round(0.03 * min(frame_h, frame_w))))
 
 def _progress(verbose: bool, step: int, total: int, msg: str) -> None:
     if not verbose:
@@ -726,14 +734,32 @@ def preview_oriented_mean_image(
     plt.show()
 
 
-def _get_default_font(fontsize: int) -> ImageFont.ImageFont:
-    try:
-        return ImageFont.truetype("arial.ttf", fontsize)
-    except Exception:
+def _get_default_font(fontsize: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    # Try common scalable fonts first
+    candidates = [
+        "Arial.ttf",
+        "arial.ttf",
+        "DejaVuSans.ttf",
+        "LiberationSans-Regular.ttf",
+    ]
+
+    for name in candidates:
         try:
-            return ImageFont.truetype("DejaVuSans.ttf", fontsize)
+            return ImageFont.truetype(name, fontsize)
         except Exception:
-            return ImageFont.load_default()
+            pass
+
+    # Try matplotlib's bundled DejaVu Sans if available
+    try:
+        from matplotlib import font_manager
+        font_path = font_manager.findfont("DejaVu Sans", fallback_to_default=True)
+        if font_path:
+            return ImageFont.truetype(font_path, fontsize)
+    except Exception:
+        pass
+
+    # Last resort
+    return ImageFont.load_default()
 
 
 def _draw_timer(
@@ -807,19 +833,23 @@ def _apply_overlays_to_frames(
 
     out = frames.copy()
     n_frames = out.shape[0]
+    
+    effective_pixel_size_um = config.pixel_size_um / max(config.upsample_factor, 1.0)
 
     for i in range(n_frames):
         img = Image.fromarray(out[i])
         draw = ImageDraw.Draw(img)
         width_px, height_px = img.size
-
+        fontsize = _resolve_overlay_fontsize(config, height_px)
+        linewidth = _resolve_overlay_linewidth(config, height_px, width_px)
+        margin_px = _resolve_overlay_margin(config, height_px, width_px)
         if config.show_timer:
             _draw_timer(
                 draw,
                 frame_idx=i,
                 native_frame_rate_hz=native_frame_rate_hz,
-                margin_px=config.overlay_margin_px,
-                fontsize=config.overlay_fontsize,
+                margin_px=margin_px,
+                fontsize=fontsize,
                 text_color=config.overlay_text_color,
             )
 
@@ -827,11 +857,11 @@ def _apply_overlays_to_frames(
             _draw_scale_bar(
                 draw,
                 image_size_xy=(width_px, height_px),
-                pixel_size_um=config.pixel_size_um,
+                pixel_size_um=effective_pixel_size_um,
                 scale_bar_um=config.scale_bar_um,
-                margin_px=config.overlay_margin_px,
-                linewidth=config.overlay_linewidth,
-                fontsize=config.overlay_fontsize,
+                margin_px=margin_px,
+                linewidth=linewidth,
+                fontsize=fontsize,
                 bar_color=config.overlay_bar_color,
                 text_color=config.overlay_text_color,
             )
