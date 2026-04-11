@@ -50,6 +50,10 @@ class GlutamateAnalysisConfig:
     sequence_label_slope_frac: float = 0.35
     sequence_label_min_abs_slope: float = 25.0
     tuning_min_effect_fve: float = 0.05
+    tuning_fve_mode: str = "trace"  # {"trace", "time_avg", "delta_auc"}
+    tuning_fve_amplitude_func: str = "mean"  # {"mean", "max", "sum", "top10"} for time-averaged FVE
+    tuning_fve_sample_slice: tuple[int, int] = (50, 100)
+    tuning_response_classes: tuple[str, ...] = ("activated",)
     tuning_method: str = "hybrid"  # {"fve", "manova", "hybrid"}
     manova_stat: str = "Wilks' lambda"
     manova_max_timepoints: int = 20
@@ -127,6 +131,69 @@ def _load_npz_dict(path: str | Path) -> dict[str, Any]:
     if "data" not in arr.files:
         raise KeyError(f"Expected top-level key 'data' in {path}, found {arr.files}")
     return arr["data"].item()
+
+
+def _load_activation_summary_source(
+    activation_summary: pd.DataFrame | str | Path | None,
+) -> pd.DataFrame | None:
+    if activation_summary is None:
+        return None
+    if isinstance(activation_summary, pd.DataFrame):
+        df = activation_summary.copy()
+    else:
+        apath = Path(activation_summary)
+        suffix = apath.suffix.lower()
+        if suffix == ".csv":
+            df = pd.read_csv(apath)
+        elif suffix in {".parquet", ".pq"}:
+            df = pd.read_parquet(apath)
+        else:
+            raise ValueError(
+                "activation_summary must be a DataFrame or a path to a .csv/.parquet file."
+            )
+    if "Unnamed: 0" in df.columns:
+        df = df.drop(columns=["Unnamed: 0"])
+    return df
+
+
+def _get_session_id_from_single_trial_npz(single_trial_npz: str | Path) -> str:
+    root = _load_npz_dict(single_trial_npz)
+    metadata = root.get("metadata", {})
+    session_id = metadata.get("session_id")
+    if session_id is None or str(session_id) == "":
+        raise KeyError(f"Could not find metadata['session_id'] in {single_trial_npz}.")
+    return str(session_id)
+
+
+def _subset_activation_summary_for_session(
+    activation_summary_df: pd.DataFrame,
+    *,
+    session_id: str,
+) -> pd.DataFrame:
+    if activation_summary_df is None:
+        raise ValueError("activation_summary_df must not be None.")
+    if "session_id" not in activation_summary_df.columns:
+        raise KeyError("activation_summary_df must contain a 'session_id' column.")
+    df = activation_summary_df.copy()
+    if "synapse_id" in df.columns:
+        df["synapse_id"] = df["synapse_id"].astype(str)
+    if "dmd" in df.columns:
+        df["dmd"] = df["dmd"].astype(str)
+    subset = df.loc[df["session_id"].astype(str).eq(str(session_id))].copy()
+    return subset
+
+
+def load_session_activation_summary(
+    single_trial_npz: str | Path,
+    activation_summary: pd.DataFrame | str | Path,
+) -> pd.DataFrame:
+    activation_summary_df = _load_activation_summary_source(activation_summary)
+    session_id = _get_session_id_from_single_trial_npz(single_trial_npz)
+    subset = _subset_activation_summary_for_session(
+        activation_summary_df,
+        session_id=session_id,
+    )
+    return subset
 
 
 def resolve_glutamate_analysis_paths(
@@ -349,6 +416,182 @@ def classify_activation(
     return event_df, summary_df
 
 
+
+def _normalize_response_classes(response_classes: Sequence[str] | None) -> tuple[str, ...]:
+    if response_classes is None:
+        return ("activated",)
+    norm_map = {
+        "activated": "activated",
+        "actrivated": "activated",
+        "deactivated": "deactivated",
+        "deactrivated": "deactivated",
+        "no_change": "no_change",
+        "no-change": "no_change",
+        "no change": "no_change",
+    }
+    out: list[str] = []
+    for cls in response_classes:
+        key = str(cls).strip().lower()
+        out.append(norm_map.get(key, key))
+    if not out:
+        return ("activated",)
+    return tuple(dict.fromkeys(out))
+
+
+def _collapse_trials_to_amplitude(arr: np.ndarray, amplitude_func: str = "mean") -> np.ndarray:
+    arr = np.asarray(arr, dtype=float)
+    if arr.ndim != 2:
+        raise ValueError("_collapse_trials_to_amplitude expects a 2D array.")
+    amplitude_func = str(amplitude_func).lower()
+    if amplitude_func == "mean":
+        return np.nanmean(arr, axis=1)
+    if amplitude_func == "max":
+        return np.nanmax(arr, axis=1)
+    if amplitude_func == "sum":
+        return np.nansum(arr, axis=1)
+    if amplitude_func == "top10":
+        k = min(10, arr.shape[1])
+        part = np.partition(arr, -k, axis=1)[:, -k:]
+        return np.nanmean(part, axis=1)
+    raise ValueError(f"Unknown amplitude_func: {amplitude_func!r}")
+
+
+def _compute_trace_variance_decomposition(
+    traces: np.ndarray,
+    labels: np.ndarray,
+    *,
+    mode: str = "trace",
+    amplitude_func: str = "mean",
+) -> dict[str, Any]:
+    traces = np.asarray(traces, dtype=float)
+    labels = np.asarray(labels)
+    mode = str(mode).lower()
+
+    out = {
+        "total_var": np.nan,
+        "mean_residual_var": np.nan,
+        "mean_fve": np.nan,
+        "image_residual_var": np.nan,
+        "image_fve_total": np.nan,
+        "image_fve_by_label": {},
+        "n_trials_total": 0,
+        "n_images_present": 0,
+    }
+
+    if traces.ndim != 2 or traces.shape[0] != labels.shape[0] or traces.shape[0] == 0:
+        return out
+
+    keep = np.array([str(lab) not in {"", "nan", "None"} for lab in labels], dtype=bool)
+    if mode in {"trace", "time_avg"}:
+        keep &= np.any(np.isfinite(traces), axis=1)
+    traces = traces[keep]
+    labels = labels[keep]
+    if traces.shape[0] < 2:
+        return out
+
+    out["n_trials_total"] = int(traces.shape[0])
+    out["n_images_present"] = int(np.unique(labels).size)
+
+    if mode == "trace":
+        mean_trace = np.nanmean(traces, axis=0)
+        total_var = float(np.nanvar(traces))
+        if not np.isfinite(total_var) or total_var <= EPS:
+            out.update({"total_var": total_var, "mean_residual_var": total_var, "mean_fve": 0.0, "image_residual_var": total_var, "image_fve_total": 0.0})
+            return out
+
+        mean_residual = traces - mean_trace[None, :]
+        mean_residual_var = float(np.nanvar(mean_residual))
+        image_residual = np.full_like(traces, np.nan, dtype=float)
+        image_fve_by_label: dict[str, float] = {}
+
+        for lab in np.unique(labels):
+            mask = labels == lab
+            mu_lab = np.nanmean(traces[mask], axis=0)
+            resid_lab = traces[mask] - mu_lab[None, :]
+            image_residual[mask] = resid_lab
+            image_fve_by_label[str(lab)] = float(1.0 - np.nanvar(resid_lab) / total_var)
+
+        image_residual_var = float(np.nanvar(image_residual))
+        out.update(
+            {
+                "total_var": total_var,
+                "mean_residual_var": mean_residual_var,
+                "mean_fve": float(1.0 - mean_residual_var / total_var),
+                "image_residual_var": image_residual_var,
+                "image_fve_total": float(1.0 - image_residual_var / total_var),
+                "image_fve_by_label": image_fve_by_label,
+            }
+        )
+        return out
+
+    values = _collapse_trials_to_amplitude(traces, amplitude_func=amplitude_func) if mode == "time_avg" else traces[:, 0]
+    finite = np.isfinite(values)
+    values = values[finite]
+    labels = labels[finite]
+    if values.size < 2:
+        return out
+
+    total_var = float(np.var(values))
+    if not np.isfinite(total_var) or total_var <= EPS:
+        out.update({"total_var": total_var, "mean_residual_var": total_var, "mean_fve": 0.0, "image_residual_var": total_var, "image_fve_total": 0.0})
+        return out
+
+    grand_mean = float(np.mean(values))
+    mean_residual = values - grand_mean
+    mean_residual_var = float(np.var(mean_residual))
+    image_residual = np.empty_like(values)
+    image_fve_by_label: dict[str, float] = {}
+
+    for lab in np.unique(labels):
+        mask = labels == lab
+        mu_lab = float(np.mean(values[mask]))
+        resid_lab = values[mask] - mu_lab
+        image_residual[mask] = resid_lab
+        image_fve_by_label[str(lab)] = float(1.0 - np.var(resid_lab) / total_var)
+
+    image_residual_var = float(np.var(image_residual))
+    out.update(
+        {
+            "total_var": total_var,
+            "mean_residual_var": mean_residual_var,
+            "mean_fve": float(1.0 - mean_residual_var / total_var),
+            "image_residual_var": image_residual_var,
+            "image_fve_total": float(1.0 - image_residual_var / total_var),
+            "image_fve_by_label": image_fve_by_label,
+        }
+    )
+    return out
+
+
+def _slice_traces_for_tuning(
+    traces: np.ndarray,
+    *,
+    sample_slice: tuple[int, int] | None,
+) -> np.ndarray:
+    traces = np.asarray(traces, dtype=float)
+    if traces.ndim != 2:
+        raise ValueError("_slice_traces_for_tuning expects a 2D array.")
+    if sample_slice is None:
+        return traces
+    start, stop = sample_slice
+    return traces[:, int(start):int(stop)]
+
+
+def _compute_tuning_fve(
+    traces: np.ndarray,
+    labels: np.ndarray,
+    *,
+    mode: str,
+    amplitude_func: str,
+) -> dict[str, Any]:
+    return _compute_trace_variance_decomposition(
+        traces=traces,
+        labels=labels,
+        mode=mode,
+        amplitude_func=amplitude_func,
+    )
+
+
 def _compute_fve(values: np.ndarray, labels: np.ndarray) -> float:
     values = np.asarray(values, dtype=float)
     labels = np.asarray(labels)
@@ -521,6 +764,7 @@ def _extract_image_trial_traces(
     return pd.DataFrame(rows)
 
 
+
 def analyze_image_tuning(
     single_trial_npz: str | Path,
     activation_summary_df: pd.DataFrame,
@@ -530,42 +774,92 @@ def analyze_image_tuning(
     rng = np.random.default_rng(config.random_seed)
     event_df = build_event_response_table(single_trial_npz=single_trial_npz, config=config)
     img_df = event_df[event_df["stimulus_family"].eq("image")].copy()
+    if "synapse_id" in img_df.columns:
+        img_df["synapse_id"] = img_df["synapse_id"].astype(str)
 
+    activation_summary_df = activation_summary_df.copy()
+    if "synapse_id" in activation_summary_df.columns:
+        activation_summary_df["synapse_id"] = activation_summary_df["synapse_id"].astype(str)
+    if "dmd" in activation_summary_df.columns:
+        activation_summary_df["dmd"] = activation_summary_df["dmd"].astype(str)
+
+    allowed_response_classes = _normalize_response_classes(config.tuning_response_classes)
     active = activation_summary_df[
         activation_summary_df["stimulus_family"].eq("image")
-        & activation_summary_df["response_class"].eq("activated")
-    ][["session_id", "dmd", "synapse_id"]].drop_duplicates()
+        & activation_summary_df["response_class"].isin(allowed_response_classes)
+    ][["session_id", "dmd", "synapse_id", "response_class"]].drop_duplicates()
 
-    img_df = img_df.merge(active.assign(is_image_activated=True), on=["session_id", "dmd", "synapse_id"], how="inner")
+    img_df = img_df.merge(active, on=["session_id", "dmd", "synapse_id"], how="inner")
 
     trace_df = _extract_image_trial_traces(
         single_trial_npz,
-        post_only=config.manova_use_post_only,
+        post_only=False,
     )
     if not trace_df.empty:
-        trace_df = trace_df.merge(active.assign(is_image_activated=True), on=["session_id", "dmd", "synapse_id"], how="inner")
+        trace_df = trace_df.merge(active, on=["session_id", "dmd", "synapse_id"], how="inner")
 
-    per_image = (
-        img_df.groupby(["session_id", "subject_id", "dmd", "synapse_id", "stimulus_name", "stimulus_label"], as_index=False)
-        .agg(
-            n_trials=("delta_auc", lambda x: int(np.isfinite(x).sum())),
-            mean_response=("delta_auc", "mean"),
-            median_response=("delta_auc", "median"),
-            std_response=("delta_auc", "std"),
-        )
-    )
+    scalar_slice = tuple(config.tuning_fve_sample_slice) if config.tuning_fve_sample_slice is not None else None
 
+    per_image_rows: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
-    for (session_id, subject_id, dmd, synapse_id), grp in img_df.groupby(
-        ["session_id", "subject_id", "dmd", "synapse_id"], sort=False
-    ):
+
+    grouped_keys = ["session_id", "subject_id", "dmd", "synapse_id", "response_class"]
+    for (session_id, subject_id, dmd, synapse_id, response_class), grp in img_df.groupby(grouped_keys, sort=False):
         counts = grp.groupby("stimulus_name")["delta_auc"].apply(lambda x: int(np.isfinite(x).sum()))
         valid_images = counts[counts >= config.min_events_tuning_per_image].index.to_numpy()
+
         gvalid = grp[grp["stimulus_name"].isin(valid_images)].copy()
-        values = gvalid["delta_auc"].to_numpy(dtype=float)
-        labels = gvalid["stimulus_label"].to_numpy()
+        values_auc = gvalid["delta_auc"].to_numpy(dtype=float)
+        labels_auc = gvalid["stimulus_label"].to_numpy()
+
+        syn_trace_df = trace_df[
+            (trace_df["session_id"] == session_id)
+            & (trace_df["dmd"] == dmd)
+            & (trace_df["synapse_id"] == synapse_id)
+            & (trace_df["stimulus_name"].isin(valid_images))
+        ].copy()
+
+        per_image_stats = {}
+        if not syn_trace_df.empty:
+            for stim_label, ilab in syn_trace_df.groupby("stimulus_label", sort=False):
+                traces = np.stack(ilab["trace"].to_list(), axis=0)
+                traces_use = _slice_traces_for_tuning(traces, sample_slice=scalar_slice)
+                scalar_vals = _collapse_trials_to_amplitude(traces_use, amplitude_func=config.tuning_fve_amplitude_func)
+                per_image_stats[str(stim_label)] = {
+                    "n_trials": int(np.isfinite(scalar_vals).sum()),
+                    "mean_response": float(np.nanmean(scalar_vals)),
+                    "median_response": float(np.nanmedian(scalar_vals)),
+                    "std_response": float(np.nanstd(scalar_vals, ddof=1)) if np.isfinite(scalar_vals).sum() > 1 else np.nan,
+                }
+
+        for (stimulus_name, stimulus_label), sub in gvalid.groupby(["stimulus_name", "stimulus_label"], sort=False):
+            stats_row = per_image_stats.get(
+                str(stimulus_label),
+                {
+                    "n_trials": int(np.isfinite(sub["delta_auc"]).sum()),
+                    "mean_response": float(np.nanmean(sub["delta_auc"])),
+                    "median_response": float(np.nanmedian(sub["delta_auc"])),
+                    "std_response": float(np.nanstd(sub["delta_auc"], ddof=1)) if np.isfinite(sub["delta_auc"]).sum() > 1 else np.nan,
+                },
+            )
+            per_image_rows.append(
+                {
+                    "session_id": session_id,
+                    "subject_id": subject_id,
+                    "dmd": dmd,
+                    "synapse_id": str(synapse_id),
+                    "response_class": response_class,
+                    "stimulus_name": str(stimulus_name),
+                    "stimulus_label": str(stimulus_label),
+                    **stats_row,
+                }
+            )
 
         fve = np.nan
+        total_var = np.nan
+        mean_residual_var = np.nan
+        mean_fve = np.nan
+        image_residual_var = np.nan
         p_shuffle = np.nan
         p_kw = np.nan
         p_manova = np.nan
@@ -585,60 +879,91 @@ def analyze_image_tuning(
         pref_vs_rest = np.nan
         pref_vs_next = np.nan
 
-        if len(valid_images) >= config.min_images_for_tuning and np.isfinite(values).sum() > 1:
-            fve = _compute_fve(values, labels)
+        if len(valid_images) >= config.min_images_for_tuning and np.isfinite(values_auc).sum() > 1:
             groups = [
                 gvalid.loc[gvalid["stimulus_label"].eq(lbl), "delta_auc"].to_numpy(dtype=float)
-                for lbl in np.unique(labels)
+                for lbl in np.unique(labels_auc)
             ]
             p_kw = _safe_kruskal(groups)
-            if np.isfinite(fve):
-                null = np.empty(config.n_shuffles_tuning, dtype=float)
-                for i in range(config.n_shuffles_tuning):
-                    null[i] = _compute_fve(values, rng.permutation(labels))
-                p_shuffle = float((1.0 + np.sum(null >= fve)) / (config.n_shuffles_tuning + 1.0))
 
-            stats_by_image = (
-                gvalid.groupby("stimulus_label")["delta_auc"]
-                .agg([("mean_response", "mean"), ("median_response", "median")])
-                .sort_values("mean_response", ascending=False)
-            )
-            if not stats_by_image.empty:
-                preferred_image = str(stats_by_image.index[0])
-                preferred_mean = float(stats_by_image.iloc[0]["mean_response"])
-                preferred_median = float(stats_by_image.iloc[0]["median_response"])
-                rest_vals = gvalid.loc[gvalid["stimulus_label"].ne(preferred_image), "delta_auc"].to_numpy(dtype=float)
-                pref_vals = gvalid.loc[gvalid["stimulus_label"].eq(preferred_image), "delta_auc"].to_numpy(dtype=float)
-                pref_vs_rest = float(np.nanmedian(pref_vals) - np.nanmedian(rest_vals)) if rest_vals.size else np.nan
-                if len(stats_by_image) > 1:
-                    pref_vs_next = float(stats_by_image.iloc[0]["mean_response"] - stats_by_image.iloc[1]["mean_response"])
+            if not syn_trace_df.empty:
+                trace_labels = syn_trace_df["stimulus_label"].to_numpy()
+                traces = np.stack(syn_trace_df["trace"].to_list(), axis=0)
+                traces_for_fve = _slice_traces_for_tuning(traces, sample_slice=scalar_slice)
+                fve_metrics = _compute_tuning_fve(
+                    traces=traces_for_fve,
+                    labels=trace_labels,
+                    mode=config.tuning_fve_mode,
+                    amplitude_func=config.tuning_fve_amplitude_func,
+                )
+                fve = fve_metrics["image_fve_total"]
+                total_var = fve_metrics["total_var"]
+                mean_residual_var = fve_metrics["mean_residual_var"]
+                mean_fve = fve_metrics["mean_fve"]
+                image_residual_var = fve_metrics["image_residual_var"]
 
-            if not trace_df.empty:
-                tgrp = trace_df[
-                    (trace_df["session_id"] == session_id)
-                    & (trace_df["dmd"] == dmd)
-                    & (trace_df["synapse_id"] == synapse_id)
-                    & (trace_df["stimulus_name"].isin(valid_images))
-                ].copy()
-                if not tgrp.empty:
-                    traces = np.stack(tgrp["trace"].to_list(), axis=0)
-                    manova = _run_manova_trace_test(
-                        traces=traces,
-                        labels=tgrp["stimulus_label"].to_numpy(),
-                        stat_name=config.manova_stat,
-                        max_timepoints=config.manova_max_timepoints,
-                        interpolate_nans=config.manova_interpolate_nans,
-                        max_nan_fraction_per_trial=config.manova_max_nan_fraction_per_trial,
-                    )
-                    p_manova = manova["p_manova"]
-                    f_manova = manova["f_manova"]
-                    stat_value_manova = manova["stat_value_manova"]
-                    num_df_manova = manova["num_df_manova"]
-                    den_df_manova = manova["den_df_manova"]
-                    n_trials_manova = manova["n_trials_manova"]
-                    n_groups_manova = manova["n_groups_manova"]
-                    n_timepoints_used_manova = manova["n_timepoints_used_manova"]
-                    manova_stat_used = manova["manova_stat_used"]
+                if np.isfinite(fve):
+                    null = np.empty(config.n_shuffles_tuning, dtype=float)
+                    for i in range(config.n_shuffles_tuning):
+                        null_metrics = _compute_tuning_fve(
+                            traces=traces_for_fve,
+                            labels=rng.permutation(trace_labels),
+                            mode=config.tuning_fve_mode,
+                            amplitude_func=config.tuning_fve_amplitude_func,
+                        )
+                        null[i] = null_metrics["image_fve_total"]
+                    p_shuffle = float((1.0 + np.sum(null >= fve)) / (config.n_shuffles_tuning + 1.0))
+
+                scalar_vals = _collapse_trials_to_amplitude(traces_for_fve, amplitude_func=config.tuning_fve_amplitude_func)
+                scalar_df = syn_trace_df[["stimulus_label"]].copy()
+                scalar_df["scalar_response"] = scalar_vals
+                stats_by_image = (
+                    scalar_df.groupby("stimulus_label")["scalar_response"]
+                    .agg([("mean_response", "mean"), ("median_response", "median")])
+                    .sort_values("mean_response", ascending=False)
+                )
+                if not stats_by_image.empty:
+                    preferred_image = str(stats_by_image.index[0])
+                    preferred_mean = float(stats_by_image.iloc[0]["mean_response"])
+                    preferred_median = float(stats_by_image.iloc[0]["median_response"])
+                    rest_vals = scalar_df.loc[scalar_df["stimulus_label"].ne(preferred_image), "scalar_response"].to_numpy(dtype=float)
+                    pref_vals = scalar_df.loc[scalar_df["stimulus_label"].eq(preferred_image), "scalar_response"].to_numpy(dtype=float)
+                    pref_vs_rest = float(np.nanmedian(pref_vals) - np.nanmedian(rest_vals)) if rest_vals.size else np.nan
+                    if len(stats_by_image) > 1:
+                        pref_vs_next = float(stats_by_image.iloc[0]["mean_response"] - stats_by_image.iloc[1]["mean_response"])
+
+                manova_traces = traces
+                if config.manova_use_post_only:
+                    manova_traces = _slice_traces_for_tuning(traces, sample_slice=tuple(config.image_post_samples))
+                manova = _run_manova_trace_test(
+                    traces=manova_traces,
+                    labels=trace_labels,
+                    stat_name=config.manova_stat,
+                    max_timepoints=config.manova_max_timepoints,
+                    interpolate_nans=config.manova_interpolate_nans,
+                    max_nan_fraction_per_trial=config.manova_max_nan_fraction_per_trial,
+                )
+                p_manova = manova["p_manova"]
+                f_manova = manova["f_manova"]
+                stat_value_manova = manova["stat_value_manova"]
+                num_df_manova = manova["num_df_manova"]
+                den_df_manova = manova["den_df_manova"]
+                n_trials_manova = manova["n_trials_manova"]
+                n_groups_manova = manova["n_groups_manova"]
+                n_timepoints_used_manova = manova["n_timepoints_used_manova"]
+                manova_stat_used = manova["manova_stat_used"]
+
+            elif np.isfinite(values_auc).sum() > 1:
+                fve = _compute_fve(values_auc, labels_auc)
+                total_var = float(np.nanvar(values_auc))
+                mean_residual_var = total_var
+                mean_fve = 0.0
+                image_residual_var = total_var * (1.0 - fve) if np.isfinite(fve) and np.isfinite(total_var) else np.nan
+                if np.isfinite(fve):
+                    null = np.empty(config.n_shuffles_tuning, dtype=float)
+                    for i in range(config.n_shuffles_tuning):
+                        null[i] = _compute_fve(values_auc, rng.permutation(labels_auc))
+                    p_shuffle = float((1.0 + np.sum(null >= fve)) / (config.n_shuffles_tuning + 1.0))
 
             method = str(config.tuning_method).lower()
             if method == "fve":
@@ -668,9 +993,18 @@ def analyze_image_tuning(
                 "subject_id": subject_id,
                 "dmd": dmd,
                 "synapse_id": str(synapse_id),
-                "n_image_trials": int(np.isfinite(values).sum()),
+                "response_class": response_class,
+                "n_image_trials": int(np.isfinite(values_auc).sum()),
                 "n_images_tested": int(len(valid_images)),
                 "fve_image": fve,
+                "total_var": total_var,
+                "mean_residual_var": mean_residual_var,
+                "mean_fve": mean_fve,
+                "image_residual_var": image_residual_var,
+                "fve_mode": str(config.tuning_fve_mode).lower(),
+                "fve_amplitude_func": str(config.tuning_fve_amplitude_func).lower(),
+                "fve_sample_start": int(scalar_slice[0]) if scalar_slice is not None else np.nan,
+                "fve_sample_stop": int(scalar_slice[1]) if scalar_slice is not None else np.nan,
                 "p_shuffle_fve": p_shuffle,
                 "p_kw": p_kw,
                 "p_manova": p_manova,
@@ -692,6 +1026,7 @@ def analyze_image_tuning(
             }
         )
 
+    per_image = pd.DataFrame(per_image_rows)
     tuning_df = pd.DataFrame(rows)
     if not tuning_df.empty:
         tuning_df["q_shuffle_fve"] = _bh_fdr(tuning_df["p_shuffle_fve"])
@@ -1331,15 +1666,89 @@ def save_analysis_tables(
     return written
 
 
+
+
+def run_glutamate_tuning_analysis(
+    session_dir_or_analysis_dir: str | Path,
+    activation_summary: pd.DataFrame | str | Path,
+    output_dir: str | Path | None = None,
+    config: GlutamateAnalysisConfig | None = None,
+    save_tables: bool = True,
+) -> dict[str, pd.DataFrame]:
+    """Run only image-tuning analysis using an externally supplied activation summary.
+
+    This mirrors the notebook workflow where activation labels are loaded from a
+    concatenated activation summary produced in an earlier batch run, then filtered
+    down to the current session before computing tuning/FVE metrics.
+    """
+    config = config or GlutamateAnalysisConfig()
+    paths = resolve_glutamate_analysis_paths(session_dir_or_analysis_dir, output_dir=output_dir)
+
+    activation_summary_df = load_session_activation_summary(
+        paths.single_trial_npz,
+        activation_summary=activation_summary,
+    )
+    tuning_per_image_df, tuning_summary_df = analyze_image_tuning(
+        paths.single_trial_npz,
+        activation_summary_df=activation_summary_df,
+        config=config,
+    )
+
+    metadata = {
+        "analysis_name": "glutamate_tuning_analysis",
+        "config": asdict(config),
+        "inputs": {
+            "single_trial_npz": str(paths.single_trial_npz),
+            "activation_summary_source": (
+                str(activation_summary) if not isinstance(activation_summary, pd.DataFrame) else "DataFrame"
+            ),
+            "activation_summary_session_id": _get_session_id_from_single_trial_npz(paths.single_trial_npz),
+        },
+        "outputs": {
+            "output_dir": str(paths.output_dir),
+        },
+    }
+
+    if save_tables:
+        save_analysis_tables(
+            {
+                "tuning_per_image_table": tuning_per_image_df,
+                "tuning_summary_table": tuning_summary_df,
+                "activation_summary_table": activation_summary_df,
+            },
+            output_dir=paths.output_dir,
+            metadata=metadata,
+        )
+
+    return {
+        "activation_summary_table": activation_summary_df,
+        "tuning_per_image_table": tuning_per_image_df,
+        "tuning_summary_table": tuning_summary_df,
+        "metadata": pd.DataFrame([metadata]),
+    }
+
+
 def run_glutamate_analysis(
     session_dir_or_analysis_dir: str | Path,
     output_dir: str | Path | None = None,
     config: GlutamateAnalysisConfig | None = None,
+    activation_summary: pd.DataFrame | str | Path | None = None,
+    recompute_activation: bool = True,
 ) -> dict[str, pd.DataFrame]:
     config = config or GlutamateAnalysisConfig()
     paths = resolve_glutamate_analysis_paths(session_dir_or_analysis_dir, output_dir=output_dir)
 
-    activation_event_df, activation_summary_df = classify_activation(paths.single_trial_npz, config=config)
+    if activation_summary is not None:
+        activation_summary_df = load_session_activation_summary(
+            paths.single_trial_npz,
+            activation_summary=activation_summary,
+        )
+        if recompute_activation:
+            activation_event_df, _ = classify_activation(paths.single_trial_npz, config=config)
+        else:
+            activation_event_df = pd.DataFrame()
+    else:
+        activation_event_df, activation_summary_df = classify_activation(paths.single_trial_npz, config=config)
     tuning_per_image_df, tuning_summary_df = analyze_image_tuning(
         paths.single_trial_npz,
         activation_summary_df=activation_summary_df,
@@ -1360,6 +1769,11 @@ def run_glutamate_analysis(
             "single_trial_npz": str(paths.single_trial_npz),
             "mean_npz": str(paths.mean_npz),
             "sequence_npz": str(paths.sequence_npz),
+            "activation_summary_source": (
+                str(activation_summary)
+                if (activation_summary is not None and not isinstance(activation_summary, pd.DataFrame))
+                else ("DataFrame" if activation_summary is not None else "computed_per_session")
+            ),
         },
         "outputs": {
             "output_dir": str(paths.output_dir),
@@ -1401,5 +1815,7 @@ __all__ = [
     "analyze_image_tuning",
     "analyze_sequence_dynamics",
     "save_analysis_tables",
+    "load_session_activation_summary",
+    "run_glutamate_tuning_analysis",
     "run_glutamate_analysis",
 ]
