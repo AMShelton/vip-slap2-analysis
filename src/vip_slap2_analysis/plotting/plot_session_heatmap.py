@@ -1171,7 +1171,7 @@ def compute_mean_image_response_by_identity(
     smooth_sigma: float = 0.0,
 ):
     """
-    Compute mean stimulus-aligned response matrices for each image identity.
+    Compute mean stimulus-aligned synapse x time response matrices for each image identity.
 
     Returns
     -------
@@ -1244,12 +1244,21 @@ def compute_mean_image_response_by_identity(
                 syn_mat = np.full((mat.shape[0], len(t_rel)), np.nan)
             else:
                 syn_mat = np.nanmean(stack, axis=0)
+                syn_mat = np.asarray(syn_mat, dtype=float)
+
+                # Remove singleton channel axis if present
+                syn_mat = np.squeeze(syn_mat)
+
+                # Force final shape to be (n_synapses, n_time)
+                if syn_mat.ndim == 1:
+                    syn_mat = syn_mat[None, :]
+                elif syn_mat.ndim != 2:
+                    raise ValueError(f"Expected 2D synapse x time matrix after averaging, got shape {syn_mat.shape}")
 
             if smooth_sigma is not None and smooth_sigma > 0:
                 syn_mat = _smooth_rows(syn_mat, smooth_sigma)
 
             mean_trace = np.nanmean(syn_mat, axis=0)
-
             n_eff = np.sum(np.isfinite(syn_mat), axis=0)
             sem_trace = np.nanstd(syn_mat, axis=0) / np.sqrt(np.maximum(n_eff, 1))
 
@@ -1268,59 +1277,72 @@ def compute_mean_image_response_by_identity(
     }
 
 
-def _plot_single_image_response_axis(
+def _compute_image_heatmap_sort_order(
+    image_mats: dict,
+    sort_by: str | None = "stimulus_locked_per_image",
+):
+    """
+    Compute a single synapse order across all image identity heatmaps for one DMD.
+
+    Parameters
+    ----------
+    image_mats : dict[str, np.ndarray]
+        image_name -> (n_synapses, n_time)
+    sort_by :
+        - "stimulus_locked_per_image"
+        - "pc1_per_image"
+        - None
+    """
+    imgs = list(image_mats.keys())
+    if len(imgs) == 0:
+        return None
+
+    feature_mat = np.concatenate([image_mats[img] for img in imgs], axis=1)
+
+    if sort_by == "stimulus_locked_per_image":
+        order, _ = _sort_rows_by_feature_matrix(feature_mat)
+    elif sort_by == "pc1_per_image":
+        order, _ = _sort_rows_by_pc1(feature_mat)
+    elif sort_by is None:
+        order = np.arange(feature_mat.shape[0])
+    else:
+        raise ValueError("sort_by must be 'stimulus_locked_per_image', 'pc1_per_image', or None")
+
+    return np.asarray(order)
+
+
+def _plot_single_image_heatmap_axis(
     ax,
     t_rel,
     syn_mat,
-    mean_trace,
-    sem_trace=None,
-    color="k",
-    plot_synapses=False,
-    synapse_color="0.7",
-    synapse_alpha=0.2,
-    lw_syn=0.7,
-    lw_mean=2.0,
-    show_sem=True,
-    sem_alpha=0.25,
-    onset_line=True,
+    cmap="coolwarm",
+    vmin=None,
+    vmax=None,
+    show_onset_line=True,
     onset_line_kwargs=None,
 ):
     """
-    Plot one image-aligned response axis.
+    Plot one synapse x time heatmap.
     """
     onset_line_kwargs = onset_line_kwargs or {"color": "k", "lw": 0.8, "alpha": 0.8}
 
-    if plot_synapses:
-        for i in range(syn_mat.shape[0]):
-            y = syn_mat[i]
-            if np.all(~np.isfinite(y)):
-                continue
-            ax.plot(
-                t_rel,
-                y,
-                color=synapse_color,
-                alpha=synapse_alpha,
-                lw=lw_syn,
-                zorder=1,
-            )
+    im = ax.imshow(
+        np.nan_to_num(syn_mat, nan=0.0),
+        aspect="auto",
+        interpolation="nearest",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        extent=[t_rel[0], t_rel[-1], syn_mat.shape[0], 0],
+    )
 
-    ax.plot(t_rel, mean_trace, color=color, lw=lw_mean, zorder=3)
-
-    if show_sem and sem_trace is not None:
-        ax.fill_between(
-            t_rel,
-            mean_trace - sem_trace,
-            mean_trace + sem_trace,
-            color=color,
-            alpha=sem_alpha,
-            zorder=2,
-        )
-
-    if onset_line:
+    if show_onset_line:
         ax.axvline(0, **onset_line_kwargs)
 
+    return im
 
-def plot_mean_image_responses(
+
+def plot_mean_image_response_heatmaps(
     asset,
     dmd: int = 1,
     image_name: str | None = None,
@@ -1330,37 +1352,40 @@ def plot_mean_image_responses(
     signal: str = "dF",
     mode: str = "ls",
     channels: str = "glutamate",
-    normalize_rows: str | None = None,
+    normalize_rows: str | None = "zscore",
     t_pre: float = 0.5,
     t_post: float = 1.0,
     baseline_subtract: bool = True,
     baseline_window: tuple[float, float] = (-0.25, 0.0),
     smooth_sigma: float = 0.0,
-    plot_synapses: bool = False,
-    show_sem: bool = True,
-    color="k",
-    image_colors: dict | None = None,
+    sort_by: str | None = "stimulus_locked_per_image",
+    cmap: str = "coolwarm",
+    percentiles: tuple[float, float] = (2, 98),
     figsize: tuple[float, float] | None = None,
     xlabel: str = "Time from image onset (s)",
-    ylabel: str = "Average glutamate response",
+    ylabel: str = "Synapse",
+    cbar_label: str = "Mean glutamate response",
     title_prefix: str = "",
     label_kwargs: dict | None = None,
     title_kwargs: dict | None = None,
+    cbar_label_kwargs: dict | None = None,
     x_tick_params: dict | None = None,
     y_tick_params: dict | None = None,
+    max_image_label_len: int = 18,
 ):
     """
-    Plot mean image-aligned glutamate responses for one DMD.
+    Plot image-aligned heatmaps where rows are synapses and columns are time.
 
     Modes
     -----
     - image_name is not None, as_grid=False:
-        plot a single image
+        plot a single image heatmap
     - as_grid=True:
         plot all images in a 2 x 4-style grid
     """
     label_kwargs = label_kwargs or {}
     title_kwargs = title_kwargs or {}
+    cbar_label_kwargs = cbar_label_kwargs or {}
     x_tick_params = _merge_kwargs(DEFAULT_X_TICK_PARAMS, x_tick_params)
     y_tick_params = _merge_kwargs(DEFAULT_Y_TICK_PARAMS, y_tick_params)
 
@@ -1381,78 +1406,84 @@ def plot_mean_image_responses(
     unique_images = out["unique_images"]
     t_rel = out["t_rel_by_dmd"][dmd]
     syn_traces = out["per_image_synapse_traces"][dmd]
-    mean_traces = out["per_image_mean"][dmd]
-    sem_traces = out["per_image_sem"][dmd]
 
-    if image_colors is None:
-        image_colors = {
-            img: IM_COLORS[i % len(IM_COLORS)]
-            for i, img in enumerate(unique_images)
-        }
+    order = _compute_image_heatmap_sort_order(
+        syn_traces,
+        sort_by=sort_by,
+    )
+
+    syn_traces = {img: syn_traces[img][order] for img in unique_images}
+
+    vals = np.concatenate(
+        [np.ravel(np.nan_to_num(syn_traces[img], nan=0.0)) for img in unique_images]
+    )
+    vmin, vmax = _safe_percentiles(vals, percentiles)
 
     if as_grid:
         if figsize is None:
             figsize = (12, 5.5)
 
-        fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+        fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False, constrained_layout=True)
         axes_flat = axes.ravel()
+        last_im = None
 
         for i, img in enumerate(unique_images):
             ax = axes_flat[i]
-            _plot_single_image_response_axis(
+            last_im = _plot_single_image_heatmap_axis(
                 ax=ax,
                 t_rel=t_rel,
                 syn_mat=syn_traces[img],
-                mean_trace=mean_traces[img],
-                sem_trace=sem_traces[img],
-                color=image_colors.get(img, "k"),
-                plot_synapses=plot_synapses,
-                show_sem=show_sem,
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax,
             )
 
-            ax.set_title(_short_image_label(img, max_len=18), **title_kwargs)
+            ax.set_title(_short_image_label(img, max_len=max_image_label_len), **title_kwargs)
             ax.set_xlabel(xlabel, **label_kwargs)
             ax.set_ylabel(ylabel, **label_kwargs)
             ax.tick_params(**x_tick_params)
             ax.tick_params(**y_tick_params)
 
-        # hide unused axis (8th panel in 2x4 grid)
         for j in range(len(unique_images), len(axes_flat)):
             axes_flat[j].axis("off")
 
         if title_prefix:
             fig.suptitle(f"{title_prefix}DMD {dmd}", y=1.02, **title_kwargs)
 
+        cbar = fig.colorbar(last_im, ax=axes, shrink=0.9)
+        cbar.set_label(cbar_label, **cbar_label_kwargs)
+        cbar.ax.tick_params(labelsize=y_tick_params.get("labelsize", 12))
+
         return {
             "fig": fig,
             "axes": axes,
             "data": out,
+            "order": order,
+            "cbar": cbar,
         }
 
     else:
         if image_name is None:
             raise ValueError("Provide image_name for single-image plotting, or set as_grid=True.")
 
-        if image_name not in mean_traces:
-            raise KeyError(f"{image_name} not found. Available images: {list(mean_traces.keys())}")
+        if image_name not in syn_traces:
+            raise KeyError(f"{image_name} not found. Available images: {list(syn_traces.keys())}")
 
         if figsize is None:
-            figsize = (4, 3)
+            figsize = (4.5, 3.5)
 
-        fig, ax = plt.subplots(figsize=figsize)
+        fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
 
-        _plot_single_image_response_axis(
+        im = _plot_single_image_heatmap_axis(
             ax=ax,
             t_rel=t_rel,
             syn_mat=syn_traces[image_name],
-            mean_trace=mean_traces[image_name],
-            sem_trace=sem_traces[image_name],
-            color=image_colors.get(image_name, "k"),
-            plot_synapses=plot_synapses,
-            show_sem=show_sem,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
         )
 
-        title = _short_image_label(image_name, max_len=24)
+        title = _short_image_label(image_name, max_len=max_image_label_len)
         if title_prefix:
             title = f"{title_prefix}{title}"
 
@@ -1462,8 +1493,14 @@ def plot_mean_image_responses(
         ax.tick_params(**x_tick_params)
         ax.tick_params(**y_tick_params)
 
+        cbar = fig.colorbar(im, ax=ax, shrink=0.9)
+        cbar.set_label(cbar_label, **cbar_label_kwargs)
+        cbar.ax.tick_params(labelsize=y_tick_params.get("labelsize", 12))
+
         return {
             "fig": fig,
             "ax": ax,
             "data": out,
+            "order": order,
+            "cbar": cbar,
         }
