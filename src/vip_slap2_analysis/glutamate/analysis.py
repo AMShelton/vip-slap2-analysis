@@ -730,41 +730,6 @@ def _run_manova_trace_test(
     return out
 
 
-def _extract_image_trial_traces(
-    single_trial_npz: str | Path,
-    *,
-    post_only: bool = False,
-) -> pd.DataFrame:
-    root = _load_npz_dict(single_trial_npz)
-    meta = root.get("metadata", {})
-    rows: list[dict[str, Any]] = []
-    for dmd_name, dmd_data in root.items():
-        if not str(dmd_name).startswith("DMD"):
-            continue
-        synapse_ids = np.asarray(dmd_data.get("synapse_ids", []))
-        for stim_name, windows in dmd_data["image_identity"].items():
-            windows = np.asarray(windows, dtype=float)
-            if post_only:
-                windows = windows[..., 50:100]
-            n_events, n_syn, _ = windows.shape
-            for event_idx in range(n_events):
-                for syn_idx, syn_id in enumerate(synapse_ids):
-                    rows.append(
-                        {
-                            "session_id": meta.get("session_id"),
-                            "subject_id": meta.get("subject_id"),
-                            "dmd": dmd_name,
-                            "synapse_id": str(syn_id),
-                            "stimulus_name": str(stim_name),
-                            "stimulus_label": _basename_stimulus(str(stim_name)),
-                            "event_index": int(event_idx),
-                            "trace": windows[event_idx, syn_idx].astype(float, copy=True),
-                        }
-                    )
-    return pd.DataFrame(rows)
-
-
-
 def analyze_image_tuning(
     single_trial_npz: str | Path,
     activation_summary_df: pd.DataFrame,
@@ -772,10 +737,8 @@ def analyze_image_tuning(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     config = config or GlutamateAnalysisConfig()
     rng = np.random.default_rng(config.random_seed)
-    event_df = build_event_response_table(single_trial_npz=single_trial_npz, config=config)
-    img_df = event_df[event_df["stimulus_family"].eq("image")].copy()
-    if "synapse_id" in img_df.columns:
-        img_df["synapse_id"] = img_df["synapse_id"].astype(str)
+    root = _load_npz_dict(single_trial_npz)
+    meta = root.get("metadata", {})
 
     activation_summary_df = activation_summary_df.copy()
     if "synapse_id" in activation_summary_df.columns:
@@ -787,546 +750,291 @@ def analyze_image_tuning(
     active = activation_summary_df[
         activation_summary_df["stimulus_family"].eq("image")
         & activation_summary_df["response_class"].isin(allowed_response_classes)
-    ][["session_id", "dmd", "synapse_id", "response_class"]].drop_duplicates()
-
-    img_df = img_df.merge(active, on=["session_id", "dmd", "synapse_id"], how="inner")
-
-    trace_df = _extract_image_trial_traces(
-        single_trial_npz,
-        post_only=False,
-    )
-    if not trace_df.empty:
-        trace_df = trace_df.merge(active, on=["session_id", "dmd", "synapse_id"], how="inner")
+    ][["session_id", "subject_id", "dmd", "synapse_id", "response_class"]].drop_duplicates()
 
     scalar_slice = tuple(config.tuning_fve_sample_slice) if config.tuning_fve_sample_slice is not None else None
+    mode = str(config.tuning_fve_mode).lower()
+    method = str(config.tuning_method).lower()
 
     per_image_rows: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
 
-    grouped_keys = ["session_id", "subject_id", "dmd", "synapse_id", "response_class"]
-    for (session_id, subject_id, dmd, synapse_id, response_class), grp in img_df.groupby(grouped_keys, sort=False):
-        counts = grp.groupby("stimulus_name")["delta_auc"].apply(lambda x: int(np.isfinite(x).sum()))
-        valid_images = counts[counts >= config.min_events_tuning_per_image].index.to_numpy()
+    session_id_meta = str(meta.get("session_id"))
+    subject_id_meta = meta.get("subject_id")
 
-        gvalid = grp[grp["stimulus_name"].isin(valid_images)].copy()
-        values_auc = gvalid["delta_auc"].to_numpy(dtype=float)
-        labels_auc = gvalid["stimulus_label"].to_numpy()
-
-        syn_trace_df = trace_df[
-            (trace_df["session_id"] == session_id)
-            & (trace_df["dmd"] == dmd)
-            & (trace_df["synapse_id"] == synapse_id)
-            & (trace_df["stimulus_name"].isin(valid_images))
-        ].copy()
-
-        per_image_stats = {}
-        if not syn_trace_df.empty:
-            for stim_label, ilab in syn_trace_df.groupby("stimulus_label", sort=False):
-                traces = np.stack(ilab["trace"].to_list(), axis=0)
-                traces_use = _slice_traces_for_tuning(traces, sample_slice=scalar_slice)
-                scalar_vals = _collapse_trials_to_amplitude(traces_use, amplitude_func=config.tuning_fve_amplitude_func)
-                per_image_stats[str(stim_label)] = {
-                    "n_trials": int(np.isfinite(scalar_vals).sum()),
-                    "mean_response": float(np.nanmean(scalar_vals)),
-                    "median_response": float(np.nanmedian(scalar_vals)),
-                    "std_response": float(np.nanstd(scalar_vals, ddof=1)) if np.isfinite(scalar_vals).sum() > 1 else np.nan,
-                }
-
-        for (stimulus_name, stimulus_label), sub in gvalid.groupby(["stimulus_name", "stimulus_label"], sort=False):
-            stats_row = per_image_stats.get(
-                str(stimulus_label),
-                {
-                    "n_trials": int(np.isfinite(sub["delta_auc"]).sum()),
-                    "mean_response": float(np.nanmean(sub["delta_auc"])),
-                    "median_response": float(np.nanmedian(sub["delta_auc"])),
-                    "std_response": float(np.nanstd(sub["delta_auc"], ddof=1)) if np.isfinite(sub["delta_auc"]).sum() > 1 else np.nan,
-                },
-            )
-            per_image_rows.append(
-                {
-                    "session_id": session_id,
-                    "subject_id": subject_id,
-                    "dmd": dmd,
-                    "synapse_id": str(synapse_id),
-                    "response_class": response_class,
-                    "stimulus_name": str(stimulus_name),
-                    "stimulus_label": str(stimulus_label),
-                    **stats_row,
-                }
-            )
-
-        fve = np.nan
-        total_var = np.nan
-        mean_residual_var = np.nan
-        mean_fve = np.nan
-        image_residual_var = np.nan
-        p_shuffle = np.nan
-        p_kw = np.nan
-        p_manova = np.nan
-        f_manova = np.nan
-        stat_value_manova = np.nan
-        num_df_manova = np.nan
-        den_df_manova = np.nan
-        n_trials_manova = 0
-        n_groups_manova = 0
-        n_timepoints_used_manova = 0
-        manova_stat_used = config.manova_stat
-
-        is_tuned = False
-        preferred_image = None
-        preferred_mean = np.nan
-        preferred_median = np.nan
-        pref_vs_rest = np.nan
-        pref_vs_next = np.nan
-
-        if len(valid_images) >= config.min_images_for_tuning and np.isfinite(values_auc).sum() > 1:
-            groups = [
-                gvalid.loc[gvalid["stimulus_label"].eq(lbl), "delta_auc"].to_numpy(dtype=float)
-                for lbl in np.unique(labels_auc)
-            ]
-            p_kw = _safe_kruskal(groups)
-
-            if not syn_trace_df.empty:
-                trace_labels = syn_trace_df["stimulus_label"].to_numpy()
-                traces = np.stack(syn_trace_df["trace"].to_list(), axis=0)
-                traces_for_fve = _slice_traces_for_tuning(traces, sample_slice=scalar_slice)
-                fve_metrics = _compute_tuning_fve(
-                    traces=traces_for_fve,
-                    labels=trace_labels,
-                    mode=config.tuning_fve_mode,
-                    amplitude_func=config.tuning_fve_amplitude_func,
-                )
-                fve = fve_metrics["image_fve_total"]
-                total_var = fve_metrics["total_var"]
-                mean_residual_var = fve_metrics["mean_residual_var"]
-                mean_fve = fve_metrics["mean_fve"]
-                image_residual_var = fve_metrics["image_residual_var"]
-
-                if np.isfinite(fve):
-                    null = np.empty(config.n_shuffles_tuning, dtype=float)
-                    for i in range(config.n_shuffles_tuning):
-                        null_metrics = _compute_tuning_fve(
-                            traces=traces_for_fve,
-                            labels=rng.permutation(trace_labels),
-                            mode=config.tuning_fve_mode,
-                            amplitude_func=config.tuning_fve_amplitude_func,
-                        )
-                        null[i] = null_metrics["image_fve_total"]
-                    p_shuffle = float((1.0 + np.sum(null >= fve)) / (config.n_shuffles_tuning + 1.0))
-
-                scalar_vals = _collapse_trials_to_amplitude(traces_for_fve, amplitude_func=config.tuning_fve_amplitude_func)
-                scalar_df = syn_trace_df[["stimulus_label"]].copy()
-                scalar_df["scalar_response"] = scalar_vals
-                stats_by_image = (
-                    scalar_df.groupby("stimulus_label")["scalar_response"]
-                    .agg([("mean_response", "mean"), ("median_response", "median")])
-                    .sort_values("mean_response", ascending=False)
-                )
-                if not stats_by_image.empty:
-                    preferred_image = str(stats_by_image.index[0])
-                    preferred_mean = float(stats_by_image.iloc[0]["mean_response"])
-                    preferred_median = float(stats_by_image.iloc[0]["median_response"])
-                    rest_vals = scalar_df.loc[scalar_df["stimulus_label"].ne(preferred_image), "scalar_response"].to_numpy(dtype=float)
-                    pref_vals = scalar_df.loc[scalar_df["stimulus_label"].eq(preferred_image), "scalar_response"].to_numpy(dtype=float)
-                    pref_vs_rest = float(np.nanmedian(pref_vals) - np.nanmedian(rest_vals)) if rest_vals.size else np.nan
-                    if len(stats_by_image) > 1:
-                        pref_vs_next = float(stats_by_image.iloc[0]["mean_response"] - stats_by_image.iloc[1]["mean_response"])
-
-                manova_traces = traces
-                if config.manova_use_post_only:
-                    manova_traces = _slice_traces_for_tuning(traces, sample_slice=tuple(config.image_post_samples))
-                manova = _run_manova_trace_test(
-                    traces=manova_traces,
-                    labels=trace_labels,
-                    stat_name=config.manova_stat,
-                    max_timepoints=config.manova_max_timepoints,
-                    interpolate_nans=config.manova_interpolate_nans,
-                    max_nan_fraction_per_trial=config.manova_max_nan_fraction_per_trial,
-                )
-                p_manova = manova["p_manova"]
-                f_manova = manova["f_manova"]
-                stat_value_manova = manova["stat_value_manova"]
-                num_df_manova = manova["num_df_manova"]
-                den_df_manova = manova["den_df_manova"]
-                n_trials_manova = manova["n_trials_manova"]
-                n_groups_manova = manova["n_groups_manova"]
-                n_timepoints_used_manova = manova["n_timepoints_used_manova"]
-                manova_stat_used = manova["manova_stat_used"]
-
-            elif np.isfinite(values_auc).sum() > 1:
-                fve = _compute_fve(values_auc, labels_auc)
-                total_var = float(np.nanvar(values_auc))
-                mean_residual_var = total_var
-                mean_fve = 0.0
-                image_residual_var = total_var * (1.0 - fve) if np.isfinite(fve) and np.isfinite(total_var) else np.nan
-                if np.isfinite(fve):
-                    null = np.empty(config.n_shuffles_tuning, dtype=float)
-                    for i in range(config.n_shuffles_tuning):
-                        null[i] = _compute_fve(values_auc, rng.permutation(labels_auc))
-                    p_shuffle = float((1.0 + np.sum(null >= fve)) / (config.n_shuffles_tuning + 1.0))
-
-            method = str(config.tuning_method).lower()
-            if method == "fve":
-                is_tuned = bool(
-                    np.isfinite(p_shuffle)
-                    and np.isfinite(p_kw)
-                    and p_shuffle < config.alpha
-                    and p_kw < config.alpha
-                    and np.isfinite(fve)
-                    and fve >= config.tuning_min_effect_fve
-                )
-            elif method == "manova":
-                is_tuned = bool(np.isfinite(p_manova) and p_manova < config.alpha)
-            elif method == "hybrid":
-                is_tuned = bool(
-                    np.isfinite(p_manova)
-                    and p_manova < config.alpha
-                    and np.isfinite(fve)
-                    and fve >= config.tuning_min_effect_fve
-                )
-            else:
-                raise ValueError(f"Unknown tuning_method={config.tuning_method!r}. Use 'fve', 'manova', or 'hybrid'.")
-
-        rows.append(
-            {
-                "session_id": session_id,
-                "subject_id": subject_id,
-                "dmd": dmd,
-                "synapse_id": str(synapse_id),
-                "response_class": response_class,
-                "n_image_trials": int(np.isfinite(values_auc).sum()),
-                "n_images_tested": int(len(valid_images)),
-                "fve_image": fve,
-                "total_var": total_var,
-                "mean_residual_var": mean_residual_var,
-                "mean_fve": mean_fve,
-                "image_residual_var": image_residual_var,
-                "fve_mode": str(config.tuning_fve_mode).lower(),
-                "fve_amplitude_func": str(config.tuning_fve_amplitude_func).lower(),
-                "fve_sample_start": int(scalar_slice[0]) if scalar_slice is not None else np.nan,
-                "fve_sample_stop": int(scalar_slice[1]) if scalar_slice is not None else np.nan,
-                "p_shuffle_fve": p_shuffle,
-                "p_kw": p_kw,
-                "p_manova": p_manova,
-                "f_manova": f_manova,
-                "stat_value_manova": stat_value_manova,
-                "num_df_manova": num_df_manova,
-                "den_df_manova": den_df_manova,
-                "n_trials_manova": n_trials_manova,
-                "n_groups_manova": n_groups_manova,
-                "n_timepoints_used_manova": n_timepoints_used_manova,
-                "manova_stat_used": manova_stat_used,
-                "preferred_image": preferred_image,
-                "preferred_mean": preferred_mean,
-                "preferred_median": preferred_median,
-                "preferred_vs_rest_effect": pref_vs_rest,
-                "preferred_vs_next_effect": pref_vs_next,
-                "is_tuned": is_tuned,
-                "tuning_method": str(config.tuning_method).lower(),
-            }
-        )
-
-    per_image = pd.DataFrame(per_image_rows)
-    tuning_df = pd.DataFrame(rows)
-    if not tuning_df.empty:
-        tuning_df["q_shuffle_fve"] = _bh_fdr(tuning_df["p_shuffle_fve"])
-        tuning_df["q_kw"] = _bh_fdr(tuning_df["p_kw"])
-        tuning_df["q_manova"] = _bh_fdr(tuning_df["p_manova"])
-        method = str(config.tuning_method).lower()
-        if method == "fve":
-            tuning_df["is_tuned"] = (
-                tuning_df["q_shuffle_fve"].lt(config.alpha)
-                & tuning_df["q_kw"].lt(config.alpha)
-                & tuning_df["fve_image"].ge(config.tuning_min_effect_fve)
-            )
-        elif method == "manova":
-            tuning_df["is_tuned"] = tuning_df["q_manova"].lt(config.alpha)
-        elif method == "hybrid":
-            tuning_df["is_tuned"] = (
-                tuning_df["q_manova"].lt(config.alpha)
-                & tuning_df["fve_image"].ge(config.tuning_min_effect_fve)
-            )
-
-    return per_image, tuning_df
-
-
-def _weighted_slope(x: np.ndarray, y: np.ndarray, w: np.ndarray | None = None) -> float:
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    valid = np.isfinite(x) & np.isfinite(y)
-    if w is not None:
-        w = np.asarray(w, dtype=float)
-        valid &= np.isfinite(w) & (w > 0)
-    if valid.sum() < 2:
-        return np.nan
-    x = x[valid]
-    y = y[valid]
-    if w is None:
-        w = np.ones_like(x)
-    else:
-        w = w[valid]
-    xbar = np.average(x, weights=w)
-    ybar = np.average(y, weights=w)
-    denom = np.sum(w * (x - xbar) ** 2)
-    if denom <= EPS:
-        return np.nan
-    return float(np.sum(w * (x - xbar) * (y - ybar)) / denom)
-
-
-def _normalize_sequence_responses(values: np.ndarray, strategy: str, r0: float) -> np.ndarray:
-    values = np.asarray(values, dtype=float)
-    strategy = str(strategy).lower()
-    if strategy == "none":
-        return values.copy()
-    if strategy == "max_abs":
-        denom = np.nanmax(np.abs(values))
-    else:
-        denom = abs(float(r0))
-    if not np.isfinite(denom) or denom <= EPS:
-        return np.full_like(values, np.nan, dtype=float)
-    return values / denom
-
-
-def _assign_quantile_bins(positions: np.ndarray, n_bins: int) -> np.ndarray:
-    positions = np.asarray(positions, dtype=float)
-    n = positions.size
-    out = np.full(n, -1, dtype=int)
-    if n == 0:
-        return out
-    n_bins = int(max(1, min(n_bins, n)))
-    order = np.argsort(positions)
-    splits = np.array_split(order, n_bins)
-    for bin_idx, inds in enumerate(splits):
-        out[np.asarray(inds, dtype=int)] = int(bin_idx)
-    return out
-
-
-def _epoch_label_from_bin(bin_idx: int, n_bins: int) -> str:
-    if n_bins <= 1:
-        return "all"
-    if bin_idx == 0:
-        return "early"
-    if bin_idx == n_bins - 1:
-        return "late"
-    return f"mid_{bin_idx}"
-
-
-def _summarize_binned_sequence(
-    positions: np.ndarray,
-    responses: np.ndarray,
-    responses_norm: np.ndarray,
-    counts: np.ndarray,
-    n_bins: int,
-) -> tuple[pd.DataFrame, float, float, float, float, float, float]:
-    positions = np.asarray(positions, dtype=float)
-    responses = np.asarray(responses, dtype=float)
-    responses_norm = np.asarray(responses_norm, dtype=float)
-    counts = np.asarray(counts, dtype=float)
-
-    bin_ids = _assign_quantile_bins(positions, n_bins=n_bins)
-    rows = []
-    for bin_idx in sorted(np.unique(bin_ids)):
-        mask = bin_ids == bin_idx
-        pos_bin = positions[mask]
-        resp_bin = responses[mask]
-        norm_bin = responses_norm[mask]
-        cnt_bin = counts[mask]
-        valid_resp = np.isfinite(resp_bin) & np.isfinite(cnt_bin) & (cnt_bin > 0)
-        if not np.any(valid_resp):
+    for dmd_name, dmd_data in root.items():
+        if not str(dmd_name).startswith("DMD"):
             continue
-        pos_center = float(np.average(pos_bin[valid_resp], weights=cnt_bin[valid_resp]))
-        mean_resp = float(np.average(resp_bin[valid_resp], weights=cnt_bin[valid_resp]))
-        valid_norm = valid_resp & np.isfinite(norm_bin)
-        mean_norm = float(np.average(norm_bin[valid_norm], weights=cnt_bin[valid_norm])) if np.any(valid_norm) else np.nan
-        rows.append(
-            {
-                "bin_index": int(bin_idx),
-                "epoch_label": _epoch_label_from_bin(int(bin_idx), int(bin_ids.max()) + 1),
-                "position_center": pos_center,
-                "response_amplitude": mean_resp,
-                "response_amplitude_norm": mean_norm,
-                "counts": float(np.nansum(cnt_bin[valid_resp])),
-                "n_positions_in_bin": int(np.sum(mask)),
-            }
-        )
+        dmd_name = str(dmd_name)
+        synapse_ids = np.asarray(dmd_data.get("synapse_ids", []))
+        synapse_id_strs = synapse_ids.astype(str)
+        syn_id_to_idx = {sid: i for i, sid in enumerate(synapse_id_strs)}
 
-    binned = pd.DataFrame(rows)
-    if binned.empty:
-        return binned, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+        image_windows_by_name: dict[str, np.ndarray] = {}
+        image_label_by_name: dict[str, str] = {}
+        for stim_name, windows in dmd_data.get("image_identity", {}).items():
+            stim_name = str(stim_name)
+            image_windows_by_name[stim_name] = np.asarray(windows, dtype=float)
+            image_label_by_name[stim_name] = _basename_stimulus(stim_name)
+        if not image_windows_by_name:
+            continue
 
-    overall_slope = _weighted_slope(
-        binned["position_center"].to_numpy(dtype=float),
-        binned["response_amplitude"].to_numpy(dtype=float),
-        binned["counts"].to_numpy(dtype=float),
-    )
-    overall_slope_norm = _weighted_slope(
-        binned["position_center"].to_numpy(dtype=float),
-        binned["response_amplitude_norm"].to_numpy(dtype=float),
-        binned["counts"].to_numpy(dtype=float),
-    )
+        active_dmd = active[
+            active["session_id"].astype(str).eq(session_id_meta)
+            & active["dmd"].astype(str).eq(dmd_name)
+        ].copy()
+        if active_dmd.empty:
+            continue
 
-    if len(binned) >= 2:
-        split = max(2, int(np.ceil(len(binned) / 2.0)))
-        early_df = binned.iloc[:split].copy()
-        late_df = binned.iloc[-split:].copy()
-        early_slope = _weighted_slope(
-            early_df["position_center"].to_numpy(dtype=float),
-            early_df["response_amplitude"].to_numpy(dtype=float),
-            early_df["counts"].to_numpy(dtype=float),
-        )
-        late_slope = _weighted_slope(
-            late_df["position_center"].to_numpy(dtype=float),
-            late_df["response_amplitude"].to_numpy(dtype=float),
-            late_df["counts"].to_numpy(dtype=float),
-        )
-    else:
-        early_slope = np.nan
-        late_slope = np.nan
+        for _, active_row in active_dmd.iterrows():
+            synapse_id = str(active_row["synapse_id"])
+            response_class = active_row["response_class"]
+            subject_id = active_row.get("subject_id", subject_id_meta)
+            syn_idx = syn_id_to_idx.get(synapse_id)
+            if syn_idx is None:
+                continue
 
-    early_mean = float(binned.iloc[0]["response_amplitude"])
-    late_mean = float(binned.iloc[-1]["response_amplitude"])
-    return binned, overall_slope, overall_slope_norm, early_slope, late_slope, early_mean, late_mean
+            valid_image_names: list[str] = []
+            scalar_values_by_image: dict[str, np.ndarray] = {}
+            trace_values_by_image: dict[str, np.ndarray] = {}
+            label_by_name: dict[str, str] = {}
 
+            for stim_name, windows in image_windows_by_name.items():
+                if windows.ndim != 3 or syn_idx >= windows.shape[1]:
+                    continue
+                traces = np.asarray(windows[:, syn_idx, :], dtype=float)
+                if traces.ndim != 2 or traces.shape[0] == 0:
+                    continue
 
-def _classify_sequence_pattern(
-    early_slope: float,
-    late_slope: float,
-    overall_slope: float,
-    *,
-    min_abs_slope: float,
-    slope_frac: float,
-) -> str:
-    vals = np.array([early_slope, late_slope, overall_slope], dtype=float)
-    finite = np.isfinite(vals)
-    if not np.any(finite):
-        return "stable"
-    max_abs = float(np.nanmax(np.abs(vals[finite])))
-    thr = max(float(min_abs_slope), float(slope_frac) * max_abs)
+                label = image_label_by_name[stim_name]
+                label_by_name[stim_name] = label
 
-    def _state(v: float) -> int:
-        if not np.isfinite(v) or abs(v) < thr:
-            return 0
-        return 1 if v > 0 else -1
+                if mode == "delta_auc":
+                    scalar_vals = _window_metric(
+                        traces[:, None, :],
+                        config.image_pre_samples,
+                        config.image_post_samples,
+                    )[:, 0]
+                else:
+                    traces_for_scalar = _slice_traces_for_tuning(traces, sample_slice=scalar_slice)
+                    scalar_vals = _collapse_trials_to_amplitude(
+                        traces_for_scalar,
+                        amplitude_func=config.tuning_fve_amplitude_func,
+                    )
 
-    e = _state(early_slope)
-    l = _state(late_slope)
-    o = _state(overall_slope)
+                n_valid_trials = int(np.isfinite(scalar_vals).sum())
+                if n_valid_trials >= config.min_events_tuning_per_image:
+                    valid_image_names.append(stim_name)
+                    scalar_values_by_image[stim_name] = scalar_vals
+                    trace_values_by_image[stim_name] = traces
 
-    if e == 0 and l == 0 and o == 0:
-        return "stable"
-    if e < 0 and l > 0:
-        return "biphasic_rebound"
-    if e > 0 and l < 0:
-        return "biphasic_adapting"
-    if e < 0 and l == 0:
-        return "early_adapting"
-    if e > 0 and l == 0:
-        return "early_facilitating"
-    if e == 0 and l < 0:
-        return "late_adapting"
-    if e == 0 and l > 0:
-        return "late_facilitating"
-    if e < 0 and l < 0:
-        return "adapting"
-    if e > 0 and l > 0:
-        return "facilitating"
-    if o < 0:
-        return "adapting"
-    if o > 0:
-        return "facilitating"
-    return "mixed"
+                per_image_rows.append(
+                    {
+                        "session_id": session_id_meta,
+                        "subject_id": subject_id,
+                        "dmd": dmd_name,
+                        "synapse_id": synapse_id,
+                        "response_class": response_class,
+                        "stimulus_name": stim_name,
+                        "stimulus_label": label,
+                        "n_trials": n_valid_trials,
+                        "mean_response": float(np.nanmean(scalar_vals)) if n_valid_trials else np.nan,
+                        "median_response": float(np.nanmedian(scalar_vals)) if n_valid_trials else np.nan,
+                        "std_response": float(np.nanstd(scalar_vals, ddof=1)) if n_valid_trials > 1 else np.nan,
+                    }
+                )
 
+            valid_image_names = list(dict.fromkeys(valid_image_names))
+            all_scalar_vals = np.array([], dtype=float)
+            all_scalar_labels = np.array([], dtype=object)
 
-def _build_sequence_rank_table(
-    tuning_per_image_df: pd.DataFrame | None,
-    tuning_summary_df: pd.DataFrame | None,
-    *,
-    rank_by: str = "hybrid_preference",
-) -> pd.DataFrame:
-    base_cols = ["session_id", "dmd", "synapse_id", "stimulus_name"]
-    if tuning_per_image_df is None or tuning_per_image_df.empty:
-        return pd.DataFrame(
-            columns=base_cols
-            + [
-                "stimulus_label",
-                "image_selectivity_score",
-                "ranking_score",
-                "image_rank_within_synapse",
-                "rank_basis",
-                "is_preferred_ranked_image",
-            ]
-        )
+            fve = np.nan
+            total_var = np.nan
+            mean_residual_var = np.nan
+            mean_fve = np.nan
+            image_residual_var = np.nan
+            p_shuffle = np.nan
+            p_kw = np.nan
+            p_manova = np.nan
+            f_manova = np.nan
+            stat_value_manova = np.nan
+            num_df_manova = np.nan
+            den_df_manova = np.nan
+            n_trials_manova = 0
+            n_groups_manova = 0
+            n_timepoints_used_manova = 0
+            manova_stat_used = config.manova_stat
+            is_tuned = False
+            preferred_image = None
+            preferred_mean = np.nan
+            preferred_median = np.nan
+            pref_vs_rest = np.nan
+            pref_vs_next = np.nan
 
-    rank_df = tuning_per_image_df.copy()
-    if "subject_id" in rank_df.columns:
-        rank_df = rank_df.drop(columns=["subject_id"])
+            if len(valid_image_names) >= config.min_images_for_tuning:
+                scalar_group_list = [scalar_values_by_image[name] for name in valid_image_names]
+                p_kw = _safe_kruskal(scalar_group_list)
 
-    if tuning_summary_df is not None and not tuning_summary_df.empty:
-        rank_df = rank_df.merge(
-            tuning_summary_df[["session_id", "dmd", "synapse_id", "is_tuned"]],
-            on=["session_id", "dmd", "synapse_id"],
-            how="left",
-        )
-    else:
-        rank_df["is_tuned"] = False
+                all_scalar_vals = np.concatenate([scalar_values_by_image[name] for name in valid_image_names])
+                all_scalar_labels = np.concatenate([
+                    np.repeat(label_by_name[name], scalar_values_by_image[name].shape[0])
+                    for name in valid_image_names
+                ])
+                scalar_finite = np.isfinite(all_scalar_vals)
+                all_scalar_vals = all_scalar_vals[scalar_finite]
+                all_scalar_labels = all_scalar_labels[scalar_finite]
 
-    rank_df["is_tuned"] = rank_df["is_tuned"].fillna(False)
-    rank_df["image_selectivity_score"] = np.nan
+                if mode == "trace":
+                    trace_blocks = []
+                    trace_label_blocks = []
+                    for name in valid_image_names:
+                        traces = _slice_traces_for_tuning(trace_values_by_image[name], sample_slice=scalar_slice)
+                        trace_blocks.append(traces)
+                        trace_label_blocks.append(np.repeat(label_by_name[name], traces.shape[0]))
+                    traces_for_fve = np.concatenate(trace_blocks, axis=0) if trace_blocks else np.empty((0, 0), dtype=float)
+                    trace_labels = np.concatenate(trace_label_blocks) if trace_label_blocks else np.array([], dtype=object)
+                    fve_metrics = _compute_tuning_fve(
+                        traces=traces_for_fve,
+                        labels=trace_labels,
+                        mode=mode,
+                        amplitude_func=config.tuning_fve_amplitude_func,
+                    )
+                    fve = fve_metrics["image_fve_total"]
+                    total_var = fve_metrics["total_var"]
+                    mean_residual_var = fve_metrics["mean_residual_var"]
+                    mean_fve = fve_metrics["mean_fve"]
+                    image_residual_var = fve_metrics["image_residual_var"]
 
-    group_keys = ["session_id", "dmd", "synapse_id"]
-    for _, idx in rank_df.groupby(group_keys).groups.items():
-        idx = list(idx)
-        vals = rank_df.loc[idx, "mean_response"].to_numpy(dtype=float)
-        scores = np.full(len(idx), np.nan, dtype=float)
-        for i in range(len(idx)):
-            others = np.delete(vals, i)
-            scores[i] = vals[i] if others.size == 0 else vals[i] - float(np.nanmean(others))
-        rank_df.loc[idx, "image_selectivity_score"] = scores
+                    if np.isfinite(fve) and config.n_shuffles_tuning > 0:
+                        null = np.empty(config.n_shuffles_tuning, dtype=float)
+                        for i in range(config.n_shuffles_tuning):
+                            null_metrics = _compute_tuning_fve(
+                                traces=traces_for_fve,
+                                labels=rng.permutation(trace_labels),
+                                mode=mode,
+                                amplitude_func=config.tuning_fve_amplitude_func,
+                            )
+                            null[i] = null_metrics["image_fve_total"]
+                        p_shuffle = float((1.0 + np.sum(null >= fve)) / (config.n_shuffles_tuning + 1.0))
 
-    rank_scores = []
-    rank_basis = []
-    strategy = str(rank_by).lower()
-    for _, row in rank_df.iterrows():
-        tuned = bool(row["is_tuned"])
-        if strategy == "selectivity_score":
-            rank_scores.append(row["image_selectivity_score"])
-            rank_basis.append("selectivity_score")
-        elif strategy == "response_amplitude":
-            rank_scores.append(row["mean_response"])
-            rank_basis.append("response_amplitude")
-        else:
-            if tuned:
-                rank_scores.append(row["image_selectivity_score"])
-                rank_basis.append("selectivity_score")
-            else:
-                rank_scores.append(row["mean_response"])
-                rank_basis.append("response_amplitude")
+                    if method in {"manova", "hybrid"}:
+                        manova_traces = traces_for_fve
+                        if config.manova_use_post_only:
+                            manova_traces = _slice_traces_for_tuning(
+                                np.concatenate([trace_values_by_image[name] for name in valid_image_names], axis=0),
+                                sample_slice=tuple(config.image_post_samples),
+                            )
+                        manova = _run_manova_trace_test(
+                            traces=manova_traces,
+                            labels=trace_labels,
+                            stat_name=config.manova_stat,
+                            max_timepoints=config.manova_max_timepoints,
+                            interpolate_nans=config.manova_interpolate_nans,
+                            max_nan_fraction_per_trial=config.manova_max_nan_fraction_per_trial,
+                        )
+                        p_manova = manova["p_manova"]
+                        f_manova = manova["f_manova"]
+                        stat_value_manova = manova["stat_value_manova"]
+                        num_df_manova = manova["num_df_manova"]
+                        den_df_manova = manova["den_df_manova"]
+                        n_trials_manova = manova["n_trials_manova"]
+                        n_groups_manova = manova["n_groups_manova"]
+                        n_timepoints_used_manova = manova["n_timepoints_used_manova"]
+                        manova_stat_used = manova["manova_stat_used"]
+                else:
+                    fve = _compute_fve(all_scalar_vals, all_scalar_labels)
+                    total_var = float(np.nanvar(all_scalar_vals)) if all_scalar_vals.size else np.nan
+                    mean_residual_var = total_var
+                    mean_fve = 0.0
+                    image_residual_var = total_var * (1.0 - fve) if np.isfinite(fve) and np.isfinite(total_var) else np.nan
+                    if np.isfinite(fve) and config.n_shuffles_tuning > 0:
+                        null = np.empty(config.n_shuffles_tuning, dtype=float)
+                        for i in range(config.n_shuffles_tuning):
+                            null[i] = _compute_fve(all_scalar_vals, rng.permutation(all_scalar_labels))
+                        p_shuffle = float((1.0 + np.sum(null >= fve)) / (config.n_shuffles_tuning + 1.0))
 
-    rank_df["ranking_score"] = rank_scores
-    rank_df["rank_basis"] = rank_basis
-    rank_df["image_rank_within_synapse"] = (
-        rank_df.groupby(group_keys)["ranking_score"]
-        .rank(method="first", ascending=False)
-        .astype("Int64")
-    )
-    rank_df["is_preferred_ranked_image"] = rank_df["image_rank_within_synapse"].eq(1)
+                if all_scalar_vals.size:
+                    scalar_df = pd.DataFrame({"stimulus_label": all_scalar_labels, "scalar_response": all_scalar_vals})
+                    stats_by_image = (
+                        scalar_df.groupby("stimulus_label")["scalar_response"]
+                        .agg([("mean_response", "mean"), ("median_response", "median")])
+                        .sort_values("mean_response", ascending=False)
+                    )
+                    if not stats_by_image.empty:
+                        preferred_image = str(stats_by_image.index[0])
+                        preferred_mean = float(stats_by_image.iloc[0]["mean_response"])
+                        preferred_median = float(stats_by_image.iloc[0]["median_response"])
+                        rest_vals = scalar_df.loc[scalar_df["stimulus_label"].ne(preferred_image), "scalar_response"].to_numpy(dtype=float)
+                        pref_vals = scalar_df.loc[scalar_df["stimulus_label"].eq(preferred_image), "scalar_response"].to_numpy(dtype=float)
+                        pref_vs_rest = float(np.nanmedian(pref_vals) - np.nanmedian(rest_vals)) if rest_vals.size else np.nan
+                        if len(stats_by_image) > 1:
+                            pref_vs_next = float(stats_by_image.iloc[0]["mean_response"] - stats_by_image.iloc[1]["mean_response"])
 
-    return rank_df[
-        [
-            "session_id",
-            "dmd",
-            "synapse_id",
-            "stimulus_name",
-            "stimulus_label",
-            "image_selectivity_score",
-            "ranking_score",
-            "image_rank_within_synapse",
-            "rank_basis",
-            "is_preferred_ranked_image",
-        ]
-    ].copy()
+                if method == "fve":
+                    is_tuned = bool(
+                        np.isfinite(p_shuffle)
+                        and np.isfinite(p_kw)
+                        and p_shuffle < config.alpha
+                        and p_kw < config.alpha
+                        and np.isfinite(fve)
+                        and fve >= config.tuning_min_effect_fve
+                    )
+                elif method == "manova":
+                    is_tuned = bool(np.isfinite(p_manova) and p_manova < config.alpha)
+                elif method == "hybrid":
+                    is_tuned = bool(
+                        np.isfinite(p_manova)
+                        and p_manova < config.alpha
+                        and np.isfinite(fve)
+                        and fve >= config.tuning_min_effect_fve
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown tuning_method={config.tuning_method!r}. Use 'fve', 'manova', or 'hybrid'."
+                    )
 
+            rows.append(
+                {
+                    "session_id": session_id_meta,
+                    "subject_id": subject_id,
+                    "dmd": dmd_name,
+                    "synapse_id": synapse_id,
+                    "response_class": response_class,
+                    "n_image_trials": int(all_scalar_vals.size),
+                    "n_images_tested": int(len(valid_image_names)),
+                    "fve_image": fve,
+                    "total_var": total_var,
+                    "mean_residual_var": mean_residual_var,
+                    "mean_fve": mean_fve,
+                    "image_residual_var": image_residual_var,
+                    "fve_mode": mode,
+                    "fve_amplitude_func": str(config.tuning_fve_amplitude_func).lower(),
+                    "fve_sample_start": int(scalar_slice[0]) if scalar_slice is not None else np.nan,
+                    "fve_sample_stop": int(scalar_slice[1]) if scalar_slice is not None else np.nan,
+                    "p_shuffle_fve": p_shuffle,
+                    "p_kw": p_kw,
+                    "p_manova": p_manova,
+                    "f_manova": f_manova,
+                    "stat_value_manova": stat_value_manova,
+                    "num_df_manova": num_df_manova,
+                    "den_df_manova": den_df_manova,
+                    "n_trials_manova": n_trials_manova,
+                    "n_groups_manova": n_groups_manova,
+                    "n_timepoints_used_manova": n_timepoints_used_manova,
+                    "manova_stat_used": manova_stat_used,
+                    "preferred_image": preferred_image,
+                    "preferred_mean": preferred_mean,
+                    "preferred_median": preferred_median,
+                    "preferred_vs_rest_effect": pref_vs_rest,
+                    "preferred_vs_next_effect": pref_vs_next,
+                    "is_tuned": is_tuned,
+                    "tuning_method": method,
+                }
+            )
 
+    per_image_df = pd.DataFrame(per_image_rows)
+    summary_df = pd.DataFrame(rows)
+    return per_image_df, summary_df
 def analyze_sequence_dynamics(
     sequence_npz: str | Path,
     activation_summary_df: pd.DataFrame,
