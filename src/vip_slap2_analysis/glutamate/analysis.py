@@ -63,6 +63,7 @@ class GlutamateAnalysisConfig:
 
     sequence_rank_by: str = "hybrid_preference"   # {"hybrid_preference", "selectivity_score", "response_amplitude"}
     sequence_norm_strategy: str = "r0_abs"        # {"r0_abs", "max_abs", "none"}
+    sequence_response_classes: tuple[str, ...] | None = None  # None => include all image synapses
 
 
 @dataclass
@@ -1035,6 +1036,233 @@ def analyze_image_tuning(
     per_image_df = pd.DataFrame(per_image_rows)
     summary_df = pd.DataFrame(rows)
     return per_image_df, summary_df
+
+
+def _normalize_sequence_response_classes(response_classes: Sequence[str] | None) -> tuple[str, ...] | None:
+    if response_classes is None:
+        return None
+    return _normalize_response_classes(response_classes)
+
+
+def _assign_quantile_bins(values: np.ndarray, n_bins: int) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    if values.ndim != 1:
+        raise ValueError("_assign_quantile_bins expects a 1D array.")
+    n = values.size
+    if n == 0:
+        return np.array([], dtype=int)
+    n_bins = int(max(1, min(int(n_bins), n)))
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(n, dtype=int)
+    ranks[order] = np.arange(n)
+    bins = np.floor(ranks * n_bins / n).astype(int)
+    bins = np.clip(bins, 0, n_bins - 1)
+    return bins
+
+
+def _safe_polyfit_slope(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    keep = np.isfinite(x) & np.isfinite(y)
+    x = x[keep]
+    y = y[keep]
+    if x.size < 2 or np.allclose(x, x[0]):
+        return np.nan
+    try:
+        return float(np.polyfit(x, y, 1)[0])
+    except Exception:
+        return np.nan
+
+
+def _epoch_label_from_bin(bin_index: int, n_bins: int) -> str:
+    if n_bins <= 1:
+        return "all"
+    if bin_index == 0:
+        return "early"
+    if bin_index == n_bins - 1:
+        return "late"
+    if n_bins == 3 and bin_index == 1:
+        return "middle"
+    return f"bin_{bin_index}"
+
+
+def _summarize_binned_sequence(
+    *,
+    positions: np.ndarray,
+    responses: np.ndarray,
+    responses_norm: np.ndarray,
+    counts: np.ndarray,
+    n_bins: int,
+) -> tuple[pd.DataFrame, float, float, float, float, float, float]:
+    positions = np.asarray(positions, dtype=float)
+    responses = np.asarray(responses, dtype=float)
+    responses_norm = np.asarray(responses_norm, dtype=float)
+    counts = np.asarray(counts, dtype=float)
+
+    keep = np.isfinite(positions) & np.isfinite(responses) & np.isfinite(counts)
+    if responses_norm.shape != responses.shape:
+        responses_norm = np.full_like(responses, np.nan, dtype=float)
+    positions = positions[keep]
+    responses = responses[keep]
+    responses_norm = responses_norm[keep]
+    counts = counts[keep]
+    if positions.size < 2:
+        empty = pd.DataFrame(columns=[
+            "bin_index", "epoch_label", "position_center",
+            "response_amplitude", "response_amplitude_norm", "counts",
+        ])
+        return empty, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+
+    bin_ids = _assign_quantile_bins(positions, n_bins=n_bins)
+    rows: list[dict[str, Any]] = []
+    for bin_index in np.unique(bin_ids):
+        mask = bin_ids == bin_index
+        rows.append({
+            "bin_index": int(bin_index),
+            "epoch_label": _epoch_label_from_bin(int(bin_index), int(np.nanmax(bin_ids) + 1)),
+            "position_center": float(np.nanmean(positions[mask])),
+            "response_amplitude": float(np.nanmean(responses[mask])),
+            "response_amplitude_norm": float(np.nanmean(responses_norm[mask])) if np.any(np.isfinite(responses_norm[mask])) else np.nan,
+            "counts": float(np.nansum(counts[mask])),
+        })
+
+    binned_df = pd.DataFrame(rows).sort_values("bin_index").reset_index(drop=True)
+    if binned_df.empty or len(binned_df) < 2:
+        return binned_df, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+
+    x = binned_df["position_center"].to_numpy(dtype=float)
+    y = binned_df["response_amplitude"].to_numpy(dtype=float)
+    yn = binned_df["response_amplitude_norm"].to_numpy(dtype=float)
+
+    overall_slope = _safe_polyfit_slope(x, y)
+    overall_slope_norm = _safe_polyfit_slope(x, yn)
+
+    early_slice = slice(0, min(2, len(binned_df)))
+    late_slice = slice(max(0, len(binned_df) - 2), len(binned_df))
+    early_slope = _safe_polyfit_slope(x[early_slice], y[early_slice])
+    late_slope = _safe_polyfit_slope(x[late_slice], y[late_slice])
+    early_mean = float(y[0]) if len(y) else np.nan
+    late_mean = float(y[-1]) if len(y) else np.nan
+
+    return binned_df, overall_slope, overall_slope_norm, early_slope, late_slope, early_mean, late_mean
+
+
+def _normalize_sequence_responses(
+    responses: np.ndarray,
+    *,
+    strategy: str,
+    r0: float,
+) -> np.ndarray:
+    responses = np.asarray(responses, dtype=float)
+    strategy = str(strategy).lower()
+    if strategy == "none":
+        return responses.astype(float, copy=True)
+    if strategy == "max_abs":
+        denom = float(np.nanmax(np.abs(responses))) if responses.size else np.nan
+    elif strategy == "r0_abs":
+        denom = abs(float(r0))
+    else:
+        raise ValueError(f"Unknown sequence_norm_strategy: {strategy!r}")
+    if not np.isfinite(denom) or denom <= EPS:
+        return np.full_like(responses, np.nan, dtype=float)
+    return responses / denom
+
+
+def _classify_sequence_pattern(
+    *,
+    early_slope: float,
+    late_slope: float,
+    overall_slope: float,
+    min_abs_slope: float,
+    slope_frac: float,
+) -> str:
+    vals = np.array([early_slope, late_slope, overall_slope], dtype=float)
+    max_abs = np.nanmax(np.abs(vals)) if np.any(np.isfinite(vals)) else np.nan
+    if not np.isfinite(max_abs) or max_abs < float(min_abs_slope):
+        return "stable"
+
+    early = 0.0 if not np.isfinite(early_slope) else float(early_slope)
+    late = 0.0 if not np.isfinite(late_slope) else float(late_slope)
+    overall = 0.0 if not np.isfinite(overall_slope) else float(overall_slope)
+    thresh = max(float(min_abs_slope), abs(overall) * float(slope_frac))
+
+    if late >= thresh and early <= -thresh:
+        return "late facilitating"
+    if late <= -thresh and early >= thresh:
+        return "late adapting"
+    if overall >= thresh:
+        return "facilitating"
+    if overall <= -thresh:
+        return "adapting"
+    return "stable"
+
+
+def _build_sequence_rank_table(
+    *,
+    tuning_per_image_df: pd.DataFrame | None,
+    tuning_summary_df: pd.DataFrame | None,
+    rank_by: str,
+) -> pd.DataFrame:
+    expected_cols = [
+        "session_id", "dmd", "synapse_id", "stimulus_name", "stimulus_label",
+        "image_selectivity_score", "ranking_score", "image_rank_within_synapse",
+        "rank_basis", "is_preferred_ranked_image",
+    ]
+    if tuning_per_image_df is None or len(tuning_per_image_df) == 0:
+        return pd.DataFrame(columns=expected_cols)
+
+    df = tuning_per_image_df.copy()
+    req = {"session_id", "dmd", "synapse_id", "stimulus_name", "stimulus_label"}
+    if not req.issubset(df.columns):
+        return pd.DataFrame(columns=expected_cols)
+
+    if "mean_response" not in df.columns:
+        num_cols = [c for c in ["median_response", "std_response"] if c in df.columns]
+        if num_cols:
+            df["mean_response"] = df[num_cols[0]]
+        else:
+            return pd.DataFrame(columns=expected_cols)
+
+    group_cols = ["session_id", "dmd", "synapse_id"]
+    df["mean_response"] = pd.to_numeric(df["mean_response"], errors="coerce")
+    df["stimulus_label"] = df["stimulus_label"].astype(str)
+    df["stimulus_name"] = df["stimulus_name"].astype(str)
+
+    med = df.groupby(group_cols)["mean_response"].transform("median")
+    df["image_selectivity_score"] = df["mean_response"] - med
+
+    rank_mode = str(rank_by).lower()
+    if rank_mode == "selectivity_score":
+        df["ranking_score"] = df["image_selectivity_score"]
+        basis = "selectivity_score"
+    elif rank_mode == "response_amplitude":
+        df["ranking_score"] = df["mean_response"]
+        basis = "response_amplitude"
+    else:
+        resp_z = df.groupby(group_cols)["mean_response"].transform(
+            lambda s: (s - s.mean()) / (s.std(ddof=0) if np.isfinite(s.std(ddof=0)) and s.std(ddof=0) > 0 else 1.0)
+        )
+        sel_z = df.groupby(group_cols)["image_selectivity_score"].transform(
+            lambda s: (s - s.mean()) / (s.std(ddof=0) if np.isfinite(s.std(ddof=0)) and s.std(ddof=0) > 0 else 1.0)
+        )
+        df["ranking_score"] = resp_z + sel_z
+        basis = "hybrid_preference"
+
+    df = df.sort_values(group_cols + ["ranking_score", "mean_response"], ascending=[True, True, True, False, False]).copy()
+    df["image_rank_within_synapse"] = df.groupby(group_cols).cumcount() + 1
+    df["rank_basis"] = basis
+    df["is_preferred_ranked_image"] = df["image_rank_within_synapse"].eq(1)
+
+    if tuning_summary_df is not None and len(tuning_summary_df) > 0 and "preferred_image" in tuning_summary_df.columns:
+        pref = tuning_summary_df[["session_id", "dmd", "synapse_id", "preferred_image"]].copy()
+        pref["preferred_image"] = pref["preferred_image"].astype(str)
+        df = df.merge(pref, on=["session_id", "dmd", "synapse_id"], how="left")
+        df["is_preferred_ranked_image"] = df["stimulus_label"].eq(df["preferred_image"]) | df["is_preferred_ranked_image"]
+        df = df.drop(columns=["preferred_image"])
+
+    return df[expected_cols].copy()
+
+
 def analyze_sequence_dynamics(
     sequence_npz: str | Path,
     activation_summary_df: pd.DataFrame,
@@ -1046,10 +1274,37 @@ def analyze_sequence_dynamics(
     root = _load_npz_dict(sequence_npz)
     meta = root.get("metadata", {})
 
-    active = activation_summary_df[
-        activation_summary_df["stimulus_family"].eq("image")
-        & activation_summary_df["response_class"].eq("activated")
-    ][["session_id", "dmd", "synapse_id"]].drop_duplicates()
+    session_id_meta = str(meta.get("session_id"))
+    subject_id_meta = meta.get("subject_id")
+
+    activation_meta = activation_summary_df.copy()
+    if activation_meta is None or len(activation_meta) == 0:
+        activation_meta = pd.DataFrame(columns=["session_id", "subject_id", "dmd", "synapse_id", "response_class", "median_delta_auc", "mean_delta_auc"])
+    if "Unnamed: 0" in activation_meta.columns:
+        activation_meta = activation_meta.drop(columns=["Unnamed: 0"])
+    if "session_id" in activation_meta.columns:
+        activation_meta["session_id"] = activation_meta["session_id"].astype(str)
+    if "dmd" in activation_meta.columns:
+        activation_meta["dmd"] = activation_meta["dmd"].astype(str)
+    if "synapse_id" in activation_meta.columns:
+        activation_meta["synapse_id"] = activation_meta["synapse_id"].astype(str)
+
+    if len(activation_meta):
+        activation_meta = activation_meta.loc[activation_meta.get("stimulus_family", pd.Series(index=activation_meta.index, dtype=object)).astype(str).eq("image")].copy()
+    if len(activation_meta) == 0:
+        activation_meta = pd.DataFrame(columns=["session_id", "subject_id", "dmd", "synapse_id", "response_class", "median_delta_auc", "mean_delta_auc"])
+
+    keep_cols = [c for c in ["session_id", "subject_id", "dmd", "synapse_id", "response_class", "median_delta_auc", "mean_delta_auc", "q_value_within_synapse"] if c in activation_meta.columns]
+    activation_meta = activation_meta[keep_cols].drop_duplicates() if keep_cols else activation_meta
+
+    allowed_response_classes = _normalize_sequence_response_classes(config.sequence_response_classes)
+    if allowed_response_classes is not None and len(activation_meta):
+        activation_meta = activation_meta[activation_meta["response_class"].isin(allowed_response_classes)].copy()
+
+    activation_lookup = {}
+    if len(activation_meta):
+        for row in activation_meta.itertuples(index=False):
+            activation_lookup[(str(row.session_id), str(row.dmd), str(row.synapse_id))] = row._asdict()
 
     rank_df = _build_sequence_rank_table(
         tuning_per_image_df=tuning_per_image_df,
@@ -1064,16 +1319,19 @@ def analyze_sequence_dynamics(
     for dmd_name, dmd_data in root.items():
         if not str(dmd_name).startswith("DMD"):
             continue
+        dmd_name = str(dmd_name)
         synapse_ids = np.asarray(dmd_data.get("synapse_ids", []))
 
         for syn_idx, syn_id in enumerate(synapse_ids):
-            active_mask = (
-                active["session_id"].eq(meta.get("session_id"))
-                & active["dmd"].eq(dmd_name)
-                & active["synapse_id"].eq(str(syn_id))
-            )
-            if not active_mask.any():
+            syn_id = str(syn_id)
+            key = (session_id_meta, dmd_name, syn_id)
+            syn_meta = activation_lookup.get(key, {})
+            if allowed_response_classes is not None and not syn_meta:
                 continue
+
+            response_class = syn_meta.get("response_class", "unknown")
+            median_delta_auc = syn_meta.get("median_delta_auc", np.nan)
+            mean_delta_auc = syn_meta.get("mean_delta_auc", np.nan)
 
             overall_slopes: list[float] = []
             early_slopes: list[float] = []
@@ -1190,10 +1448,13 @@ def analyze_sequence_dynamics(
                     info = bin_lookup.get(int(bin_idx), {})
                     position_rows.append(
                         {
-                            "session_id": meta.get("session_id"),
-                            "subject_id": meta.get("subject_id"),
+                            "session_id": session_id_meta,
+                            "subject_id": subject_id_meta,
                             "dmd": dmd_name,
-                            "synapse_id": str(syn_id),
+                            "synapse_id": syn_id,
+                            "response_class": response_class,
+                            "activation_median_delta_auc": median_delta_auc,
+                            "activation_mean_delta_auc": mean_delta_auc,
                             "stimulus_name": str(stim_name),
                             "stimulus_label": _basename_stimulus(str(stim_name)),
                             "position_category": "repeated",
@@ -1227,10 +1488,13 @@ def analyze_sequence_dynamics(
                 )[0]
                 position_rows.append(
                     {
-                        "session_id": meta.get("session_id"),
-                        "subject_id": meta.get("subject_id"),
+                        "session_id": session_id_meta,
+                        "subject_id": subject_id_meta,
                         "dmd": dmd_name,
-                        "synapse_id": str(syn_id),
+                        "synapse_id": syn_id,
+                        "response_class": response_class,
+                        "activation_median_delta_auc": median_delta_auc,
+                        "activation_mean_delta_auc": mean_delta_auc,
                         "stimulus_name": str(stim_name),
                         "stimulus_label": _basename_stimulus(str(stim_name)),
                         "position_category": "terminal",
@@ -1259,10 +1523,13 @@ def analyze_sequence_dynamics(
 
                 per_image_rows.append(
                     {
-                        "session_id": meta.get("session_id"),
-                        "subject_id": meta.get("subject_id"),
+                        "session_id": session_id_meta,
+                        "subject_id": subject_id_meta,
                         "dmd": dmd_name,
-                        "synapse_id": str(syn_id),
+                        "synapse_id": syn_id,
+                        "response_class": response_class,
+                        "activation_median_delta_auc": median_delta_auc,
+                        "activation_mean_delta_auc": mean_delta_auc,
                         "stimulus_name": str(stim_name),
                         "stimulus_label": _basename_stimulus(str(stim_name)),
                         "n_positions": int(valid.sum()),
@@ -1296,10 +1563,13 @@ def analyze_sequence_dynamics(
 
             summary_rows.append(
                 {
-                    "session_id": meta.get("session_id"),
-                    "subject_id": meta.get("subject_id"),
+                    "session_id": session_id_meta,
+                    "subject_id": subject_id_meta,
                     "dmd": dmd_name,
-                    "synapse_id": str(syn_id),
+                    "synapse_id": syn_id,
+                    "response_class": response_class,
+                    "activation_median_delta_auc": median_delta_auc,
+                    "activation_mean_delta_auc": mean_delta_auc,
                     "n_images_with_sequences": int(slopes.size),
                     "median_seq_slope": median_overall,
                     "median_overall_slope": median_overall,
@@ -1326,6 +1596,7 @@ def analyze_sequence_dynamics(
     per_image_df = pd.DataFrame(per_image_rows)
     summary_df = pd.DataFrame(summary_rows)
 
+    rank_cols = ["image_selectivity_score", "ranking_score", "image_rank_within_synapse", "rank_basis", "is_preferred_ranked_image"]
     if not rank_df.empty:
         if not per_image_df.empty:
             per_image_df = per_image_df.merge(
@@ -1339,6 +1610,15 @@ def analyze_sequence_dynamics(
                 on=["session_id", "dmd", "synapse_id", "stimulus_name", "stimulus_label"],
                 how="left",
             )
+
+    for df in [position_df, per_image_df]:
+        if df.empty:
+            for col in rank_cols:
+                df[col] = pd.Series(dtype=float if col != "rank_basis" else object)
+        else:
+            for col in rank_cols:
+                if col not in df.columns:
+                    df[col] = np.nan if col != "rank_basis" else None
 
     if not summary_df.empty:
         summary_df["seq_q"] = _bh_fdr(summary_df["seq_p"])

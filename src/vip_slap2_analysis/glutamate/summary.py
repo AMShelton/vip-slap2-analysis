@@ -611,6 +611,216 @@ class GlutamateSummary:
             return int(sorted(shape)[-2])  # usually rois
         return 0
 
+    def _ref_trial_shape_traces(
+        self,
+        dmd: int,
+        signal: str = "dF",
+        mode: str = "ls",
+        channels: ChannelSpec = None,
+        roi_inds: Optional[Sequence[int]] = None,
+        t_slice: Optional[slice] = None,
+        drop_discarded: bool = False,
+        dtype: Optional[np.dtype] = None,
+        force_n_channels: Optional[int] = None,
+        pad_value: float = np.nan,
+        drop_nan_channels: bool = False,
+    ) -> Tuple[int, int, int]:
+        """
+        Determine (T, n_rois, n_channels) from the first readable valid synapse trial.
+        """
+        dmd0 = dmd - 1
+        keep = np.asarray(self.keep_trials[dmd0], dtype=bool)
+        valid_trials = np.flatnonzero(keep)
+
+        if valid_trials.size == 0:
+            raise ValueError(f"No valid trials found for dmd={dmd}")
+
+        last_err: Optional[Exception] = None
+
+        for t0 in valid_trials:
+            try:
+                x = self.get_traces(
+                    dmd=dmd,
+                    trial=int(t0) + 1,
+                    signal=signal,
+                    mode=mode,
+                    channels=channels,
+                    t_slice=t_slice,
+                    roi_inds=roi_inds,
+                    drop_discarded=drop_discarded,
+                    dtype=dtype,
+                    force_n_channels=force_n_channels,
+                    pad_value=pad_value,
+                    drop_nan_channels=drop_nan_channels,
+                    squeeze_channels=False,
+                )
+                x = np.asarray(x)
+
+                if x.ndim == 2:
+                    return int(x.shape[0]), int(x.shape[1]), 1
+                if x.ndim == 3:
+                    return int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+
+            except Exception as e:
+                last_err = e
+                continue
+
+        msg = f"No readable synapse trace matrices found for dmd={dmd}, signal={signal}, mode={mode}."
+        if last_err is not None:
+            msg += f" Last error: {repr(last_err)}"
+        raise ValueError(msg)
+
+
+    def get_traces_all_trials(
+        self,
+        dmd: int = 1,
+        signal: str = "dF",
+        mode: str = "ls",
+        channels: ChannelSpec = None,
+        t_slice: Optional[slice] = None,
+        roi_inds: Optional[Sequence[int]] = None,
+        include_invalid: bool = True,
+        pad_to: Literal["ref", "max_valid", "none"] = "ref",
+        drop_discarded: bool = False,
+        dtype: Optional[np.dtype] = None,
+        force_n_channels: Optional[int] = None,
+        pad_value: float = np.nan,
+        drop_nan_channels: bool = False,
+        squeeze_channels: bool = False,
+    ) -> Union[np.ndarray, List[Optional[np.ndarray]]]:
+        """
+        Load synapse/source traces across all trials.
+
+        Returns
+        -------
+        If pad_to != 'none':
+            ndarray of shape (n_trials, Tpad, n_rois, n_channels)
+            or (n_trials, Tpad, n_rois) if squeeze_channels=True and n_channels==1
+
+        If pad_to == 'none':
+            list of per-trial arrays, with invalid trials left as None when
+            include_invalid=False or as all-NaN arrays when include_invalid=True.
+        """
+        T_ref, n_rois_ref, n_ch_ref = self._ref_trial_shape_traces(
+            dmd=dmd,
+            signal=signal,
+            mode=mode,
+            channels=channels,
+            roi_inds=roi_inds,
+            t_slice=t_slice,
+            drop_discarded=drop_discarded,
+            dtype=dtype,
+            force_n_channels=force_n_channels,
+            pad_value=pad_value,
+            drop_nan_channels=drop_nan_channels,
+        )
+
+        if force_n_channels is not None:
+            n_ch_ref = force_n_channels
+
+        if pad_to == "ref":
+            Tpad = T_ref
+        elif pad_to == "max_valid":
+            Ts: List[int] = []
+            for tr in range(1, self.n_trials + 1):
+                if self.keep_trials[dmd - 1, tr - 1]:
+                    x = self.get_traces(
+                        dmd=dmd,
+                        trial=tr,
+                        signal=signal,
+                        mode=mode,
+                        channels=channels,
+                        t_slice=t_slice,
+                        roi_inds=roi_inds,
+                        drop_discarded=drop_discarded,
+                        dtype=dtype,
+                        force_n_channels=force_n_channels,
+                        pad_value=pad_value,
+                        drop_nan_channels=drop_nan_channels,
+                        squeeze_channels=False,
+                    )
+                    Ts.append(int(np.asarray(x).shape[0]))
+            Tpad = max(Ts) if Ts else T_ref
+        elif pad_to == "none":
+            Tpad = -1
+        else:
+            raise ValueError(f"pad_to must be 'ref', 'max_valid', or 'none'. Got: {pad_to}")
+
+        if pad_to == "none":
+            out_list: List[Optional[np.ndarray]] = [None] * self.n_trials
+        else:
+            out = np.full(
+                (self.n_trials, Tpad, n_rois_ref, n_ch_ref),
+                pad_value,
+                dtype=(dtype if dtype is not None else float),
+            )
+
+        for tr in range(1, self.n_trials + 1):
+            valid = bool(self.keep_trials[dmd - 1, tr - 1])
+
+            if not valid:
+                if not include_invalid:
+                    if pad_to != "none":
+                        raise ValueError("include_invalid=False requires pad_to='none'.")
+                    continue
+                # leave NaN block in place
+                continue
+
+            x = self.get_traces(
+                dmd=dmd,
+                trial=tr,
+                signal=signal,
+                mode=mode,
+                channels=channels,
+                t_slice=t_slice,
+                roi_inds=roi_inds,
+                drop_discarded=drop_discarded,
+                dtype=dtype,
+                force_n_channels=force_n_channels,
+                pad_value=pad_value,
+                drop_nan_channels=drop_nan_channels,
+                squeeze_channels=False,
+            )
+            x = np.asarray(x)
+
+            if x.ndim == 2:
+                x = x[:, :, None]
+
+            if pad_to == "none":
+                if include_invalid:
+                    out_list[tr - 1] = x
+                else:
+                    out_list[tr - 1] = x
+            else:
+                tcopy = min(Tpad, x.shape[0])
+                rcopy = min(n_rois_ref, x.shape[1])
+                ccopy = min(n_ch_ref, x.shape[2])
+                out[tr - 1, :tcopy, :rcopy, :ccopy] = x[:tcopy, :rcopy, :ccopy]
+
+        if pad_to == "none":
+            if include_invalid:
+                # replace remaining None with NaN blocks
+                for i in range(self.n_trials):
+                    if out_list[i] is None:
+                        out_list[i] = np.full((T_ref, n_rois_ref, n_ch_ref), pad_value, dtype=float)
+
+            if squeeze_channels:
+                squeezed = []
+                for x in out_list:
+                    if x is None:
+                        squeezed.append(None)
+                    elif x.ndim == 3 and x.shape[2] == 1:
+                        squeezed.append(x[:, :, 0])
+                    else:
+                        squeezed.append(x)
+                return squeezed
+            return out_list
+
+        if squeeze_channels and out.shape[3] == 1:
+            out = out[:, :, :, 0]
+
+        return out
+
     def _normalize_raw_to_time_roi_ch(
         self,
         raw: np.ndarray,
@@ -697,7 +907,6 @@ class GlutamateSummary:
         if frame_lines is not None and frame_lines.size > 0:
             n_time = int(frame_lines.size)
 
-        # Identify a plausible time axis in native ds
         def find_time_axis() -> Optional[int]:
             if n_time is None:
                 return None
@@ -707,16 +916,12 @@ class GlutamateSummary:
             return None
 
         time_ax = find_time_axis()
-
-        # Identify channel axis candidates in native ds
-        ch_axes = [ax for ax, s in enumerate(shape) if s == n_channels] if n_channels > 1 else []
         ch_ax = None
-        # Identify channel axis candidates in native ds
-        ch_axes = [ax for ax, s in enumerate(shape) if s == n_channels] if n_channels > 1 else []
-        ch_ax = None
+        roi_ax = None
 
         if ndim == 3:
-            # 1) Prefer an axis that matches the STRUCTURAL channel count (e.g. 2)
+            ch_axes = [ax for ax, s in enumerate(shape) if s == n_channels] if n_channels > 1 else []
+
             if ch_axes:
                 if time_ax is not None:
                     cand = [ax for ax in ch_axes if ax != time_ax]
@@ -724,30 +929,46 @@ class GlutamateSummary:
                 else:
                     ch_ax = ch_axes[0]
 
-            # 2) Only if we couldn't find that, fall back to len(channels)
-            #    (dangerous when len(channels)==1 and ROI axis is also 1)
-            if ch_ax is None and channels is not None and len(channels) != 1:
+            if ch_ax is None and channels is not None and len(channels) > 1:
                 for ax, s in enumerate(shape):
                     if s == len(channels):
                         ch_ax = ax
                         break
 
-            # 3) Last resort: pick a singleton axis
             if ch_ax is None:
                 ones = [ax for ax, s in enumerate(shape) if s == 1]
                 ch_ax = ones[0] if ones else None
 
-                if time_ax is None:
-                    axes = list(range(ndim))
-                    if ch_ax is not None and ch_ax in axes:
-                        axes.remove(ch_ax)
-                    time_ax = max(axes, key=lambda ax: shape[ax])
+            if time_ax is None:
+                axes = list(range(ndim))
+                if ch_ax is not None and ch_ax in axes:
+                    axes.remove(ch_ax)
+                time_ax = max(axes, key=lambda ax: shape[ax])
 
-                if ndim == 2:
-                    roi_ax = 1 - time_ax
+            remaining = [ax for ax in range(3) if ax not in (time_ax, ch_ax)]
+            if len(remaining) != 1:
+                raise ValueError(
+                    f"Could not infer roi axis for dataset shape {shape}; "
+                    f"time_ax={time_ax}, ch_ax={ch_ax}"
+                )
+            roi_ax = remaining[0]
+
+        elif ndim == 2:
+            if time_ax is None:
+                if n_time is not None:
+                    if shape[0] == n_time:
+                        time_ax = 0
+                    elif shape[1] == n_time:
+                        time_ax = 1
+                    else:
+                        time_ax = 0 if shape[0] >= shape[1] else 1
                 else:
-                    remaining = [ax for ax in range(3) if ax not in (time_ax, ch_ax)]
-                    roi_ax = remaining[0] if remaining else (0 if time_ax != 0 else 1)
+                    time_ax = 0 if shape[0] >= shape[1] else 1
+            roi_ax = 1 - time_ax
+            ch_ax = None
+
+        else:
+            raise ValueError(f"Expected 2D or 3D trace dataset, got shape {shape}")
 
         sel = [slice(None)] * ndim
         if t_slice is not None:
@@ -758,7 +979,12 @@ class GlutamateSummary:
             sel[ch_ax] = channels.tolist()
 
         raw = np.asarray(ds[tuple(sel)])
-        return self._normalize_raw_to_time_roi_ch(raw, n_channels=n_channels, channels=channels, n_time=n_time)
+        return self._normalize_raw_to_time_roi_ch(
+            raw,
+            n_channels=n_channels,
+            channels=channels,
+            n_time=n_time,
+        )
 
     @staticmethod
     def _squeeze_channels(x: np.ndarray, squeeze_channels: bool) -> np.ndarray:
