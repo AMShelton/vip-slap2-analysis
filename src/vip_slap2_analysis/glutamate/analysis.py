@@ -253,6 +253,13 @@ def _rolling_nanmean_1d(x: np.ndarray, window: int) -> np.ndarray:
 
 
 def _peak_window_response(trace: np.ndarray, pre: tuple[int, int], post: tuple[int, int], peak_window_samples: int) -> float:
+    """Return a mean-based response metric using the same number of post samples.
+
+    Historically this helper used the maximum rolling mean within the post window,
+    which biased sparse late-sequence positions upward. We now keep the exact same
+    ``peak_window_samples`` parameter but compute the mean of the first
+    ``peak_window_samples`` post-stimulus samples instead of a peak statistic.
+    """
     trace = np.asarray(trace, dtype=float)
     if trace.ndim != 1:
         raise ValueError("_peak_window_response expects a 1D trace.")
@@ -261,10 +268,13 @@ def _peak_window_response(trace: np.ndarray, pre: tuple[int, int], post: tuple[i
     baseline = float(np.nanmean(pre_seg)) if pre_seg.size else np.nan
     if not np.isfinite(baseline) or post_seg.size == 0:
         return np.nan
-    peak_mean = _rolling_nanmean_1d(post_seg, peak_window_samples)
-    if peak_mean.size == 0 or not np.any(np.isfinite(peak_mean)):
+
+    n = int(max(1, min(int(peak_window_samples), int(post_seg.size))))
+    response_seg = post_seg[:n]
+    response_mean = float(np.nanmean(response_seg)) if response_seg.size else np.nan
+    if not np.isfinite(response_mean):
         return np.nan
-    return float(np.nanmax(peak_mean) - baseline)
+    return float(response_mean - baseline)
 
 
 def _sequence_metric_from_mean(
