@@ -47,14 +47,14 @@ class GlutamateAnalysisConfig:
     sequence_peak_window_samples: int = 10
     sequence_n_quantile_bins: int = 3
     sequence_min_count_per_position: int = 1
-    sequence_label_slope_frac: float = 0.35
-    sequence_label_min_abs_slope: float = 25.0
+    sequence_label_slope_frac: float = 0.15
+    sequence_label_min_abs_slope: float = 5.0
     tuning_min_effect_fve: float = 0.05
     tuning_fve_mode: str = "trace"  # {"trace", "time_avg", "delta_auc"}
     tuning_fve_amplitude_func: str = "mean"  # {"mean", "max", "sum", "top10"} for time-averaged FVE
     tuning_fve_sample_slice: tuple[int, int] = (50, 100)
     tuning_response_classes: tuple[str, ...] = ("activated",)
-    tuning_method: str = "hybrid"  # {"fve", "manova", "hybrid"}
+    tuning_method: str = "fve"  # {"fve", "manova", "hybrid"}
     manova_stat: str = "Wilks' lambda"
     manova_max_timepoints: int = 20
     manova_use_post_only: bool = False
@@ -64,6 +64,13 @@ class GlutamateAnalysisConfig:
     sequence_rank_by: str = "hybrid_preference"   # {"hybrid_preference", "selectivity_score", "response_amplitude"}
     sequence_norm_strategy: str = "r0_abs"        # {"r0_abs", "max_abs", "none"}
     sequence_response_classes: tuple[str, ...] | None = None  # None => include all image synapses
+    sequence_slope_method: str = "binned_peak"    # {"binned_peak", "notebook_mean"}
+    sequence_notebook_use_quantiles: bool = False
+    sequence_notebook_n_quantiles: int = 4
+    sequence_sampling_rate_hz: float = 200.0
+    sequence_flash_start_offset_s: float = 0.25
+    sequence_flash_duration_s: float = 0.25
+    sequence_gray_duration_s: float = 0.5
 
 
 @dataclass
@@ -253,13 +260,6 @@ def _rolling_nanmean_1d(x: np.ndarray, window: int) -> np.ndarray:
 
 
 def _peak_window_response(trace: np.ndarray, pre: tuple[int, int], post: tuple[int, int], peak_window_samples: int) -> float:
-    """Return a mean-based response metric using the same number of post samples.
-
-    Historically this helper used the maximum rolling mean within the post window,
-    which biased sparse late-sequence positions upward. We now keep the exact same
-    ``peak_window_samples`` parameter but compute the mean of the first
-    ``peak_window_samples`` post-stimulus samples instead of a peak statistic.
-    """
     trace = np.asarray(trace, dtype=float)
     if trace.ndim != 1:
         raise ValueError("_peak_window_response expects a 1D trace.")
@@ -268,13 +268,10 @@ def _peak_window_response(trace: np.ndarray, pre: tuple[int, int], post: tuple[i
     baseline = float(np.nanmean(pre_seg)) if pre_seg.size else np.nan
     if not np.isfinite(baseline) or post_seg.size == 0:
         return np.nan
-
-    n = int(max(1, min(int(peak_window_samples), int(post_seg.size))))
-    response_seg = post_seg[:n]
-    response_mean = float(np.nanmean(response_seg)) if response_seg.size else np.nan
-    if not np.isfinite(response_mean):
+    peak_mean = _rolling_nanmean_1d(post_seg, peak_window_samples)
+    if peak_mean.size == 0 or not np.any(np.isfinite(peak_mean)):
         return np.nan
-    return float(response_mean - baseline)
+    return float(np.nanmax(peak_mean) - baseline)
 
 
 def _sequence_metric_from_mean(
@@ -290,6 +287,39 @@ def _sequence_metric_from_mean(
     for idx in np.ndindex(mean_traces.shape[:-1]):
         out[idx] = _peak_window_response(mean_traces[idx], pre=pre, post=post, peak_window_samples=peak_window_samples)
     return out
+
+
+def _sequence_response_metric_from_mean(
+    mean_traces: np.ndarray,
+    *,
+    config: GlutamateAnalysisConfig,
+) -> np.ndarray:
+    method = str(config.sequence_slope_method).lower()
+    mean_traces = np.asarray(mean_traces, dtype=float)
+    if method == "binned_peak":
+        return _sequence_metric_from_mean(
+            mean_traces,
+            pre=config.sequence_pre_samples,
+            post=config.sequence_post_samples,
+            peak_window_samples=config.sequence_peak_window_samples,
+        )
+    if method == "notebook_mean":
+        if mean_traces.ndim == 1:
+            return np.array([float(np.nanmean(mean_traces))], dtype=float)
+        return np.nanmean(mean_traces, axis=-1)
+    raise ValueError(
+        f"Unknown sequence_slope_method: {config.sequence_slope_method!r}. Use 'binned_peak' or 'notebook_mean'."
+    )
+
+
+def _sequence_time_midpoints_s(
+    positions: np.ndarray,
+    *,
+    config: GlutamateAnalysisConfig,
+) -> np.ndarray:
+    positions = np.asarray(positions, dtype=float)
+    cycle_dur = float(config.sequence_flash_duration_s) + float(config.sequence_gray_duration_s)
+    return float(config.sequence_flash_start_offset_s) + 0.5 * float(config.sequence_flash_duration_s) + positions * cycle_dur
 
 
 def build_event_response_table(
@@ -1157,6 +1187,107 @@ def _summarize_binned_sequence(
     return binned_df, overall_slope, overall_slope_norm, early_slope, late_slope, early_mean, late_mean
 
 
+def _summarize_sequence_profile(
+    *,
+    positions: np.ndarray,
+    responses: np.ndarray,
+    responses_norm: np.ndarray,
+    counts: np.ndarray,
+    config: GlutamateAnalysisConfig,
+) -> tuple[pd.DataFrame, np.ndarray, float, float, float, float, float, float, str]:
+    method = str(config.sequence_slope_method).lower()
+    positions = np.asarray(positions, dtype=float)
+    responses = np.asarray(responses, dtype=float)
+    responses_norm = np.asarray(responses_norm, dtype=float)
+    counts = np.asarray(counts, dtype=float)
+
+    if method == "binned_peak":
+        binned_df, overall_slope, overall_slope_norm, early_slope, late_slope, early_mean, late_mean = _summarize_binned_sequence(
+            positions=positions,
+            responses=responses,
+            responses_norm=responses_norm,
+            counts=counts,
+            n_bins=config.sequence_n_quantile_bins,
+        )
+        raw_bin_ids = _assign_quantile_bins(positions, n_bins=config.sequence_n_quantile_bins)
+        return (
+            binned_df,
+            raw_bin_ids,
+            overall_slope,
+            overall_slope_norm,
+            early_slope,
+            late_slope,
+            early_mean,
+            late_mean,
+            "sequence_position",
+        )
+
+    if method != "notebook_mean":
+        raise ValueError(
+            f"Unknown sequence_slope_method: {config.sequence_slope_method!r}. Use 'binned_peak' or 'notebook_mean'."
+        )
+
+    x = _sequence_time_midpoints_s(positions, config=config)
+    if responses_norm.shape != responses.shape:
+        responses_norm = np.full_like(responses, np.nan, dtype=float)
+
+    keep = np.isfinite(x) & np.isfinite(responses) & np.isfinite(counts)
+    x = x[keep]
+    responses = responses[keep]
+    responses_norm = responses_norm[keep]
+    counts = counts[keep]
+    if x.size < 2:
+        empty = pd.DataFrame(columns=[
+            "bin_index", "epoch_label", "position_center",
+            "response_amplitude", "response_amplitude_norm", "counts",
+        ])
+        return empty, np.array([], dtype=int), np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, "time_s"
+
+    if config.sequence_notebook_use_quantiles:
+        bin_ids = _assign_quantile_bins(np.arange(x.size, dtype=float), n_bins=config.sequence_notebook_n_quantiles)
+        rows: list[dict[str, Any]] = []
+        n_fit_bins = int(np.nanmax(bin_ids) + 1) if bin_ids.size else 0
+        for bin_index in np.unique(bin_ids):
+            mask = bin_ids == bin_index
+            rows.append({
+                "bin_index": int(bin_index),
+                "epoch_label": _epoch_label_from_bin(int(bin_index), n_fit_bins),
+                "position_center": float(np.nanmean(x[mask])),
+                "response_amplitude": float(np.nanmean(responses[mask])),
+                "response_amplitude_norm": float(np.nanmean(responses_norm[mask])) if np.any(np.isfinite(responses_norm[mask])) else np.nan,
+                "counts": float(np.nansum(counts[mask])),
+            })
+        fit_df = pd.DataFrame(rows).sort_values("bin_index").reset_index(drop=True)
+        raw_bin_ids = bin_ids
+    else:
+        n_points = x.size
+        fit_df = pd.DataFrame({
+            "bin_index": np.arange(n_points, dtype=int),
+            "epoch_label": [_epoch_label_from_bin(i, n_points) for i in range(n_points)],
+            "position_center": x,
+            "response_amplitude": responses,
+            "response_amplitude_norm": responses_norm,
+            "counts": counts,
+        })
+        raw_bin_ids = np.arange(n_points, dtype=int)
+
+    if fit_df.empty or len(fit_df) < 2:
+        return fit_df, raw_bin_ids, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, "time_s"
+
+    fit_x = fit_df["position_center"].to_numpy(dtype=float)
+    fit_y = fit_df["response_amplitude"].to_numpy(dtype=float)
+    fit_yn = fit_df["response_amplitude_norm"].to_numpy(dtype=float)
+
+    overall_slope = _safe_polyfit_slope(fit_x, fit_y)
+    overall_slope_norm = _safe_polyfit_slope(fit_x, fit_yn)
+    early_slope = _safe_polyfit_slope(fit_x[:2], fit_y[:2])
+    late_slope = _safe_polyfit_slope(fit_x[-2:], fit_y[-2:])
+    early_mean = float(fit_y[0]) if fit_y.size else np.nan
+    late_mean = float(fit_y[-1]) if fit_y.size else np.nan
+
+    return fit_df, raw_bin_ids, overall_slope, overall_slope_norm, early_slope, late_slope, early_mean, late_mean, "time_s"
+
+
 def _normalize_sequence_responses(
     responses: np.ndarray,
     *,
@@ -1359,11 +1490,9 @@ def analyze_sequence_dynamics(
                 positions = np.asarray(repeated["positions"], dtype=float)
                 counts = np.asarray(repeated["counts"], dtype=float)
 
-                repeated_resp = _sequence_metric_from_mean(
+                repeated_resp = _sequence_response_metric_from_mean(
                     repeated_mean,
-                    pre=config.sequence_pre_samples,
-                    post=config.sequence_post_samples,
-                    peak_window_samples=config.sequence_peak_window_samples,
+                    config=config,
                 )
 
                 valid = (
@@ -1395,18 +1524,20 @@ def analyze_sequence_dynamics(
 
                 (
                     binned_df,
+                    raw_bin_ids,
                     overall_slope,
                     overall_slope_norm,
                     early_slope,
                     late_slope,
                     early_mean,
                     late_mean,
-                ) = _summarize_binned_sequence(
+                    slope_x_units,
+                ) = _summarize_sequence_profile(
                     positions=pos_valid,
                     responses=resp_valid,
                     responses_norm=resp_norm,
                     counts=counts_valid,
-                    n_bins=config.sequence_n_quantile_bins,
+                    config=config,
                 )
                 if binned_df.empty:
                     continue
@@ -1415,11 +1546,9 @@ def analyze_sequence_dynamics(
 
                 terminal_mean = np.asarray(seq_data["terminal"]["mean"], dtype=float)[syn_idx, :]
                 rterminal = float(
-                    _sequence_metric_from_mean(
+                    _sequence_response_metric_from_mean(
                         terminal_mean,
-                        pre=config.sequence_pre_samples,
-                        post=config.sequence_post_samples,
-                        peak_window_samples=config.sequence_peak_window_samples,
+                        config=config,
                     )[0]
                 )
                 terminal_jump = float(rterminal - rlast)
@@ -1452,8 +1581,6 @@ def analyze_sequence_dynamics(
                     }
                     for _, row in binned_df.iterrows()
                 }
-                raw_bin_ids = _assign_quantile_bins(pos_valid, n_bins=config.sequence_n_quantile_bins)
-
                 for p, rv, rvn, c, bin_idx in zip(pos_valid, resp_valid, resp_norm, counts_valid, raw_bin_ids):
                     info = bin_lookup.get(int(bin_idx), {})
                     position_rows.append(
@@ -1475,6 +1602,8 @@ def analyze_sequence_dynamics(
                             "response_amplitude_norm": float(rvn) if np.isfinite(rvn) else np.nan,
                             "delta_from_r0": float(rv - r0),
                             "r0": r0,
+                            "sequence_slope_method": str(config.sequence_slope_method).lower(),
+                            "sequence_fit_x_units": slope_x_units,
                             "sequence_slope": overall_slope,
                             "sequence_slope_norm": overall_slope_norm,
                             "overall_slope": overall_slope,
@@ -1515,6 +1644,8 @@ def analyze_sequence_dynamics(
                         "response_amplitude_norm": float(terminal_norm) if np.isfinite(terminal_norm) else np.nan,
                         "delta_from_r0": float(rterminal - r0),
                         "r0": r0,
+                        "sequence_slope_method": str(config.sequence_slope_method).lower(),
+                        "sequence_fit_x_units": slope_x_units,
                         "sequence_slope": overall_slope,
                         "sequence_slope_norm": overall_slope_norm,
                         "overall_slope": overall_slope,
@@ -1552,6 +1683,8 @@ def analyze_sequence_dynamics(
                         "late_mean": late_mean,
                         "early_minus_late": float(early_mean - late_mean),
                         "adaptation_index": adaptation_idx,
+                        "sequence_slope_method": str(config.sequence_slope_method).lower(),
+                        "sequence_fit_x_units": slope_x_units,
                         "sequence_slope": overall_slope,
                         "sequence_slope_norm": overall_slope_norm,
                         "overall_slope": overall_slope,
@@ -1591,6 +1724,8 @@ def analyze_sequence_dynamics(
                     "median_rterminal": float(np.nanmedian(image_rterminal)),
                     "median_terminal_minus_last": float(np.nanmedian(image_terminal_jump)),
                     "median_early_minus_late": float(np.nanmedian(image_early_minus_late)),
+                    "sequence_slope_method": str(config.sequence_slope_method).lower(),
+                    "sequence_fit_x_units": ("sequence_position" if str(config.sequence_slope_method).lower() == "binned_peak" else "time_s"),
                     "seq_p": p_slope,
                     "sequence_class": _classify_sequence_pattern(
                         early_slope=median_early,
