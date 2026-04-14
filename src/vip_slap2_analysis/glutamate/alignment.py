@@ -409,6 +409,79 @@ def reconstruct_dmd_session_traces(
 # Session-wide alignment
 # -----------------------------------------------------------------------------
 
+def _resolve_bundle_timebase(bundle) -> Tuple[np.ndarray, np.ndarray, float, Optional[np.ndarray]]:
+    """
+    Return traces, a nominal session start, and an optional explicit sample timebase.
+
+    If an explicit per-sample timebase is present and valid, downstream alignment
+    should use it instead of assuming onset->sample conversion is exactly
+    (t - session_start) * fs.
+    """
+    if isinstance(bundle, dict):
+        traces = np.asarray(bundle["traces"], dtype=float)
+        session_start_sec = float(bundle.get("session_start_sec", np.nan))
+        tb = bundle.get("timebase_sec", None)
+    else:
+        traces = np.asarray(bundle.traces, dtype=float)
+        session_start_sec = float(getattr(bundle, "session_start_sec", np.nan))
+        tb = getattr(bundle, "timebase_sec", None)
+
+    timebase_sec: Optional[np.ndarray]
+    if tb is None:
+        timebase_sec = None
+    else:
+        timebase_sec = np.asarray(tb, dtype=float).reshape(-1)
+        if (
+            traces.ndim != 2
+            or timebase_sec.ndim != 1
+            or timebase_sec.size != traces.shape[1]
+            or timebase_sec.size == 0
+            or not np.all(np.isfinite(timebase_sec))
+            or np.any(np.diff(timebase_sec) <= 0)
+        ):
+            timebase_sec = None
+
+    if not np.isfinite(session_start_sec):
+        if timebase_sec is not None and timebase_sec.size:
+            session_start_sec = float(timebase_sec[0])
+        else:
+            session_start_sec = 0.0
+
+    return traces, np.asarray([session_start_sec], dtype=float), session_start_sec, timebase_sec
+
+
+def _nearest_sample_index(
+    onset_sec: float,
+    *,
+    session_start_sec: float,
+    im_rate_hz: float,
+    n_total_samples: int,
+    timebase_sec: Optional[np.ndarray] = None,
+) -> int:
+    """
+    Convert an event time to the nearest sample center.
+
+    When a valid explicit sample timebase is available, use nearest-neighbor search
+    on that timebase. Otherwise, fall back to the nominal fixed-rate mapping.
+    """
+    if n_total_samples <= 0:
+        return 0
+
+    if timebase_sec is not None and timebase_sec.size == n_total_samples:
+        idx = int(np.searchsorted(timebase_sec, float(onset_sec), side="left"))
+        if idx <= 0:
+            return 0
+        if idx >= n_total_samples:
+            return n_total_samples - 1
+        prev_idx = idx - 1
+        if abs(float(timebase_sec[idx]) - float(onset_sec)) < abs(float(onset_sec) - float(timebase_sec[prev_idx])):
+            return idx
+        return prev_idx
+
+    center = int(round((float(onset_sec) - float(session_start_sec)) * float(im_rate_hz)))
+    return max(0, min(center, n_total_samples - 1))
+
+
 def align_traces_to_session_intervals(
     bundle,
     stim_times,
@@ -422,20 +495,20 @@ def align_traces_to_session_intervals(
     n_post = int(round(post_time * im_rate_hz))
     n_win = n_pre + n_post
 
-    # support both dataclass bundles and dict bundles
-    if isinstance(bundle, dict):
-        traces = bundle["traces"]
-        session_start_sec = float(bundle["session_start_sec"])
-    else:
-        traces = bundle.traces
-        session_start_sec = float(bundle.session_start_sec)
+    traces, _session_start_arr, session_start_sec, timebase_sec = _resolve_bundle_timebase(bundle)
 
     def _extract_one_list(intervals):
         snippets = []
         kept_onsets = []
 
         for onset, _ in intervals:
-            center = int(round((float(onset) - session_start_sec) * im_rate_hz))
+            center = _nearest_sample_index(
+                float(onset),
+                session_start_sec=session_start_sec,
+                im_rate_hz=im_rate_hz,
+                n_total_samples=traces.shape[1],
+                timebase_sec=timebase_sec,
+            )
             start = center - n_pre
             stop = start + n_win
             if start < 0 or stop > traces.shape[1]:

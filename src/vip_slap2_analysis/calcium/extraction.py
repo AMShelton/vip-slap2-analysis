@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -179,26 +179,32 @@ def _reconstruct_ca_session_traces(
     *,
     im_rate_hz: float,
     epoch_start_sec: float,
+    epoch_end_sec: Optional[float] = None,
     motion_correct: bool = True,
     use_glu: bool = True,
-    max_session_minutes = None
+    max_session_minutes=None,
 ) -> Dict[str, Any]:
     """
-    Reconstruct session-wide soma Ca traces by concatenating all trials in order.
-    Invalid trials are represented as NaN blocks.
+    Reconstruct session-wide soma Ca traces by concatenating processed per-trial
+    calcium traces in trial order.
 
-    Uses:
-        exp.get_processed_soma_ca_all_trials(... )["dff"]
-
-    Expected dff shape from your implementation:
-        (n_trials, n_rois, n_samples)
+    Key differences from the previous implementation:
+      - requests per-trial outputs with ``pad_to="none"`` so valid trials keep
+        their true processed lengths
+      - preserves those true lengths in ``trial_lengths_samples``
+      - fills invalid trials with NaN blocks using the median valid-trial length
+      - optionally warps the per-sample timebase to the measured imaging epoch,
+        which prevents small per-trial rounding errors from accumulating into a
+        noticeable global stimulus lag later in the session
     """
     ca_dict = exp.get_processed_soma_ca_all_trials(
         dmd=dmd,
+        fs_hz=im_rate_hz,
+        pad_to="none",
+        include_invalid=True,
         motion_correct=motion_correct,
         use_glu_as_motion_regressor=use_glu,
-        max_session_minutes = max_session_minutes
-
+        max_session_minutes=max_session_minutes,
     )
 
     if ca_dict is None:
@@ -206,9 +212,15 @@ def _reconstruct_ca_session_traces(
             "traces": np.empty((0, 0), dtype=float),
             "trial_valid_mask": np.zeros((0,), dtype=bool),
             "trial_lengths_samples": np.zeros((0,), dtype=int),
+            "trial_starts_sec": np.zeros((0,), dtype=float),
             "session_start_sec": float(epoch_start_sec),
             "timebase_sec": np.empty((0,), dtype=float),
+            "nominal_timebase_sec": np.empty((0,), dtype=float),
             "reconstructed_duration_sec": 0.0,
+            "nominal_reconstructed_duration_sec": 0.0,
+            "timebase_mode": "empty",
+            "effective_im_rate_hz": float(im_rate_hz),
+            "duration_vs_epoch_error_sec": np.nan,
         }
 
     if "dff" not in ca_dict:
@@ -217,49 +229,164 @@ def _reconstruct_ca_session_traces(
             f"Available keys: {list(ca_dict.keys())}"
         )
 
-    ca = np.asarray(ca_dict["dff"], dtype=float)
+    dff_trials = ca_dict["dff"]
+    if isinstance(dff_trials, np.ndarray):
+        if dff_trials.ndim != 3:
+            raise ValueError(
+                f"Expected Ca dff shape (n_trials, n_rois, n_samples), got {dff_trials.shape}"
+            )
+        trial_list: List[Optional[np.ndarray]] = [np.asarray(dff_trials[i], dtype=float) for i in range(dff_trials.shape[0])]
+    else:
+        trial_list = []
+        for tr in list(dff_trials):
+            if tr is None:
+                trial_list.append(None)
+            else:
+                arr = np.asarray(tr, dtype=float)
+                if arr.ndim != 2:
+                    raise ValueError(
+                        "Expected per-trial processed Ca arrays shaped (n_rois, n_samples); "
+                        f"got {arr.shape}."
+                    )
+                trial_list.append(arr)
 
-    # expected shape: (n_trials, n_rois, n_samples)
-    if ca.ndim != 3:
-        raise ValueError(
-            f"Expected Ca dff shape (n_trials, n_rois, n_samples), got {ca.shape}"
-        )
+    n_trials = len(trial_list)
+    if n_trials == 0:
+        return {
+            "traces": np.empty((0, 0), dtype=float),
+            "trial_valid_mask": np.zeros((0,), dtype=bool),
+            "trial_lengths_samples": np.zeros((0,), dtype=int),
+            "trial_starts_sec": np.zeros((0,), dtype=float),
+            "session_start_sec": float(epoch_start_sec),
+            "timebase_sec": np.empty((0,), dtype=float),
+            "nominal_timebase_sec": np.empty((0,), dtype=float),
+            "reconstructed_duration_sec": 0.0,
+            "nominal_reconstructed_duration_sec": 0.0,
+            "timebase_mode": "empty",
+            "effective_im_rate_hz": float(im_rate_hz),
+            "duration_vs_epoch_error_sec": np.nan,
+        }
 
-    n_trials, n_rois, n_samples = ca.shape
-
-    if n_rois == 0 or n_trials == 0 or n_samples == 0:
+    valid_trials = [arr for arr in trial_list if arr is not None and arr.ndim == 2 and arr.size > 0]
+    if len(valid_trials) == 0:
         return {
             "traces": np.empty((0, 0), dtype=float),
             "trial_valid_mask": np.zeros((n_trials,), dtype=bool),
-            "trial_lengths_samples": np.full((n_trials,), n_samples, dtype=int),
+            "trial_lengths_samples": np.zeros((n_trials,), dtype=int),
+            "trial_starts_sec": np.zeros((n_trials,), dtype=float),
             "session_start_sec": float(epoch_start_sec),
             "timebase_sec": np.empty((0,), dtype=float),
+            "nominal_timebase_sec": np.empty((0,), dtype=float),
             "reconstructed_duration_sec": 0.0,
+            "nominal_reconstructed_duration_sec": 0.0,
+            "timebase_mode": "no_valid_trials",
+            "effective_im_rate_hz": float(im_rate_hz),
+            "duration_vs_epoch_error_sec": np.nan,
         }
 
-    trial_lengths = np.full((n_trials,), n_samples, dtype=int)
-    total_samples = int(np.sum(trial_lengths))
-    traces = np.full((n_rois, total_samples), np.nan, dtype=float)
+    n_rois = int(max(arr.shape[0] for arr in valid_trials))
+    valid_lengths = np.asarray([arr.shape[1] for arr in valid_trials], dtype=int)
+    invalid_fill_length = int(np.median(valid_lengths)) if valid_lengths.size else 0
+
+    trial_lengths = np.zeros((n_trials,), dtype=int)
     trial_valid_mask = np.zeros((n_trials,), dtype=bool)
+    for i, arr in enumerate(trial_list):
+        if arr is None:
+            trial_lengths[i] = invalid_fill_length
+            continue
+        trial_lengths[i] = int(arr.shape[1])
+        trial_valid_mask[i] = np.isfinite(arr).any()
+
+    total_samples = int(np.sum(trial_lengths))
+    if n_rois == 0 or total_samples == 0:
+        return {
+            "traces": np.empty((0, 0), dtype=float),
+            "trial_valid_mask": trial_valid_mask,
+            "trial_lengths_samples": trial_lengths,
+            "trial_starts_sec": np.zeros((n_trials,), dtype=float),
+            "session_start_sec": float(epoch_start_sec),
+            "timebase_sec": np.empty((0,), dtype=float),
+            "nominal_timebase_sec": np.empty((0,), dtype=float),
+            "reconstructed_duration_sec": 0.0,
+            "nominal_reconstructed_duration_sec": 0.0,
+            "timebase_mode": "empty",
+            "effective_im_rate_hz": float(im_rate_hz),
+            "duration_vs_epoch_error_sec": np.nan,
+        }
+
+    traces = np.full((n_rois, total_samples), np.nan, dtype=float)
+    trial_starts_sec = np.zeros((n_trials,), dtype=float)
 
     pos = 0
-    for t in range(n_trials):
-        # block shape: (n_rois, n_samples)
-        block = ca[t, :, :]
-        traces[:, pos:pos + n_samples] = block
-        trial_valid_mask[t] = np.isfinite(block).any()
-        pos += n_samples
+    for i, arr in enumerate(trial_list):
+        L = int(trial_lengths[i])
+        trial_starts_sec[i] = float(epoch_start_sec + pos / float(im_rate_hz))
+        if arr is not None and L > 0:
+            rcopy = min(n_rois, arr.shape[0])
+            tcopy = min(L, arr.shape[1])
+            traces[:rcopy, pos:pos + tcopy] = arr[:rcopy, :tcopy]
+        pos += L
 
-    timebase_sec = epoch_start_sec + np.arange(total_samples, dtype=float) / float(im_rate_hz)
+    nominal_timebase_sec = epoch_start_sec + np.arange(total_samples, dtype=float) / float(im_rate_hz)
+    nominal_span_sec = float((total_samples - 1) / float(im_rate_hz)) if total_samples > 1 else 0.0
+
+    timebase_mode = "nominal_fixed_rate"
+    timebase_sec = nominal_timebase_sec.copy()
+    effective_im_rate_hz = float(im_rate_hz)
+    duration_vs_epoch_error_sec = np.nan
+
+    if epoch_end_sec is not None and np.isfinite(epoch_end_sec) and total_samples > 1:
+        epoch_span_sec = float(epoch_end_sec - epoch_start_sec)
+        if epoch_span_sec > 0:
+            timebase_sec = np.linspace(
+                float(epoch_start_sec),
+                float(epoch_end_sec),
+                int(total_samples),
+                endpoint=True,
+                dtype=float,
+            )
+            timebase_mode = "epoch_warped_linear"
+            effective_im_rate_hz = float((total_samples - 1) / epoch_span_sec)
+            duration_vs_epoch_error_sec = float(nominal_span_sec - epoch_span_sec)
+
+    reconstructed_duration_sec = float(timebase_sec[-1] - timebase_sec[0]) if total_samples > 1 else 0.0
 
     return {
-        "traces": traces,                       # (n_rois, total_samples)
-        "trial_valid_mask": trial_valid_mask,  # (n_trials,)
+        "traces": traces,
+        "trial_valid_mask": trial_valid_mask,
         "trial_lengths_samples": trial_lengths,
+        "trial_starts_sec": trial_starts_sec,
         "session_start_sec": float(epoch_start_sec),
         "timebase_sec": timebase_sec,
-        "reconstructed_duration_sec": float(total_samples / im_rate_hz),
+        "nominal_timebase_sec": nominal_timebase_sec,
+        "reconstructed_duration_sec": reconstructed_duration_sec,
+        "nominal_reconstructed_duration_sec": nominal_span_sec,
+        "timebase_mode": timebase_mode,
+        "effective_im_rate_hz": effective_im_rate_hz,
+        "duration_vs_epoch_error_sec": duration_vs_epoch_error_sec,
     }
+
+
+def _nearest_timebase_index(bundle: Dict[str, Any], onset_sec: float, *, im_rate_hz: float) -> int:
+    traces = np.asarray(bundle["traces"], dtype=float)
+    n_total = int(traces.shape[1]) if traces.ndim == 2 else 0
+    if n_total == 0:
+        return 0
+
+    tb = np.asarray(bundle.get("timebase_sec", []), dtype=float).reshape(-1)
+    if tb.size == n_total and np.all(np.isfinite(tb)) and np.all(np.diff(tb) > 0):
+        idx = int(np.searchsorted(tb, float(onset_sec), side="left"))
+        if idx <= 0:
+            return 0
+        if idx >= n_total:
+            return n_total - 1
+        prev_idx = idx - 1
+        if abs(float(tb[idx]) - float(onset_sec)) < abs(float(onset_sec) - float(tb[prev_idx])):
+            return idx
+        return prev_idx
+
+    center = int(round((float(onset_sec) - float(bundle["session_start_sec"])) * float(im_rate_hz)))
+    return max(0, min(center, n_total - 1))
 
 
 def process_calcium_extraction(
@@ -328,7 +455,7 @@ def process_calcium_extraction(
     tvecs = _time_vectors(windows, im_rate_hz)
 
     base_meta = {
-        "schema_version": "0.1.1",
+        "schema_version": "0.1.2",
         "session_id": asset.session_id,
         "subject_id": int(asset.subject_id),
         "summary_mat": str(asset.summary_mat),
@@ -351,7 +478,7 @@ def process_calcium_extraction(
     seq_pkg: Dict[str, Any] = {"metadata": base_meta, "timebase_sec": {"image": tvecs["image"]}, "DMD1": {}, "DMD2": {}}
 
     meta_out: Dict[str, Any] = {
-        "schema_version": "0.1.1",
+        "schema_version": "0.1.2",
         "session_id": asset.session_id,
         "indicator2": indicator2,
         "motion_correct": bool(motion_correct),
@@ -387,6 +514,7 @@ def process_calcium_extraction(
             dmd=dmd,
             im_rate_hz=im_rate_hz,
             epoch_start_sec=epoch_start_sec,
+            epoch_end_sec=epoch_end_sec,
             motion_correct=motion_correct,
             use_glu=use_glu,
             max_session_minutes=max_session_minutes,
@@ -438,7 +566,7 @@ def process_calcium_extraction(
         ordered_snippets: Dict[int, np.ndarray] = {}
         n_img_time = len(tvecs["image"])
         for evt in ordered_images_f:
-            center = int(round((float(evt.onset) - bundle["session_start_sec"]) * im_rate_hz))
+            center = _nearest_timebase_index(bundle, float(evt.onset), im_rate_hz=im_rate_hz)
             n_pre = int(round(windows.image[0] * im_rate_hz))
             start = center - n_pre
             stop = start + n_img_time
@@ -480,8 +608,11 @@ def process_calcium_extraction(
             "n_trials_valid": int(np.sum(bundle["trial_valid_mask"])),
             "n_trials_invalid": int(np.sum(~bundle["trial_valid_mask"])),
             "trial_lengths_samples": bundle["trial_lengths_samples"].tolist(),
+            "timebase_mode": bundle.get("timebase_mode", "unknown"),
+            "effective_im_rate_hz": float(bundle.get("effective_im_rate_hz", im_rate_hz)),
             "reconstructed_duration_sec": float(bundle["reconstructed_duration_sec"]),
-            "duration_vs_epoch_error_sec": float(bundle["reconstructed_duration_sec"] - epoch_duration_sec),
+            "nominal_reconstructed_duration_sec": float(bundle.get("nominal_reconstructed_duration_sec", bundle["reconstructed_duration_sec"])),
+            "duration_vs_epoch_error_sec": float(bundle.get("duration_vs_epoch_error_sec", np.nan)),
             "n_image_ids_extracted": int(len(image_count_by_id)),
             "image_count_by_id": image_count_by_id,
             "zero_count_image_ids": zero_count_ids,
