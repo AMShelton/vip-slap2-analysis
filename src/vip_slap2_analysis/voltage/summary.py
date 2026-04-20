@@ -1,4 +1,13 @@
 # vip_slap2_analysis/voltage/summary.py
+"""Read MATLAB voltage-summary files and expose ROI traces lazily.
+
+This module provides :class:`VoltageSummary`, a lightweight HDF5/MATLAB v7.3
+reader for voltage-imaging summary files. It supports both the original
+per-DMD/per-trial ``summary/E`` layout and newer flat session-wide trace exports.
+The public API uses 1-indexed DMD and trial arguments to stay consistent with the
+MATLAB pipeline while returning NumPy arrays suitable for downstream Python
+postprocessing and QC.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -36,6 +45,13 @@ class VoltageSummary:
     swap_xy_images: bool = True  # convenience for ref images / masks display orientation
 
     def __post_init__(self) -> None:
+        """Open the MAT file and infer the supported voltage-summary layout.
+
+        The constructor initializes shared session metadata such as number of
+        DMDs, trials, samples, ROI counts, valid-trial masks, and ROI offsets.
+        It does not eagerly load large trace arrays; those remain HDF5-backed
+        until requested by accessor methods.
+        """
         self.file_path = Path(self.file_path)
         self._mat = MatV73File(self.file_path, keep_open=self.keep_open)
 
@@ -58,18 +74,21 @@ class VoltageSummary:
     # ----------------- lifecycle -----------------
 
     def close(self) -> None:
+        """Close the underlying HDF5 file handle."""
         self._mat.close()
 
     # ----------------- structure inference -----------------
 
     @staticmethod
     def _is_ref_dataset(node: object) -> bool:
+        """Return True when ``node`` stores MATLAB-style HDF5 references."""
         return (
             isinstance(node, h5py.Dataset)
             and (node.dtype == h5py.ref_dtype or getattr(node.dtype, "kind", None) == "O")
         )
 
     def _get_info(self) -> None:
+        """Detect summary layout and populate object-level shape metadata."""
         summary = self._mat.f["summary"]
 
         if "E" in summary:
@@ -199,6 +218,7 @@ class VoltageSummary:
     # ----------------- event/trial helpers -----------------
 
     def _E_ref(self, dmd0: int, trial0: int) -> Optional[h5py.Reference]:
+        """Return the HDF5 reference for a zero-indexed DMD/trial pair."""
         if self._summary_layout != "event_trial":
             raise ValueError("summary/E is not present in this file; this is a flat-traces voltage summary.")
 
@@ -219,6 +239,7 @@ class VoltageSummary:
         return ref
 
     def _E_group(self, dmd0: int, trial0: int) -> h5py.Group:
+        """Dereference a zero-indexed DMD/trial entry from ``summary/E``."""
         ref = self._E_ref(dmd0, trial0)
         if ref is None:
             raise ValueError(f"No E ref for dmd={dmd0+1}, trial={trial0+1}")
@@ -261,6 +282,7 @@ class VoltageSummary:
         return out
 
     def _require_trial1_for_flat_summary(self, trial: int) -> None:
+        """Validate flat-trace access, where the whole session is exposed as trial 1."""
         if self._summary_layout == "flat_traces" and trial != 1:
             raise ValueError(
                 "This voltage summary has no per-trial E structure. "
@@ -268,6 +290,7 @@ class VoltageSummary:
             )
 
     def _flat_roi_row_inds(self, dmd: int, roi_inds: Optional[Sequence[int]]) -> np.ndarray:
+        """Map DMD-local ROI indices to rows in the flat session-wide trace matrix."""
         dmd0 = dmd - 1
         if dmd0 < 0 or dmd0 >= self.n_dmds:
             raise IndexError(f"dmd must be in [1, {self.n_dmds}]")

@@ -1,3 +1,10 @@
+"""
+Shared plotting utilities for VIP-SLAP2 figure generation.
+
+This module centralizes the project-level plotting style, color helpers, axis styling,
+and figure-saving behavior used by QC and summary plots.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path

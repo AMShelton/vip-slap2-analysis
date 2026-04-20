@@ -1,3 +1,11 @@
+"""Utilities for SLAP2 helper routines used across analysis notebooks and modules.
+
+This module collects small numerical, plotting, HARP-loading, and package-loading
+helpers that are shared by older notebooks and newer package code. Most functions
+operate on NumPy arrays or pandas objects; the explicitly named loading and saving
+helpers perform file I/O.
+"""
+
 import os
 import glob
 import json
@@ -109,6 +117,23 @@ def normalize_image(image, max_val=None):
 
 def normalize(arr):
     
+    """Scale an array linearly to the unit interval.
+
+    Parameters
+    ----------
+    arr : array-like
+        Numeric input array.
+
+    Returns
+    -------
+    array-like
+        Array after subtracting its minimum and dividing by its range.
+
+    Notes
+    -----
+    This helper preserves the original implementation and does not guard against
+    zero-range input.
+    """
     arr = (arr-np.min(arr))/(np.max(arr)-np.min(arr))
 
     return arr
@@ -153,6 +178,19 @@ def save_figure(fig, fname, formats = ['.pdf'],transparent=False,dpi=300,facecol
 
 def get_HARP_data(harp_path):
     
+    """Load HARP digital-input data and return an acquisition-relative timebase.
+
+    Parameters
+    ----------
+    harp_path : str or pathlib.Path
+        Directory containing HARP binary files readable by ``HarpReader``.
+
+    Returns
+    -------
+    tuple[pandas.DataFrame, numpy.ndarray]
+        Digital input dataframe with a ``time`` column and a zero-referenced acquisition
+        time vector in seconds.
+    """
     harp_handler = HarpReader(harp_path)
     harp_df = harp_handler.reader.DigitalInputState.read()
     harp_df['time']=harp_df.index
@@ -164,6 +202,20 @@ def get_HARP_data(harp_path):
     return harp_df,acq_time
 
 def get_stim_data(harp_dir,behavior_files = ['encoder.pkl','photodiode.pkl','licks.pkl','rewards.pkl']):
+    """Load Bonsai stimulus data and extracted HARP behavior dataframes.
+
+    Parameters
+    ----------
+    harp_dir : str or pathlib.Path
+        Behavior/HARP directory containing a Bonsai CSV and extracted behavior files.
+    behavior_files : list[str]
+        Pickle filenames to load recursively from ``harp_dir``.
+
+    Returns
+    -------
+    tuple[pandas.DataFrame, pandas.DataFrame, pandas.DataFrame, pandas.DataFrame, pandas.DataFrame]
+        Stimulus log plus encoder, photodiode, lick, and reward dataframes.
+    """
     stimulus_df = pd.read_csv(glob.glob(os.path.join(harp_dir,'**.csv'))[0])
     behavior_dfs = []
     for filename in behavior_files:

@@ -1,3 +1,11 @@
+"""Helpers for padding, stacking, and concatenating trial-wise traces.
+
+The functions in this module standardize variable-length trial arrays into
+fixed-shape NumPy stacks while preserving invalid trials as fill-valued rows.
+They are intentionally modality-agnostic and can be reused for soma calcium,
+glutamate, voltage, or other trial-aligned signals represented as
+``(n_signals, time)`` arrays."""
+
 from __future__ import annotations
 
 from typing import Iterable, Sequence
@@ -9,6 +17,18 @@ ArrayLike2D = np.ndarray
 
 
 def infer_max_trial_length(trials: Sequence[ArrayLike2D | None]) -> int:
+    """Infer the maximum valid trial length from a trial sequence.
+
+            Parameters
+            ----------
+            trials
+                Sequence of trial arrays shaped ``(n_signals, time)`` or ``None``
+                for invalid/missing trials.
+
+            Returns
+            -------
+            int
+                Maximum time dimension among non-``None`` trials."""
     lengths = [int(tr.shape[-1]) for tr in trials if tr is not None]
     if not lengths:
         raise ValueError("Could not infer trial length: no non-empty trials were provided.")
@@ -16,6 +36,17 @@ def infer_max_trial_length(trials: Sequence[ArrayLike2D | None]) -> int:
 
 
 def infer_n_signals(trials: Sequence[ArrayLike2D | None]) -> int:
+    """Infer the maximum number of signals across valid trials.
+
+            Parameters
+            ----------
+            trials
+                Sequence of trial arrays shaped ``(n_signals, time)`` or ``None``.
+
+            Returns
+            -------
+            int
+                Maximum first-axis size among non-``None`` trials."""
     counts = [int(tr.shape[0]) for tr in trials if tr is not None]
     if not counts:
         raise ValueError("Could not infer signal count: no non-empty trials were provided.")
@@ -29,6 +60,23 @@ def pad_trial_to_length(
     n_signals: int | None = None,
     fill_value: float = np.nan,
 ) -> ArrayLike2D:
+    """Pad or crop one trial to a fixed signal count and time length.
+
+            Parameters
+            ----------
+            trial
+                Two-dimensional array shaped ``(n_signals, time)``.
+            target_length
+                Output time dimension.
+            n_signals
+                Output number of signals. If omitted, uses the trial's first axis.
+            fill_value
+                Value used to initialize padded entries.
+
+            Returns
+            -------
+            numpy.ndarray
+                Fixed-shape array with shape ``(n_signals, target_length)``."""
     trial = np.asarray(trial, dtype=float)
     if trial.ndim != 2:
         raise ValueError(f"Expected a 2D array shaped (n_signals, time). Got {trial.shape}.")
@@ -91,6 +139,15 @@ def concatenate_trial_stack(trial_stack: ArrayLike2D) -> ArrayLike2D:
 
 
 def trial_lengths(trials: Sequence[ArrayLike2D | None], *, invalid_fill_length: int | None = None) -> list[int | None]:
+    """Return per-trial sample counts with optional invalid-trial fill lengths.
+
+            Parameters
+            ----------
+            trials
+                Sequence of trial arrays or ``None`` placeholders.
+            invalid_fill_length
+                Length to report for invalid trials. If omitted, invalid trials are
+                represented as ``None`` in the returned list."""
     out: list[int | None] = []
     for tr in trials:
         if tr is None:
@@ -101,4 +158,19 @@ def trial_lengths(trials: Sequence[ArrayLike2D | None], *, invalid_fill_length: 
 
 
 def trial_start_times_seconds(n_trials: int, trial_length_samples: int, fs_hz: float) -> np.ndarray:
+    """Compute nominal trial start times for fixed-length trial stacks.
+
+            Parameters
+            ----------
+            n_trials
+                Number of trials.
+            trial_length_samples
+                Fixed number of samples per trial.
+            fs_hz
+                Sampling rate in Hz.
+
+            Returns
+            -------
+            numpy.ndarray
+                Trial onset times in seconds relative to the concatenated trace."""
     return np.arange(int(n_trials), dtype=float) * (float(trial_length_samples) / float(fs_hz))

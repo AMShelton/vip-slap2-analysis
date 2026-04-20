@@ -1,3 +1,11 @@
+"""Command-line utilities for reorganizing SLAP2 session folders.
+
+This module builds and optionally executes a filesystem reorganization plan that
+separates raw acquisition files, processed SLAP2 outputs, behavior files, and
+unclassified backup content. It is designed to support dry-run review before any
+files are moved, producing a TSV report of every planned or executed operation.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -16,6 +24,11 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 @dataclass
 class MoveRecord:
+    """Single planned or executed filesystem move.
+
+    Attributes record the source, destination, routing rationale, high-level category,
+    and current execution status for one file or directory move.
+    """
     src: Path
     dst: Path
     reason: str
@@ -25,6 +38,11 @@ class MoveRecord:
 
 @dataclass
 class SessionNames:
+    """Canonical directory-name components inferred for a SLAP2 session.
+
+    The inferred names define the destination raw, processed, and backup roots used by
+    the reorganization plan.
+    """
     mouse_id: str
     session_stamp: str          # e.g. 826033_2026-02-17_13-13-55
     slap2_stamp: str            # e.g. 2026-02-17_13-13-55 or from slap2_*
@@ -36,6 +54,11 @@ class SessionNames:
 
 @dataclass
 class ReorgPlan:
+    """Container for a proposed SLAP2 session reorganization.
+
+    The plan stores destination roots, planned move records, and non-fatal warnings
+    encountered during path inference or routing.
+    """
     target_session_dir: Path
     raw_root: Path
     processed_root: Path
@@ -44,9 +67,23 @@ class ReorgPlan:
     warnings: List[str] = field(default_factory=list)
 
     def add(self, src: Path, dst: Path, reason: str, category: str) -> None:
+        """Append one move record to the reorganization plan.
+
+        Parameters
+        ----------
+        src : pathlib.Path
+            Existing source path to move.
+        dst : pathlib.Path
+            Planned destination path.
+        reason : str
+            Human-readable routing rationale.
+        category : str
+            High-level destination category, such as ``raw``, ``processed``, or ``backup``.
+        """
         self.records.append(MoveRecord(src=src, dst=dst, reason=reason, category=category))
 
     def planned_sources(self) -> set[Path]:
+        """Return the set of all source paths currently in the plan."""
         return {r.src for r in self.records}
 
 
@@ -174,12 +211,14 @@ def infer_session_names(
 # -----------------------------------------------------------------------------
 
 def iter_immediate_children(path: Path) -> Iterable[Path]:
+    """Return immediate children of a path, or an empty list if missing."""
     if not path.exists():
         return []
     return list(path.iterdir())
 
 
 def safe_relpath(path: Path, start: Path) -> str:
+    """Return ``path`` relative to ``start`` when possible, otherwise absolute text."""
     try:
         return str(path.relative_to(start))
     except Exception:
@@ -187,6 +226,7 @@ def safe_relpath(path: Path, start: Path) -> str:
 
 
 def find_slap2_dirs(target_session_dir: Path) -> List[Path]:
+    """Find candidate ``slap2_*`` acquisition directories under a session tree."""
     matches = []
     imaging_root = target_session_dir / "imaging_data" / "SLAP2_data"
     if imaging_root.exists():
@@ -202,6 +242,7 @@ def find_slap2_dirs(target_session_dir: Path) -> List[Path]:
 
 
 def find_first_existing(paths: Sequence[Path]) -> Optional[Path]:
+    """Return the first existing path from a sequence, or ``None``."""
     for p in paths:
         if p.exists():
             return p
@@ -213,6 +254,10 @@ def find_first_existing(paths: Sequence[Path]) -> Optional[Path]:
 # -----------------------------------------------------------------------------
 
 def ensure_dir(path: Path, execute: bool) -> None:
+    """Create a directory tree only when execution mode is enabled.
+
+    This supports dry-run planning without creating filesystem side effects.
+    """
     if execute:
         path.mkdir(parents=True, exist_ok=True)
 
@@ -356,6 +401,11 @@ def build_reorganization_plan(
     target_manifest_tsv: Optional[Path] = None,
     mouse_id: Optional[str] = None,
 ) -> ReorgPlan:
+    """Build a dry-run reorganization plan for one SLAP2 session directory.
+
+    The function scans the target session tree, classifies known SLAP2, behavior, and
+    metadata content, and stores unmatched items in a backup destination.
+    """
     names = infer_session_names(target_session_dir, example_manifest_tsv, mouse_id=mouse_id)
 
     # New roots live under the parent directory of the current raw session folder
@@ -491,6 +541,11 @@ def build_reorganization_plan(
 # -----------------------------------------------------------------------------
 
 def validate_plan(plan: ReorgPlan) -> List[str]:
+    """Validate a reorganization plan before execution.
+
+    Checks for duplicate sources, duplicate destinations, and moves that would place a
+    destination inside its own source.
+    """
     errors: List[str] = []
 
     # No duplicate sources
@@ -515,6 +570,7 @@ def validate_plan(plan: ReorgPlan) -> List[str]:
     return errors
 
 def find_duplicates(paths: Sequence[Path]) -> List[str]:
+    """Return duplicated path strings from a path sequence."""
     seen: Dict[Path, int] = {}
     dupes: List[str] = []
     for p in paths:
@@ -526,6 +582,7 @@ def find_duplicates(paths: Sequence[Path]) -> List[str]:
 
 
 def create_destination_roots(plan: ReorgPlan, execute: bool) -> None:
+    """Create canonical destination root directories when execution is enabled."""
     roots = [
         plan.raw_root,
         plan.raw_root / "behavior",
@@ -542,6 +599,7 @@ def create_destination_roots(plan: ReorgPlan, execute: bool) -> None:
 
 
 def move_one(src: Path, dst: Path, execute: bool) -> str:
+    """Move one filesystem object, respecting dry-run and overwrite protections."""
     if not src.exists():
         return "MISSING_SOURCE"
 
@@ -557,10 +615,12 @@ def move_one(src: Path, dst: Path, execute: bool) -> str:
 
 
 def execute_plan(plan: ReorgPlan, execute: bool) -> None:
+    """Execute or dry-run all moves in a validated reorganization plan."""
     create_destination_roots(plan, execute=execute)
 
     # Sort deep files before parents to reduce folder-move conflicts
     def sort_key(rec: MoveRecord) -> Tuple[int, int, str]:
+        """Sort deeper paths before shallower paths to reduce move conflicts."""
         depth = len(rec.src.parts)
         is_dir = 0 if rec.src.is_file() else 1
         return (-depth, is_dir, str(rec.src))
@@ -587,6 +647,7 @@ def cleanup_empty_dirs(root: Path, stop_at: Path, execute: bool) -> None:
 
 
 def write_report(plan: ReorgPlan, report_path: Path) -> None:
+    """Write a tab-separated report of planned or executed moves."""
     report_path.parent.mkdir(parents=True, exist_ok=True)
     with report_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, delimiter="\t")
@@ -596,6 +657,7 @@ def write_report(plan: ReorgPlan, report_path: Path) -> None:
 
 
 def summarize_plan(plan: ReorgPlan) -> str:
+    """Format a compact human-readable summary of a reorganization plan."""
     n_raw = sum(r.category == "raw" for r in plan.records)
     n_processed = sum(r.category == "processed" for r in plan.records)
     n_backup = sum(r.category == "backup" for r in plan.records)
@@ -621,6 +683,7 @@ def summarize_plan(plan: ReorgPlan) -> str:
 # -----------------------------------------------------------------------------
 
 def build_argparser() -> argparse.ArgumentParser:
+    """Build the command-line parser for the session reorganization utility."""
     p = argparse.ArgumentParser(
         description=(
             "Reorganize a SLAP2 session directory into raw / processed / remaining-data "
@@ -669,6 +732,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Command-line entry point for dry-running or executing a reorganization plan."""
     args = build_argparser().parse_args()
 
     target_session_dir: Path = args.target_session_dir

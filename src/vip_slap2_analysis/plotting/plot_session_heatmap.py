@@ -1,3 +1,11 @@
+"""
+Session-level and stimulus-locked glutamate heatmap plots.
+
+This module builds concatenated session matrices from SummaryLoCo data, extracts
+stimulus-locked features, computes row sort orders, and renders publication-style
+heatmaps for visual inspection of SLAP2 glutamate data.
+"""
+
 from __future__ import annotations
 
 import os
@@ -49,6 +57,7 @@ DEFAULT_Y_TICK_PARAMS = dict(axis="y", which="major", reset=True, right=False, l
 
 
 def _merge_kwargs(base: Optional[dict], override: Optional[dict]) -> dict:
+    """Merge default keyword arguments with user-provided overrides."""
     out = dict(base or {})
     out.update(override or {})
     return out
@@ -56,6 +65,7 @@ def _merge_kwargs(base: Optional[dict], override: Optional[dict]) -> dict:
 
 
 def _robust_row_zscore(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Robustly z-score each row using the median and MAD scale estimate."""
     x = np.asarray(x, dtype=float)
     med = np.nanmedian(x, axis=1, keepdims=True)
     mad = np.nanmedian(np.abs(x - med), axis=1, keepdims=True)
@@ -66,6 +76,7 @@ def _robust_row_zscore(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
 
 
 def _fill_nan_rowwise(x: np.ndarray, fill_value: str = "median") -> np.ndarray:
+    """Fill NaNs independently within each row using a summary statistic."""
     x = np.asarray(x, dtype=float).copy()
     for i in range(x.shape[0]):
         row = x[i]
@@ -86,6 +97,7 @@ def _fill_nan_rowwise(x: np.ndarray, fill_value: str = "median") -> np.ndarray:
 
 
 def _smooth_rows(x: np.ndarray, sigma_samples: float = 0) -> np.ndarray:
+    """Apply one-dimensional Gaussian smoothing along each row."""
     if sigma_samples is None or sigma_samples <= 0:
         return x
     return gaussian_filter1d(x, sigma=sigma_samples, axis=1, mode="nearest")
@@ -93,6 +105,7 @@ def _smooth_rows(x: np.ndarray, sigma_samples: float = 0) -> np.ndarray:
 
 
 def _compute_dt(tb: Iterable[float]) -> float:
+    """Infer a representative sample interval from a timebase."""
     tb = np.asarray(tb, dtype=float)
     if tb.size >= 2:
         dt = float(np.nanmedian(np.diff(tb)))
@@ -103,6 +116,7 @@ def _compute_dt(tb: Iterable[float]) -> float:
 
 
 def _safe_percentiles(x: np.ndarray, q: Tuple[float, float] = (2, 98)) -> Tuple[float, float]:
+    """Compute robust finite-data percentile limits for plotting."""
     vals = np.asarray(x, dtype=float)
     vals = vals[np.isfinite(vals)]
     if vals.size == 0:
@@ -115,6 +129,7 @@ def _safe_percentiles(x: np.ndarray, q: Tuple[float, float] = (2, 98)) -> Tuple[
 
 
 def _clip_time_window(t: np.ndarray, xlim_sec: Optional[Tuple[float, float]]) -> slice:
+    """Return a slice selecting samples within a requested time window."""
     if xlim_sec is None:
         return slice(None)
     t0, t1 = xlim_sec
@@ -127,6 +142,7 @@ def _clip_time_window(t: np.ndarray, xlim_sec: Optional[Tuple[float, float]]) ->
 
 
 def _short_image_label(name: str, max_len: int = 18) -> str:
+    """Create a compact image label from a stimulus filename."""
     base = os.path.basename(str(name))
     base = base.replace(".tiff", "").replace(".tif", "")
     base = base.replace("stimuliImages_", "")
@@ -137,6 +153,7 @@ def _short_image_label(name: str, max_len: int = 18) -> str:
 
 
 def _build_image_color_map(ordered_images, im_colors):
+    """Assign stable colors to ordered image identities."""
     unique = []
     seen = set()
     for evt in ordered_images:
@@ -153,6 +170,7 @@ def _build_image_color_map(ordered_images, im_colors):
 
 
 def load_stimulus_events(asset) -> Dict[str, Any]:
+    """Load corrected stimulus events and imaging-epoch timing for a session."""
     stim_df = load_corrected_bonsai_csv(asset.bonsai_event_log_csv)
     _, ordered_images = extract_image_intervals(stim_df)
 
@@ -299,6 +317,7 @@ def build_session_glutamate_mats(
     channels: str = "glutamate",
     normalize_rows: Optional[str] = "zscore",
 ):
+    """Build DMD-specific synapse-by-time matrices across the full session."""
     summary = GlutamateSummary(asset.summary_mat)
 
     dmd_mats = {}
@@ -392,6 +411,7 @@ def build_session_glutamate_mats(
 
 
 def _extract_triggered_stack(session_mat, session_t, event_times_rel, t_pre, t_post, dt):
+    """Extract event-triggered synapse traces from a concatenated session matrix."""
     n_syn, n_time = session_mat.shape
     n_pre = int(round(t_pre / dt))
     n_post = int(round(t_post / dt))
@@ -414,6 +434,7 @@ def _extract_triggered_stack(session_mat, session_t, event_times_rel, t_pre, t_p
 
 
 def _baseline_subtract_stack(stack, t_rel, baseline_window=(-0.25, 0.0)):
+    """Subtract a pre-event baseline from an event-triggered trace stack."""
     if stack.size == 0:
         return stack
     mask = (t_rel >= baseline_window[0]) & (t_rel < baseline_window[1])
@@ -436,6 +457,7 @@ def build_stimulus_locked_feature_mats(
     baseline_window: Tuple[float, float] = (-0.25, 0.0),
     smooth_sigma: float = 2.0,
 ):
+    """Compute pooled and per-image stimulus-locked feature matrices."""
     image_names = [evt.image_name for evt in ordered_images]
     unique_images = list(dict.fromkeys(image_names))
     pooled_times = [float(evt.onset) - float(session_start_sec) for evt in ordered_images]
@@ -488,6 +510,7 @@ def build_stimulus_locked_feature_mats(
 
 
 def _sort_rows_by_feature_matrix(feature_mat, metric="correlation", method="average"):
+    """Sort rows by hierarchical clustering on a feature matrix."""
     x = np.asarray(feature_mat, dtype=float)
     if x.shape[0] <= 2:
         return np.arange(x.shape[0]), None
@@ -509,6 +532,7 @@ def _sort_rows_by_feature_matrix(feature_mat, metric="correlation", method="aver
 
 
 def _sort_rows_by_pc1(feature_mat, nan_fill="median"):
+    """Sort rows by their projection onto the first principal component."""
     x = np.asarray(feature_mat, dtype=float)
 
     if x.shape[0] <= 1:
@@ -530,6 +554,7 @@ def _sort_rows_by_pc1(feature_mat, nan_fill="median"):
 
 
 def _sort_rows_by_rastermap(feature_mat: np.ndarray, rastermap_kwargs: Optional[dict] = None):
+    """Sort rows using Rastermap on a NaN-filled feature matrix."""
     try:
         from rastermap import Rastermap
     except ImportError as e:
@@ -573,6 +598,7 @@ def compute_sort_orders(
     feature_smooth_sigma: float = 2.0,
     rastermap_kwargs: Optional[dict] = None,
 ) -> Dict[str, Any]:
+    """Compute per-DMD row orders using the requested sorting basis."""
     dmds = sorted(dmd_mats.keys())
     dmd_order = {}
     dmd_sort_meta = {}
@@ -1003,6 +1029,7 @@ def plot_stimulus_locked_heatmaps(
     cbar_label_kwargs: Optional[dict] = None,
     rastermap_kwargs: Optional[dict] = None,
 ):
+    """Plot pooled and per-image stimulus-locked heatmaps by DMD."""
     summary, dmd_mats, dmd_timebases, dmd_dt = build_session_glutamate_mats(
         asset=asset,
         signal=signal,

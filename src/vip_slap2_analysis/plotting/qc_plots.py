@@ -1,3 +1,10 @@
+"""
+Standard synapse quality-control plotting routines.
+
+The functions in this module generate compact review figures from the synapse-level QC
+table produced by the SLAP2 QC pipeline.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path

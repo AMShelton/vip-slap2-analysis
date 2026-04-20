@@ -1,3 +1,12 @@
+"""Postprocess voltage-summary ROI traces for downstream analysis.
+
+This module currently provides a compact utility for concatenating per-trial
+voltage ROI traces into one 1D signal per ROI while retaining trial-to-session
+slice bookkeeping. It assumes a :class:`vip_slap2_analysis.voltage.summary.VoltageSummary`
+-like object that exposes valid trials, ROI counts, ROI traces, and discard-frame
+masks.
+"""
+
 import numpy as np
 
 def concat_rois_across_trials(vs, dmd: int = 1, drop_discarded: bool = True, dtype=np.float32):

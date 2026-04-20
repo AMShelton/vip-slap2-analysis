@@ -1,3 +1,11 @@
+"""
+Movie loading, preprocessing, and rendering utilities for SLAP2 data.
+
+This module supports memory-conscious loading of page-stacked TIFF files, conversion to
+display-oriented movie arrays, baseline/activity rendering, orientation/cropping
+operations, and writing annotated RGB videos.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -60,19 +68,24 @@ class MovieRenderConfig:
 
 
 def _vprint(verbose: bool, msg: str) -> None:
+    """Print ``msg`` only when verbose logging is enabled."""
     if verbose:
         print(msg)
         
 def _resolve_overlay_fontsize(config: MovieRenderConfig, frame_h: int) -> int:
+    """Resolve an overlay font size scaled to the rendered frame height."""
     return max(config.overlay_fontsize, int(round(0.045 * frame_h)))
 
 def _resolve_overlay_linewidth(config: MovieRenderConfig, frame_h: int, frame_w: int) -> int:
+    """Resolve an overlay line width scaled to the rendered frame size."""
     return max(config.overlay_linewidth, int(round(0.006 * min(frame_h, frame_w))))
 
 def _resolve_overlay_margin(config: MovieRenderConfig, frame_h: int, frame_w: int) -> int:
+    """Resolve an overlay margin scaled to the rendered frame size."""
     return max(config.overlay_margin_px, int(round(0.03 * min(frame_h, frame_w))))
 
 def _progress(verbose: bool, step: int, total: int, msg: str) -> None:
+    """Print a simple text progress bar for long movie-rendering steps."""
     if not verbose:
         return
     bar_len = 24
@@ -82,6 +95,7 @@ def _progress(verbose: bool, step: int, total: int, msg: str) -> None:
 
 
 def inspect_tiff_layout(path: PathLike) -> None:
+    """Print TIFF series, page, and memory-map layout information."""
     path = str(path)
     with tifffile.TiffFile(path) as tf:
         print(f"path: {path}")
@@ -95,6 +109,7 @@ def inspect_tiff_layout(path: PathLike) -> None:
 
 
 def _read_tiff_memmap(path: PathLike, *, verbose: bool = False) -> np.ndarray:
+    """Open a TIFF as a memory-mapped array when possible."""
     path = str(path)
     _vprint(verbose, f"Opening TIFF: {path}")
     try:
@@ -191,6 +206,7 @@ def _time_to_page_range(
     end_frame: int,
     n_channels: int,
 ) -> tuple[int, int]:
+    """Convert time-frame bounds to page bounds for page-stacked TIFFs."""
     return start_frame * n_channels, end_frame * n_channels
 
 
@@ -202,6 +218,7 @@ def _resolve_frame_window(
     start_frame: Optional[int],
     end_frame: Optional[int],
 ) -> tuple[Optional[int], Optional[int]]:
+    """Resolve frame indices from second-based or frame-based window bounds."""
     if start_frame is None and start_s is not None:
         start_frame = int(np.floor(start_s * frame_rate_hz))
     if end_frame is None and end_s is not None:
@@ -365,6 +382,7 @@ def load_slap2_movie_from_tiffs(
     t_min = min(t1, t2)
 
     def _pad_x(arr: np.ndarray, x_target: int, t_target: int) -> np.ndarray:
+        """Pad a DMD movie along x and truncate time to the shared frame count."""
         y, x, c, t = arr.shape
         out = np.full((y, x_target, c, t_target), np.nan, dtype=arr.dtype)
         out[:, :x, :, :] = arr[:, :, :, :t_target]
@@ -379,6 +397,7 @@ def load_slap2_movie_from_tiffs(
 
 
 def _downsample_time_by_2(movie: np.ndarray) -> np.ndarray:
+    """Average adjacent frames to downsample a movie by a factor of two."""
     if movie.ndim != 3:
         raise ValueError(f"Expected (Y, X, T), got {movie.shape}")
 
@@ -392,6 +411,7 @@ def _downsample_time_by_2(movie: np.ndarray) -> np.ndarray:
 
 
 def temporal_downsample(movie: np.ndarray, n_steps: int) -> np.ndarray:
+    """Repeatedly downsample a movie along time by powers of two."""
     out = movie
     for _ in range(n_steps):
         out = _downsample_time_by_2(out)
@@ -399,6 +419,7 @@ def temporal_downsample(movie: np.ndarray, n_steps: int) -> np.ndarray:
 
 
 def _fill_nans_with_mean_image(movie: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fill NaNs with each pixel's temporal mean and flag mostly-NaN pixels."""
     valid_counts = np.sum(~np.isnan(movie), axis=2)
     sum_image = np.nansum(movie, axis=2)
     mean_image = np.divide(
@@ -427,6 +448,7 @@ def _compute_f0_movie_full(
     baseline_window_frames: int,
     butter_order: int = 4,
 ) -> np.ndarray:
+    """Estimate a slowly varying fluorescence baseline using iterative filtering."""
     if movie.ndim != 3:
         raise ValueError(f"Expected (Y, X, T), got {movie.shape}")
 
@@ -464,6 +486,7 @@ def _compute_f0_movie_fast(
     *,
     baseline_window_frames: int,
 ) -> np.ndarray:
+    """Estimate a fluorescence baseline using fast temporal smoothing filters."""
     if movie.ndim != 3:
         raise ValueError(f"Expected (Y, X, T), got {movie.shape}")
 
@@ -478,6 +501,7 @@ def _compute_f0_movie_fast(
 
 
 def _normalize_percentile(arr: np.ndarray, q: float, eps: float = 1e-8) -> np.ndarray:
+    """Normalize an array by a high percentile and clip to the display range."""
     finite = np.isfinite(arr)
     if not np.any(finite):
         return np.zeros_like(arr, dtype=np.float32)
@@ -500,6 +524,7 @@ def _compute_structure_and_activity(
     structure_gaussian_sigma_px: float,
     activity_temporal_sigma_frames: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute normalized structure and activity volumes for RGB rendering."""
     movie_filled, mean_image, setnan = _fill_nans_with_mean_image(movie)
 
     baseline_mode = baseline_mode.lower()
@@ -567,6 +592,7 @@ def _compose_rgb_frames(
     *,
     gamma: float = 1.0,
 ) -> np.ndarray:
+    """Compose cyan structure and red activity channels into RGB frames."""
     red = np.clip(activity, 0.0, 1.0)
     cyan = np.clip(structure, 0.0, 1.0)
 
@@ -587,6 +613,7 @@ def _compose_rgb_frames(
 
 
 def _pad_rgb_frames_to_even(rgb: np.ndarray) -> np.ndarray:
+    """Pad RGB frames to even spatial dimensions for video encoders."""
     if rgb.ndim != 4 or rgb.shape[-1] != 3:
         raise ValueError(f"Expected RGB array with shape (Y, X, T, 3), got {rgb.shape}")
 
@@ -603,6 +630,7 @@ def _pad_rgb_frames_to_even(rgb: np.ndarray) -> np.ndarray:
 
 
 def _get_pil_resample(mode: str):
+    """Resolve a Pillow resampling mode from a user-facing string."""
     mode = mode.lower()
     if mode == "nearest":
         return Image.Resampling.NEAREST
@@ -618,6 +646,7 @@ def _upsample_frames(
     factor: float,
     mode: str,
 ) -> np.ndarray:
+    """Upsample RGB frames with Pillow using the requested interpolation mode."""
     if factor == 1.0:
         return frames
     if factor <= 0:
@@ -637,6 +666,7 @@ def _upsample_frames(
 
 
 def crop_movie_to_bbox(movie: np.ndarray, bbox: Tuple[int, int, int, int]) -> np.ndarray:
+    """Crop a 3D or 4D movie to a ``(y0, y1, x0, x1)`` bounding box."""
     y0, y1, x0, x1 = bbox
     if movie.ndim == 3:
         return movie[y0:y1, x0:x1, :]
@@ -646,6 +676,7 @@ def crop_movie_to_bbox(movie: np.ndarray, bbox: Tuple[int, int, int, int]) -> np
 
 
 def bbox_from_mask(mask: np.ndarray, padding_px: int = 0) -> Tuple[int, int, int, int]:
+    """Compute a padded bounding box around nonzero pixels in a mask."""
     yy, xx = np.where(mask > 0)
     if len(yy) == 0:
         raise ValueError("Mask is empty; cannot compute bounding box.")
@@ -662,6 +693,7 @@ def bbox_from_masks_union(
     image_shape: Tuple[int, int],
     padding_px: int = 0,
 ) -> Tuple[int, int, int, int]:
+    """Compute a padded bounding box around the union of ROI masks."""
     if len(roi_masks) == 0:
         raise ValueError("roi_masks is empty.")
 
@@ -686,6 +718,7 @@ def select_movie_time_window(
     start_frame: Optional[int] = None,
     end_frame: Optional[int] = None,
 ) -> np.ndarray:
+    """Select a time window from a 3D or 4D movie array."""
     if movie.ndim == 3:
         t_dim = 2
         n_frames = movie.shape[2]
@@ -716,6 +749,7 @@ def preview_oriented_mean_image(
     flip_ud: bool = False,
     flip_lr: bool = False,
 ):
+    """Display the oriented mean image for visual orientation checks."""
     import matplotlib.pyplot as plt
 
     mean_im = np.nanmean(movie_yxct[:, :, channel_index, :], axis=2)
@@ -736,6 +770,7 @@ def preview_oriented_mean_image(
 
 def _get_default_font(fontsize: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     # Try common scalable fonts first
+    """Return a scalable PIL font when available, otherwise the default font."""
     candidates = [
         "Arial.ttf",
         "arial.ttf",
@@ -771,6 +806,7 @@ def _draw_timer(
     fontsize: int,
     text_color: Tuple[int, int, int],
 ) -> None:
+    """Draw an elapsed-time label on a PIL image canvas."""
     elapsed_s = frame_idx / native_frame_rate_hz
     text = f"t = {elapsed_s:0.3f} s"
     font = _get_default_font(fontsize)
@@ -789,6 +825,7 @@ def _draw_scale_bar(
     bar_color: Tuple[int, int, int],
     text_color: Tuple[int, int, int],
 ) -> None:
+    """Draw a calibrated scale bar and label on a PIL image canvas."""
     width_px, height_px = image_size_xy
     bar_len_px = int(round(scale_bar_um / pixel_size_um))
     if bar_len_px <= 0:

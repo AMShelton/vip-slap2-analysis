@@ -1,3 +1,10 @@
+"""Utilities for extracting stimulus timing metadata from Bonsai logs.
+
+This module converts corrected Bonsai/BonVision event logs into a compact,
+JSON-serializable stimulus event representation used by downstream packaging and
+analysis workflows. It preserves the ordered image sequence, groups repeated
+image identities, and exports special event times such as changes and omissions."""
+
 from __future__ import annotations
 
 import json
@@ -22,10 +29,38 @@ def load_bonsai_event_log(csv_path: str | Path) -> pd.DataFrame:
 
 
 def _normalize_value_series(series: pd.Series) -> pd.Series:
+    """Normalize event-label values before matching stimulus names.
+
+            Parameters
+            ----------
+            series
+                Event-label column from a Bonsai event log.
+
+            Returns
+            -------
+            pandas.Series
+                String-valued labels with leading and trailing whitespace removed."""
     return series.astype(str).str.strip()
 
 
 def _event_times(df: pd.DataFrame, value: str, *, time_col: str, value_col: str) -> list[float]:
+    """Return numeric event times for one event label.
+
+            Parameters
+            ----------
+            df
+                Event table containing value and time columns.
+            value
+                Event label to match exactly.
+            time_col
+                Name of the column containing event times.
+            value_col
+                Name of the column containing event labels.
+
+            Returns
+            -------
+            list of float
+                Finite event times in seconds for matching rows."""
     sub = df.loc[df[value_col] == value, time_col]
     out = pd.to_numeric(sub, errors="coerce").dropna().to_numpy(dtype=float)
     return out.tolist()
@@ -123,6 +158,10 @@ def extract_stimulus_events(
     special_events: Iterable[str] = DEFAULT_SPECIAL_EVENTS,
     drop_duplicate_pairs: bool = False,
 ) -> Dict[str, Any]:
+    """Load a Bonsai event log and extract stimulus event timing metadata.
+
+            Parameters mirror :func:`extract_stimulus_events_from_bonsai`, but this
+            entry point accepts a CSV path rather than a pre-loaded DataFrame."""
     df = load_bonsai_event_log(bonsai_event_log_csv)
     return extract_stimulus_events_from_bonsai(
         df,
@@ -140,6 +179,22 @@ def write_stimulus_events_json(
     *,
     indent: int = 2,
 ) -> Path:
+    """Write extracted stimulus events to a JSON file.
+
+            Parameters
+            ----------
+            output_path
+                Destination JSON path.
+            events
+                Mapping returned by :func:`extract_stimulus_events` or another
+                JSON-compatible event payload.
+            indent
+                JSON indentation level.
+
+            Returns
+            -------
+            pathlib.Path
+                Path to the written JSON file."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
@@ -148,6 +203,10 @@ def write_stimulus_events_json(
 
 
 def _to_jsonable(obj: Any) -> Any:
+    """Convert common scientific Python objects into JSON-safe values.
+
+            Handles nested mappings/sequences, paths, NumPy arrays and scalars, and
+            pandas missing values while leaving already-serializable objects intact."""
     if isinstance(obj, dict):
         return {str(k): _to_jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):

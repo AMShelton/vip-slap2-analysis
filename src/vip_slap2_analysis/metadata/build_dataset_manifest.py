@@ -1,3 +1,12 @@
+"""Build dataset-level manifests from discovered session folders.
+
+This module crawls a VIP synaptic-dynamics dataset root, discovers session
+folders matching the canonical ``mouse_date_time`` naming convention, reads
+available QC JSON outputs, and writes machine- and human-readable manifest files.
+The manifest provides quick status visibility across behavior, glutamate, and
+calcium processing streams.
+"""
+
 from __future__ import annotations
 
 import json
@@ -17,6 +26,20 @@ SESSION_RE = re.compile(r"(?P<mouse>\d{6})_(?P<date>\d{4}-\d{2}-\d{2})_(?P<time>
 
 @dataclass
 class ManifestConfig:
+    """Configuration for dataset-manifest discovery and output paths.
+
+    Attributes
+    ----------
+    dataset_root
+        Root directory that will be crawled for session folders and receive the
+        generated manifest outputs.
+    output_csv, output_json, output_md
+        Filenames for the tabular CSV, structured JSON, and markdown overview.
+    glutamate_qc_candidates, calcium_qc_candidates, behavior_qc_candidates
+        Candidate QC JSON paths, interpreted relative to each session directory.
+    registry_candidates
+        Candidate names for a manually curated registry workbook, if present.
+    """
     dataset_root: Path
     output_csv: str = "dataset_manifest.csv"
     output_json: str = "dataset_manifest.json"
@@ -47,6 +70,19 @@ class ManifestConfig:
 
 
 def safe_read_json(path: Path) -> Dict[str, Any]:
+    """Read a JSON file as a dictionary, returning an empty dict on failure.
+
+    Parameters
+    ----------
+    path
+        Path to a JSON file expected to contain a top-level object.
+
+    Returns
+    -------
+    dict
+        Parsed JSON object, or ``{}`` when the file cannot be read or does not
+        contain a dictionary.
+    """
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
@@ -56,6 +92,20 @@ def safe_read_json(path: Path) -> Dict[str, Any]:
 
 
 def first_existing(base: Path, candidates: Sequence[str]) -> Optional[Path]:
+    """Return the first existing candidate path below a base directory.
+
+    Parameters
+    ----------
+    base
+        Directory against which candidate relative paths are resolved.
+    candidates
+        Ordered relative paths to test.
+
+    Returns
+    -------
+    pathlib.Path or None
+        First existing path, or ``None`` if no candidates exist.
+    """
     for rel in candidates:
         p = base / rel
         if p.exists():
@@ -64,6 +114,18 @@ def first_existing(base: Path, candidates: Sequence[str]) -> Optional[Path]:
 
 
 def discover_session_dirs(dataset_root: Path) -> List[Path]:
+    """Discover session directories matching the canonical session-name pattern.
+
+    Parameters
+    ----------
+    dataset_root
+        Root directory to search recursively.
+
+    Returns
+    -------
+    list[pathlib.Path]
+        Sorted list of directories named like ``803496_2025-07-25_13-02-10``.
+    """
     session_dirs: List[Path] = []
     for p in dataset_root.rglob("*"):
         if not p.is_dir():
@@ -74,6 +136,19 @@ def discover_session_dirs(dataset_root: Path) -> List[Path]:
 
 
 def infer_session_identity(session_dir: Path) -> Dict[str, Any]:
+    """Infer mouse, date, time, and session identifiers from a directory name.
+
+    Parameters
+    ----------
+    session_dir
+        Session directory whose name may follow the canonical pattern.
+
+    Returns
+    -------
+    dict
+        Identity fields used as manifest columns. Pattern mismatches preserve
+        the directory name as ``session_id`` and set parsed fields to ``None``.
+    """
     m = SESSION_RE.fullmatch(session_dir.name)
     if not m:
         return {
@@ -91,6 +166,18 @@ def infer_session_identity(session_dir: Path) -> Dict[str, Any]:
 
 
 def maybe_float(x: Any) -> Optional[float]:
+    """Best-effort conversion to a finite float.
+
+    Parameters
+    ----------
+    x
+        Arbitrary value that may encode a numeric quantity.
+
+    Returns
+    -------
+    float or None
+        Converted value, excluding missing and NaN-like inputs.
+    """
     try:
         if x is None:
             return None
@@ -103,6 +190,18 @@ def maybe_float(x: Any) -> Optional[float]:
 
 
 def maybe_int(x: Any) -> Optional[int]:
+    """Best-effort conversion to an integer.
+
+    Parameters
+    ----------
+    x
+        Arbitrary value that may encode an integer count.
+
+    Returns
+    -------
+    int or None
+        Converted integer, or ``None`` if conversion fails.
+    """
     try:
         if x is None:
             return None
@@ -112,6 +211,23 @@ def maybe_int(x: Any) -> Optional[int]:
 
 
 def get_nested(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    """Retrieve a nested dictionary value without raising missing-key errors.
+
+    Parameters
+    ----------
+    d
+        Source dictionary.
+    *keys
+        Successive nested keys to traverse.
+    default
+        Value returned when any key is missing or the current object is not a
+        dictionary.
+
+    Returns
+    -------
+    Any
+        Nested value or ``default``.
+    """
     cur: Any = d
     for k in keys:
         if not isinstance(cur, dict) or k not in cur:
@@ -121,6 +237,19 @@ def get_nested(d: Dict[str, Any], *keys: str, default: Any = None) -> Any:
 
 
 def coalesce(*values: Any) -> Any:
+    """Return the first non-missing value from ordered candidates.
+
+    Parameters
+    ----------
+    *values
+        Candidate values ordered from most to least preferred.
+
+    Returns
+    -------
+    Any
+        First value that is not ``None`` and not NaN, or ``None`` if all values
+        are missing.
+    """
     for v in values:
         if v is None:
             continue
@@ -131,6 +260,18 @@ def coalesce(*values: Any) -> Any:
 
 
 def summarize_glutamate_qc(qc: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract standardized manifest fields from glutamate QC metadata.
+
+    Parameters
+    ----------
+    qc
+        Parsed glutamate QC JSON object, or an empty dictionary when unavailable.
+
+    Returns
+    -------
+    dict
+        Normalized presence, ROI-count, pass-fraction, SNR, and notes fields.
+    """
     return {
         "has_glutamate": bool(qc),
         "glut_qc_path_found": bool(qc),
@@ -166,6 +307,18 @@ def summarize_glutamate_qc(qc: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def summarize_calcium_qc(qc: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract standardized manifest fields from calcium QC metadata.
+
+    Parameters
+    ----------
+    qc
+        Parsed calcium QC JSON object, or an empty dictionary when unavailable.
+
+    Returns
+    -------
+    dict
+        Normalized presence, ROI-count, pass-fraction, SNR, and notes fields.
+    """
     return {
         "has_calcium": bool(qc),
         "calcium_qc_path_found": bool(qc),
@@ -197,6 +350,18 @@ def summarize_calcium_qc(qc: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def summarize_behavior_qc(qc: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract standardized manifest fields from behavior QC metadata.
+
+    Parameters
+    ----------
+    qc
+        Parsed behavior QC JSON object, or an empty dictionary when unavailable.
+
+    Returns
+    -------
+    dict
+        Normalized alignment, event-coverage, and notes fields.
+    """
     ready = coalesce(
         qc.get("ready_for_physiology_extraction"),
         qc.get("alignment_success"),
@@ -221,11 +386,20 @@ def summarize_behavior_qc(qc: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def compute_overall_quality(row: Dict[str, Any]) -> Tuple[Optional[float], Optional[str], str]:
-    """
-    Returns:
-        score in [0, 1] if computable,
-        tier in {A, B, C, FAIL} if computable,
-        semicolon-delimited flags
+    """Compute a coarse overall quality score, tier, and review flags.
+
+    Parameters
+    ----------
+    row
+        Session-level dictionary containing modality pass fractions and behavior
+        alignment fields.
+
+    Returns
+    -------
+    tuple
+        ``(score, tier, flags)`` where score is in ``[0, 1]`` when computable,
+        tier is one of ``"A"``, ``"B"``, ``"C"``, or ``"FAIL"``, and flags is a
+        semicolon-delimited string of review triggers.
     """
     components: List[float] = []
     weights: List[float] = []
@@ -278,6 +452,21 @@ def compute_overall_quality(row: Dict[str, Any]) -> Tuple[Optional[float], Optio
 
 
 def build_session_row(session_dir: Path, cfg: ManifestConfig) -> Dict[str, Any]:
+    """Build one session-level manifest row from discovered files and QC JSON.
+
+    Parameters
+    ----------
+    session_dir
+        Session directory to summarize.
+    cfg
+        Manifest configuration containing candidate QC paths and output names.
+
+    Returns
+    -------
+    dict
+        Session-level manifest row with identity, QC summaries, quality score,
+        tier, and review flags.
+    """
     ident = infer_session_identity(session_dir)
 
     glut_path = first_existing(session_dir, cfg.glutamate_qc_candidates)
@@ -319,6 +508,19 @@ def build_session_row(session_dir: Path, cfg: ManifestConfig) -> Dict[str, Any]:
 
 
 def build_mouse_rows(session_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate session-level manifest rows into mouse-level summary rows.
+
+    Parameters
+    ----------
+    session_df
+        Session-level manifest dataframe.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per mouse with session counts, usability counts, modality counts,
+        alignment failures, and median QC summaries.
+    """
     if session_df.empty:
         return pd.DataFrame()
 
@@ -355,6 +557,19 @@ def build_mouse_rows(session_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Reorder manifest columns so review-relevant fields appear first.
+
+    Parameters
+    ----------
+    df
+        Manifest dataframe with any subset of expected columns.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Dataframe containing the same rows and columns, with preferred display
+        columns moved to the front when present.
+    """
     cols_first = [
         "row_type",
         "mouse_id",
@@ -381,6 +596,20 @@ def dataframe_for_display(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def markdown_table(df: pd.DataFrame, max_rows: int = 50) -> str:
+    """Render a dataframe as a bounded markdown table.
+
+    Parameters
+    ----------
+    df
+        Dataframe to render.
+    max_rows
+        Maximum number of rows included in the markdown output.
+
+    Returns
+    -------
+    str
+        Markdown table text, or a placeholder when the dataframe is empty.
+    """
     if df.empty:
         return "_No rows found._"
     clipped = df.head(max_rows).copy()
@@ -393,6 +622,19 @@ def write_markdown_overview(
     mouse_df: pd.DataFrame,
     dataset_root: Path,
 ) -> None:
+    """Write a human-readable dataset overview markdown file.
+
+    Parameters
+    ----------
+    output_path
+        Destination markdown path.
+    session_df
+        Session-level manifest dataframe.
+    mouse_df
+        Mouse-level manifest dataframe.
+    dataset_root
+        Root directory summarized by the manifest.
+    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     n_sessions = len(session_df)
     n_mice = session_df["mouse_id"].nunique(dropna=True) if not session_df.empty else 0
@@ -488,6 +730,21 @@ def build_dataset_manifest(
     dataset_root: str | Path,
     write_outputs: bool = True,
 ) -> pd.DataFrame:
+    """Build and optionally write a dataset manifest for discovered sessions.
+
+    Parameters
+    ----------
+    dataset_root
+        Root directory searched recursively for canonical session folders.
+    write_outputs
+        If True, write CSV, JSON, and markdown manifest outputs to
+        ``dataset_root``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Combined mouse- and session-level manifest dataframe.
+    """
     cfg = ManifestConfig(dataset_root=Path(dataset_root))
     session_dirs = discover_session_dirs(cfg.dataset_root)
 

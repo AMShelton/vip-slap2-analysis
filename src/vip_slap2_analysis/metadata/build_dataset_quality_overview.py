@@ -1,3 +1,11 @@
+"""Build lightweight session- and mouse-level quality summaries.
+
+This module reads the manually curated VIP synaptic-dynamics session summary
+spreadsheet, normalizes selected quality annotations, filters to requested mice
+and paradigms, and writes a human-readable dataset-quality overview. It is meant
+as a top-level metadata utility rather than a physiology-analysis module.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -8,6 +16,19 @@ import pandas as pd
 
 
 def _normalize_quality(x: object) -> str:
+    """Map free-text quality annotations onto coarse quality labels.
+
+    Parameters
+    ----------
+    x
+        Raw value from the session-summary ``quality`` column.
+
+    Returns
+    -------
+    str
+        Canonical label such as ``"good"``, ``"okay"``, ``"poor"``, or
+        ``"unknown"`` when the input is missing.
+    """
     if pd.isna(x):
         return "unknown"
 
@@ -24,12 +45,37 @@ def _normalize_quality(x: object) -> str:
 
 
 def _clean_text(x: object) -> str:
+    """Return stripped text while treating missing values as empty strings.
+
+    Parameters
+    ----------
+    x
+        Value from a free-text metadata column.
+
+    Returns
+    -------
+    str
+        Cleaned text suitable for CSV and markdown output.
+    """
     if pd.isna(x):
         return ""
     return str(x).strip()
 
 
 def _overall_mouse_assessment(mouse_df: pd.DataFrame) -> str:
+    """Assign a coarse mouse-level assessment from session quality counts.
+
+    Parameters
+    ----------
+    mouse_df
+        Session-level dataframe for one mouse with a ``quality_simple`` column.
+
+    Returns
+    -------
+    str
+        Rollup label such as ``"strong"``, ``"usable"``, ``"mixed"``,
+        ``"needs review"``, or ``"unclear"``.
+    """
     counts = mouse_df["quality_simple"].value_counts(dropna=False).to_dict()
 
     n_good = counts.get("good", 0)

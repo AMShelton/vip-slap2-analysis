@@ -1,3 +1,11 @@
+"""Packaging utilities for soma calcium traces and stimulus metadata.
+
+This module exports raw and processed soma calcium traces from SLAP2
+``SummaryLoCo`` files into analysis-friendly NPZ/JSON packages. The packaged
+outputs include trial stacks, session-concatenated traces, trial timing metadata,
+stimulus event times, DMD depth annotations when available, and imaging epoch
+metadata from behavior QC."""
+
 from __future__ import annotations
 
 import json
@@ -96,6 +104,10 @@ def _session_export_root(
     package_name: str = "soma_calcium",
     base_dir: str | Path | None = None,
 ) -> Path:
+    """Resolve the per-session output directory for packaged traces.
+
+            Uses an explicit ``base_dir`` when supplied, otherwise writes under the
+            asset's derived directory or a conventional ``analysis/derived`` path."""
     if base_dir is not None:
         root = Path(base_dir)
     elif getattr(asset, "derived_dir", None) is not None:
@@ -106,6 +118,10 @@ def _session_export_root(
 
 
 def _safe_jsonable(obj: Any) -> Any:
+    """Recursively convert metadata objects into JSON-safe Python values.
+
+            This helper handles paths, NumPy containers/scalars, datetimes, pandas
+            timestamps/timedeltas, missing values, and nested containers."""
     if isinstance(obj, dict):
         return {str(k): _safe_jsonable(v) for k, v in obj.items()}
 
@@ -151,6 +167,14 @@ def _safe_jsonable(obj: Any) -> Any:
 
 
 def _write_json(path: str | Path, payload: Mapping[str, Any]) -> Path:
+    """Write a metadata payload to disk as indented JSON.
+
+            Parameters
+            ----------
+            path
+                Destination JSON path.
+            payload
+                Mapping to serialize after conversion with :func:`_safe_jsonable`."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -159,6 +183,19 @@ def _write_json(path: str | Path, payload: Mapping[str, Any]) -> Path:
 
 
 def _detect_dmd_depth_um(asset: SessionAssets, dmd: int) -> Optional[float]:
+    """Look up DMD imaging depth in a session asset metadata dictionary.
+
+            Parameters
+            ----------
+            asset
+                Session asset with optional metadata fields.
+            dmd
+                One-indexed DMD identifier.
+
+            Returns
+            -------
+            float or None
+                DMD depth in microns, when present and convertible to float."""
     metadata = getattr(asset, "metadata", {}) or {}
     candidates = (
         f"dmd{dmd}_depth_um",
@@ -181,6 +218,10 @@ def _detect_dmd_depth_um(asset: SessionAssets, dmd: int) -> Optional[float]:
 
 
 def _guess_session_label(asset: SessionAssets) -> Optional[str]:
+    """Infer a human-readable session label from available asset metadata.
+
+            Searches common metadata fields such as ``session_type`` and
+            ``experience_level`` and returns the first non-empty value."""
     metadata = getattr(asset, "metadata", {}) or {}
     candidates = (
         "session_type",
@@ -198,6 +239,14 @@ def _guess_session_label(asset: SessionAssets) -> Optional[str]:
 
 
 def _valid_trial_mask(gs: GlutamateSummary, dmd: int) -> np.ndarray:
+    """Return the valid-trial mask for one DMD from a SummaryLoCo reader.
+
+            Parameters
+            ----------
+            gs
+                Open :class:`GlutamateSummary` reader.
+            dmd
+                One-indexed DMD identifier."""
     return np.asarray(gs.keep_trials[dmd - 1], dtype=bool)
 
 
@@ -208,6 +257,10 @@ def _load_raw_soma_calcium_trials(
     trace_type: str,
     roi_inds: Optional[Sequence[int]] = None,
 ) -> list[np.ndarray | None]:
+    """Load raw soma calcium traces for all trials on one DMD.
+
+            Invalid trials are represented as ``None`` so trial order and trial count
+            remain aligned with the source SummaryLoCo file."""
     trials: list[np.ndarray | None] = []
     keep = _valid_trial_mask(gs, dmd)
 
@@ -244,6 +297,11 @@ def _load_processed_soma_calcium_trials(
     roi_inds: Optional[Sequence[int]] = None,
     process_kwargs: Optional[Mapping[str, Any]] = None,
 ) -> list[np.ndarray | None]:
+    """Load processed soma calcium dF/F traces for all trials on one DMD.
+
+            Processing is delegated to :meth:`GlutamateSummary.get_processed_soma_ca_all_trials`
+            with ``pad_to="none"`` so valid trial lengths are preserved until the
+            packaging step."""
     process_kwargs = dict(process_kwargs or {})
 
     out = gs.get_processed_soma_ca_all_trials(
@@ -282,6 +340,20 @@ def _package_trace_family(
     *,
     fs_hz: float,
 ) -> Dict[str, Any]:
+    """Convert trial-wise traces into padded and concatenated package arrays.
+
+            Parameters
+            ----------
+            trials
+                Sequence of per-trial arrays or ``None`` placeholders.
+            fs_hz
+                Sampling rate used to compute nominal trial start times.
+
+            Returns
+            -------
+            dict
+                Trial stack, session concatenation, trial lengths, timing, and shape
+                metadata for one trace family."""
     trial_stack = stack_trials_padded(trials)
     concat = concatenate_trial_stack(trial_stack)
     fill_length = int(trial_stack.shape[-1])
@@ -309,6 +381,11 @@ def _write_trace_npz(
     fs_hz: float,
     roi_axis_name: str = "soma_roi",
 ) -> Path:
+    """Write one packaged trace family to a compressed NPZ file.
+
+            The NPZ contains the padded trial stack, session-concatenated traces,
+            trial lengths, trial start times, sampling rate, DMD index, and ROI-axis
+            metadata."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -330,6 +407,10 @@ def _write_trace_npz(
 
 
 def _common_session_metadata(asset: SessionAssets, gs: GlutamateSummary) -> Dict[str, Any]:
+    """Build session-level metadata shared by packaged soma calcium outputs.
+
+            Includes identifiers, source file paths, sampling rate, asset metadata,
+            and behavior-derived imaging epoch metadata when available."""
     return {
         "session_id": getattr(asset, "session_id", None),
         "subject_id": getattr(asset, "subject_id", None),
@@ -359,6 +440,32 @@ def package_session_soma_calcium(
     event_time_col: str = DEFAULT_EVENT_TIME_COLUMN,
     overwrite: bool = False,
 ) -> Dict[str, Any]:
+    """Package raw and processed soma calcium traces for one session.
+
+            Parameters
+            ----------
+            asset
+                Resolved session assets containing SummaryLoCo and corrected Bonsai
+                event-log paths.
+            output_root
+                Optional external root for packaged outputs.
+            trace_type
+                SummaryLoCo soma trace type to read.
+            dmds
+                DMD indices to export.
+            roi_inds
+                Optional subset of soma ROI indices.
+            process_kwargs
+                Additional keyword arguments forwarded to calcium processing.
+            event_time_col
+                Bonsai event-log time column used for stimulus extraction.
+            overwrite
+                If False, existing DMD-level NPZ exports are reused.
+
+            Returns
+            -------
+            dict
+                JSON-safe session metadata describing written or skipped exports."""
     if getattr(asset, "summary_mat", None) is None:
         raise FileNotFoundError(f"No SummaryLoCo .mat file was resolved for session {asset.session_id}.")
     if getattr(asset, "bonsai_event_log_csv", None) is None:
@@ -471,6 +578,10 @@ def package_soma_calcium_batch(
     event_time_col: str = DEFAULT_EVENT_TIME_COLUMN,
     overwrite: bool = False,
 ) -> list[Dict[str, Any]]:
+    """Package soma calcium traces for multiple sessions.
+
+            Iterates over session assets and returns each session's metadata payload
+            from :func:`package_session_soma_calcium`."""
     results: list[Dict[str, Any]] = []
     for asset in assets:
         results.append(
