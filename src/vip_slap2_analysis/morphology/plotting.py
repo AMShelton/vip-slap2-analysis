@@ -1,3 +1,11 @@
+"""
+Plot 2D projections of reconstructed morphology trees.
+
+The plotting helpers render branch segments as matplotlib line collections,
+optionally using smoothed coordinates for cleaner vector graphics. Figures
+can be saved directly as publication- or Illustrator-friendly formats.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -17,6 +25,7 @@ Projection = Literal["xy", "xz", "zy"]
 
 
 def _apply_plot_style() -> None:
+    """Apply package-level matplotlib/seaborn styling for morphology plots."""
     sns.set()
     sns.set_style("white")
     plt.rcParams.update({
@@ -36,6 +45,7 @@ def _finalize_and_save_figure(
     dpi: int = 300,
     close: bool = True,
 ) -> None:
+    """Tighten layout, save a figure in one or more formats, and optionally close it."""
     save_path_stem = Path(save_path_stem)
     fig.tight_layout()
     for fmt in formats:
@@ -46,6 +56,7 @@ def _finalize_and_save_figure(
 
 
 def _projection_columns(projection: Projection) -> tuple[str, str]:
+    """Return the coordinate columns used for a 2D morphology projection."""
     mapping = {
         "xy": ("x_um", "y_um"),
         "xz": ("x_um", "z_um"),
@@ -55,6 +66,7 @@ def _projection_columns(projection: Projection) -> tuple[str, str]:
 
 
 def _make_segments(tree: MorphologyTree, projection: Projection, smooth: bool = True) -> tuple[list[np.ndarray], list[float]]:
+    """Build projected line segments and branch-order values for plotting."""
     c0, c1 = _projection_columns(projection)
     branch_order_values: list[float] = []
     segments: list[np.ndarray] = []
@@ -86,6 +98,33 @@ def plot_morphology_projection(
     show_root: bool = True,
     ax: Optional[plt.Axes] = None,
 ) -> plt.Axes:
+    """
+    Plot one 2D projection of a morphology tree.
+    
+    Parameters
+    ----------
+    tree
+        Morphology tree to render.
+    projection
+        Projection plane: ``"xy"``, ``"xz"``, or ``"zy"``.
+    smooth
+        Whether to plot smoothed branch polylines.
+    color_by
+        Whether to color segments by branch order or use a single color.
+    line_width
+        Width of rendered branch segments.
+    alpha
+        Segment transparency.
+    show_root
+        Whether to mark the root node.
+    ax
+        Optional axes to draw into.
+    
+    Returns
+    -------
+    matplotlib.axes.Axes
+        Axes containing the rendered projection.
+    """
     _apply_plot_style()
     if ax is None:
         _, ax = plt.subplots(figsize=(6, 6))
@@ -127,6 +166,12 @@ def plot_morphology_triptych(
     formats: Sequence[str] = (".pdf", ".svg", ".png"),
     dpi: int = 300,
 ) -> tuple[plt.Figure, list[plt.Axes]]:
+    """
+    Plot XY, XZ, and ZY projections for a morphology tree.
+    
+    Optionally saves the figure to one or more file formats using the supplied
+    path stem.
+    """
     _apply_plot_style()
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     for ax, projection in zip(axes, ["xy", "xz", "zy"]):
@@ -145,6 +190,7 @@ def save_single_projection(
     smooth: bool = True,
     dpi: int = 300,
 ) -> Path:
+    """Save one morphology projection and return the output path."""
     save_path = Path(save_path)
     fig, ax = plt.subplots(figsize=(6, 6))
     plot_morphology_projection(tree, projection=projection, smooth=smooth, ax=ax)

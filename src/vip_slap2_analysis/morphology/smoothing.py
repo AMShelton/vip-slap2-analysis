@@ -1,3 +1,12 @@
+"""
+Smooth morphology branch polylines for visualization.
+
+The routines here operate on :class:`MorphologyTree` branch segments and
+produce upsampled, lightly smoothed coordinates suitable for vector graphics
+and presentation figures. They are designed for visualization rather than
+for recomputing quantitative morphology metrics.
+"""
+
 from __future__ import annotations
 
 from typing import List
@@ -9,6 +18,13 @@ from .model import MorphologyTree
 
 
 def _moving_average(arr: np.ndarray, window: int = 5) -> np.ndarray:
+    """
+    Apply column-wise moving-average smoothing to an array.
+    
+    The input is padded with edge values so that the returned array has the same
+    shape as the input. This helper is used after linear upsampling of branch
+    coordinates.
+    """
     if window <= 1 or arr.shape[0] < window:
         return arr.copy()
     kernel = np.ones(window, dtype=float) / window
@@ -25,11 +41,26 @@ def smooth_polyline(
     points_per_segment: int = 20,
     spline_smoothness: float = 10,
 ) -> np.ndarray:
-    """Generate a visually smoother branch polyline.
-
-    This uses piecewise linear upsampling followed by gentle moving-average smoothing.
-    It is deliberately lightweight and robust for batch rendering of anisotropic z-sampled
-    reconstructions.
+    """
+    Generate a visually smoother branch polyline.
+    
+    This uses piecewise linear upsampling followed by gentle moving-average
+    smoothing. It is deliberately lightweight and robust for batch rendering of
+    anisotropic z-sampled reconstructions.
+    
+    Parameters
+    ----------
+    xyz_um
+        Array of branch coordinates with shape ``(n_points, 3)`` in microns.
+    points_per_segment
+        Number of interpolated points to generate per original segment.
+    spline_smoothness
+        Reserved compatibility parameter; currently ignored.
+    
+    Returns
+    -------
+    np.ndarray
+        Smoothed coordinates with shape ``(n_smoothed_points, 3)``.
     """
     del spline_smoothness
     xyz_um = np.asarray(xyz_um, dtype=float)
@@ -52,6 +83,13 @@ def smooth_branch_segments(
     points_per_segment: int = 20,
     spline_smoothness: float = 10,
 ) -> List[pd.DataFrame]:
+    """
+    Smooth all branch segments in a morphology tree.
+    
+    Each branch segment is extracted from the tree, converted to an upsampled
+    polyline, and returned as a dataframe with segment-level branch and Strahler
+    annotations preserved.
+    """
     out: List[pd.DataFrame] = []
     for seg in tree.branch_segments():
         xyz = seg[["x_um", "y_um", "z_um"]].to_numpy(dtype=float)

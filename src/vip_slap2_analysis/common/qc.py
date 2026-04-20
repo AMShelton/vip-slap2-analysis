@@ -1,3 +1,12 @@
+"""Behavior-independent QC metrics for SLAP2 glutamate synapse traces.
+
+This module reads SummaryLoCo MAT files, extracts valid-trial synapse traces
+for each DMD, computes robust trace-quality metrics, assigns composite quality
+scores, and writes per-session QC tables plus optional diagnostic plots. The
+metrics are designed to evaluate trace support, finite-data completeness,
+dynamic range, and residual signal-to-noise before stimulus-aligned analysis.
+"""
+
 from __future__ import annotations
 
 import json
@@ -19,6 +28,11 @@ from vip_slap2_analysis.plotting.qc_plots import make_all_synapse_qc_plots
 # =============================================================================
 
 def mad(x: np.ndarray) -> float:
+    """Return the median absolute deviation of finite values.
+    
+    Non-finite values are ignored. If no finite samples are available, NaN is
+    returned.
+    """
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
     if x.size == 0:
@@ -38,6 +52,15 @@ def robust_sigma(x: np.ndarray) -> float:
 
 
 def safe_percentile(x: np.ndarray, q: float) -> float:
+    """Return a percentile after dropping non-finite values.
+    
+    Parameters
+    ----------
+    x
+        Input array.
+    q
+        Percentile in the interval [0, 100].
+    """
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
     if x.size == 0:
@@ -46,6 +69,11 @@ def safe_percentile(x: np.ndarray, q: float) -> float:
 
 
 def robust_range(x: np.ndarray, q_lo: float = 1.0, q_hi: float = 99.0) -> float:
+    """Return a percentile-based robust range.
+    
+    The default is q99 - q1, which is less sensitive to outliers than a raw
+    max-min range.
+    """
     lo = safe_percentile(x, q_lo)
     hi = safe_percentile(x, q_hi)
     if not np.isfinite(lo) or not np.isfinite(hi):
@@ -54,6 +82,10 @@ def robust_range(x: np.ndarray, q_lo: float = 1.0, q_hi: float = 99.0) -> float:
 
 
 def finite_fraction(x: np.ndarray) -> float:
+    """Return the fraction of samples that are finite.
+    
+    Empty arrays return NaN because the denominator is undefined.
+    """
     x = np.asarray(x)
     if x.size == 0:
         return np.nan
@@ -191,6 +223,11 @@ def _get_valid_trial_trace_matrix(
     signal: str,
     mode: str,
 ) -> np.ndarray:
+    """Load one valid-trial trace matrix as ``(n_rois, n_time)``.
+    
+    Parameters identify the DMD, 1-indexed trial, signal family, and signal mode
+    to request from ``GlutamateSummary``.
+    """
     x = exp.get_traces(
         dmd=dmd,
         trial=trial,
@@ -257,12 +294,16 @@ def collect_dmd_synapse_segments(
 # =============================================================================
 
 def _bounded_exp_score(x: float, k: float = 1.0) -> float:
+    """Map a non-negative value to a bounded score using ``1 - exp(-k*x)``.
+    """
     if not np.isfinite(x) or x < 0:
         return np.nan
     return float(1.0 - np.exp(-k * x))
 
 
 def _clip01(x: float) -> float:
+    """Clip a finite scalar to the closed interval [0, 1].
+    """
     if not np.isfinite(x):
         return np.nan
     return float(np.clip(x, 0.0, 1.0))
@@ -449,6 +490,11 @@ def build_qc_metadata(
     score_params: Dict[str, float],
     dmd_summary: Dict[str, Dict[str, float]],
 ) -> Dict[str, object]:
+    """Build JSON-serializable metadata describing a synapse QC run.
+    
+    The metadata records session inputs, parameter values, DMD-level support
+    summaries, and plain-language descriptions of each QC metric.
+    """
     return {
         "schema_version": "0.1.0",
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -520,6 +566,17 @@ def build_qc_metadata(
 
 @dataclass
 class SessionQCResult:
+    """Container returned by ``run_session_synapse_qc``.
+    
+    Attributes
+    ----------
+    qc_df
+        Per-synapse QC table.
+    metadata
+        JSON-serializable metadata describing parameters and metric meanings.
+    summary
+        Session-level summary statistics and DMD-level support metadata.
+    """
     qc_df: pd.DataFrame
     metadata: Dict[str, object]
     summary: Dict[str, object]

@@ -1,3 +1,12 @@
+"""
+Read morphology reconstructions and associated SNT exports.
+
+This module provides file I/O helpers for SWC reconstructions and common
+Fiji/Simple Neurite Tracer sidecar outputs. The returned objects preserve
+node geometry, optional measurement tables, and paths to related tracing or
+image files.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,6 +18,13 @@ from .model import MorphologyBundle, MorphologyTree
 
 
 def read_swc(swc_path: str | Path) -> MorphologyTree:
+    """
+    Read an SWC morphology file into a :class:`MorphologyTree`.
+    
+    Comment lines beginning with ``#`` are parsed for simple ``key: value``
+    metadata. Data rows are expected to contain the standard seven SWC fields:
+    node id, node type, x, y, z, radius, and parent id.
+    """
     swc_path = Path(swc_path)
     metadata: Dict[str, str] = {}
     rows = []
@@ -42,15 +58,19 @@ def read_swc(swc_path: str | Path) -> MorphologyTree:
 
 
 def _read_optional_csv(path: Optional[Path]) -> Optional[pd.DataFrame]:
+    """Read a CSV file when it exists, otherwise return ``None``."""
     if path is None or not path.exists():
         return None
     return pd.read_csv(path)
 
 
 def load_snt_bundle(base_dir: str | Path, swc_name: Optional[str] = None) -> MorphologyBundle:
-    """Load a morphology folder exported from Fiji/SNT.
-
+    """
+    Load a morphology folder exported from Fiji/SNT.
+    
     Expected contents include an SWC file and optionally SNT-generated CSV tables.
+    The function also records associated ``.traces`` files, TIFF images, and
+    unrecognized sidecar files so they remain discoverable downstream.
     """
     base_dir = Path(base_dir)
     if base_dir.is_file() and base_dir.suffix.lower() == ".swc":

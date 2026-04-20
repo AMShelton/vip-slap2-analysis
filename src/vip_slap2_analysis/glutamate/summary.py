@@ -348,6 +348,10 @@ def _align_bool_mask(mask: np.ndarray, n: int) -> np.ndarray:
     return out
 
 
+# ==============================================================================================
+# GLUTAMATE SUMMARY CLASS for unpackaging ExperimentSummary .mat files
+# ==============================================================================================
+
 @dataclass
 class GlutamateSummary:
     """Lazy reader and processor for SLAP2 ExperimentSummary files.

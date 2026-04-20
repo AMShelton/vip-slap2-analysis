@@ -1,3 +1,11 @@
+"""
+Compute morphology summary metrics and Sholl profiles.
+
+The functions in this module operate on parsed SWC trees and return compact
+pandas/numpy outputs for cable length, branching, path-length, bounding-box,
+and Sholl-style intersection analyses.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,14 +19,28 @@ from .model import MorphologyTree
 
 @dataclass
 class ShollResult:
+    """
+    Sholl intersection profile for a morphology tree.
+    
+    The arrays store sampled radii in microns and the corresponding number of
+    tree edges crossing each radius.
+    """
     radii_um: np.ndarray
     intersections: np.ndarray
 
     def to_frame(self) -> pd.DataFrame:
+        """Convert the Sholl profile to a tidy dataframe."""
         return pd.DataFrame({"radius_um": self.radii_um, "n_intersections": self.intersections})
 
 
 def compute_basic_metrics(tree: MorphologyTree) -> pd.Series:
+    """
+    Compute basic graph and geometry metrics for a morphology tree.
+    
+    Returns counts of nodes, edges, roots, branch points, and tips, along with
+    cable length, edge length, radius, path-length, branch-order, Strahler-order,
+    and bounding-box summaries.
+    """
     tip_path_lengths = [tree.path_length_to_root_um(nid) for nid in tree.tip_ids]
     edges = tree.edge_table()
     bbox = tree.bounding_box_um()
@@ -47,6 +69,28 @@ def compute_sholl_intersections(
     radius_step_um: float = 5.0,
     max_radius_um: Optional[float] = None,
 ) -> ShollResult:
+    """
+    Compute Sholl-style edge intersections at concentric radii.
+    
+    Each edge is counted when its endpoints fall on opposite sides of a sphere
+    centered on the soma/root or a user-specified point.
+    
+    Parameters
+    ----------
+    tree
+        Parsed morphology tree.
+    center_xyz_um
+        Optional Sholl center in microns. Defaults to the root node position.
+    radius_step_um
+        Radius spacing in microns.
+    max_radius_um
+        Optional maximum radius. Defaults to the farthest edge endpoint.
+    
+    Returns
+    -------
+    ShollResult
+        Radii and intersection counts.
+    """
     if radius_step_um <= 0:
         raise ValueError("radius_step_um must be positive")
 
@@ -75,6 +119,13 @@ def compute_sholl_intersections(
 
 
 def compare_with_snt_measurements(tree: MorphologyTree, measurements: pd.DataFrame) -> pd.Series:
+    """
+    Compare selected computed metrics against SNT measurement exports.
+    
+    The returned series always includes this package's total cable length and,
+    when matching SNT columns are available, includes SNT values and deltas for
+    cable length, branch-point count, and tip count.
+    """
     ours = compute_basic_metrics(tree)
     comparison: Dict[str, float] = {"total_cable_length_um": float(ours["total_cable_length_um"])}
     if measurements is None or measurements.empty:

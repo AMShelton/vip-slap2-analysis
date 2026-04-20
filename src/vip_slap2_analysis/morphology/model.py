@@ -1,3 +1,11 @@
+"""
+In-memory data model for SWC morphology reconstructions.
+
+This module defines immutable node records, tree-level graph accessors, and
+containers for associating a morphology tree with optional Fiji/SNT export
+tables. Coordinates and distances are assumed to be in microns.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -10,7 +18,12 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class MorphologyNode:
-    """Single SWC node."""
+    """
+    Single SWC node with position, radius, type, and parent id.
+    
+    The dataclass is immutable and represents one row of an SWC reconstruction.
+    Coordinates and radius are assumed to be in microns.
+    """
 
     node_id: int
     node_type: int
@@ -22,18 +35,26 @@ class MorphologyNode:
 
     @property
     def xyz_um(self) -> np.ndarray:
+        """Return the node position as a three-element numpy array in microns."""
         return np.array([self.x_um, self.y_um, self.z_um], dtype=float)
 
 
 @dataclass
 class MorphologyTree:
-    """In-memory morphology tree parsed from SWC."""
+    """
+    In-memory morphology tree parsed from SWC.
+    
+    The tree stores nodes in a dataframe, builds lookup tables for parent/child
+    relationships, and provides graph, path-length, branch-order, Strahler-order,
+    and branch-segment accessors.
+    """
 
     nodes: pd.DataFrame
     metadata: Dict[str, str] = field(default_factory=dict)
     source_path: Optional[Path] = None
 
     def __post_init__(self) -> None:
+        """Validate node columns and initialize lookup structures after construction."""
         required = ["node_id", "node_type", "x_um", "y_um", "z_um", "radius_um", "parent_id"]
         missing = [c for c in required if c not in self.nodes.columns]
         if missing:
@@ -49,6 +70,7 @@ class MorphologyTree:
         self._children = self._build_children_map()
 
     def _build_children_map(self) -> Dict[int, List[int]]:
+        """Build a mapping from each node id to its direct child node ids."""
         children: Dict[int, List[int]] = {int(nid): [] for nid in self.nodes["node_id"]}
         for _, row in self.nodes.iterrows():
             parent = int(row.parent_id)
@@ -58,10 +80,17 @@ class MorphologyTree:
 
     @property
     def node_ids(self) -> np.ndarray:
+        """Return all node ids as an integer numpy array."""
         return self.nodes["node_id"].to_numpy(dtype=int)
 
     @property
     def roots(self) -> List[int]:
+        """
+        Return root node ids.
+        
+        Roots are nodes with a negative parent id. If none are explicitly marked,
+        nodes that never appear as children are treated as roots.
+        """
         roots = self.nodes.loc[self.nodes["parent_id"] < 0, "node_id"].astype(int).tolist()
         if roots:
             return roots
@@ -70,6 +99,14 @@ class MorphologyTree:
 
     @property
     def root_id(self) -> int:
+        """
+        Return the first root node id.
+        
+        Raises
+        ------
+        ValueError
+            If the morphology contains no resolvable root.
+        """
         roots = self.roots
         if not roots:
             raise ValueError("Morphology contains no root node.")
@@ -77,30 +114,43 @@ class MorphologyTree:
 
     @property
     def child_counts(self) -> pd.Series:
+        """Return the number of direct children for each node."""
         return pd.Series({nid: len(children) for nid, children in self._children.items()}, name="n_children")
 
     @property
     def tip_ids(self) -> List[int]:
+        """Return node ids with no children."""
         return [nid for nid, children in self._children.items() if len(children) == 0]
 
     @property
     def branch_point_ids(self) -> List[int]:
+        """Return node ids with more than one child."""
         return [nid for nid, children in self._children.items() if len(children) > 1]
 
     def get_row(self, node_id: int) -> pd.Series:
+        """Return the dataframe row for a node id."""
         return self.nodes.iloc[self._node_index[int(node_id)]]
 
     def get_xyz(self, node_id: int) -> np.ndarray:
+        """Return the x/y/z coordinates for a node id in microns."""
         row = self.get_row(node_id)
         return row[["x_um", "y_um", "z_um"]].to_numpy(dtype=float)
 
     def get_parent_id(self, node_id: int) -> int:
+        """Return the parent id for a node."""
         return int(self.get_row(node_id)["parent_id"])
 
     def get_children_ids(self, node_id: int) -> List[int]:
+        """Return direct child ids for a node."""
         return list(self._children[int(node_id)])
 
     def edge_table(self) -> pd.DataFrame:
+        """
+        Return a dataframe describing parent-child edges.
+        
+        Each row contains parent and child ids, edge length in microns, and endpoint
+        coordinates.
+        """
         rows = []
         for _, row in self.nodes.iterrows():
             child_id = int(row.node_id)
@@ -125,12 +175,19 @@ class MorphologyTree:
         return pd.DataFrame(rows)
 
     def total_cable_length_um(self) -> float:
+        """Return the sum of all parent-child edge lengths in microns."""
         edges = self.edge_table()
         if edges.empty:
             return 0.0
         return float(edges["length_um"].sum())
 
     def path_to_root(self, node_id: int) -> List[int]:
+        """
+        Return the node-id path from a node back to the root.
+        
+        The returned list starts with ``node_id`` and walks proximally through parent
+        links. A cycle raises ``ValueError``.
+        """
         path = [int(node_id)]
         seen = {int(node_id)}
         parent = self.get_parent_id(node_id)
@@ -143,6 +200,7 @@ class MorphologyTree:
         return path
 
     def path_length_to_root_um(self, node_id: int) -> float:
+        """Return cumulative path length from a node to the root in microns."""
         total = 0.0
         current = int(node_id)
         while True:
@@ -154,6 +212,11 @@ class MorphologyTree:
         return total
 
     def branch_orders(self) -> pd.Series:
+        """
+        Compute centrifugal branch order for each node.
+        
+        Branch order increases when a path passes through a branch point.
+        """
         order = {self.root_id: 0}
         queue = [self.root_id]
         while queue:
@@ -165,9 +228,11 @@ class MorphologyTree:
         return pd.Series(order, name="branch_order")
 
     def strahler_orders(self) -> pd.Series:
+        """Compute Strahler order for each node in the tree."""
         order: Dict[int, int] = {}
 
         def _compute(node_id: int) -> int:
+            """Recursively compute Strahler order for a node and its descendants."""
             children = self.get_children_ids(node_id)
             if not children:
                 order[node_id] = 1
@@ -184,6 +249,7 @@ class MorphologyTree:
         return pd.Series(order, name="strahler_order")
 
     def bounding_box_um(self) -> Dict[str, float]:
+        """Return min, max, and span of x/y/z coordinates in microns."""
         mins = self.nodes[["x_um", "y_um", "z_um"]].min()
         maxs = self.nodes[["x_um", "y_um", "z_um"]].max()
         spans = maxs - mins
@@ -200,6 +266,7 @@ class MorphologyTree:
         }
 
     def with_node_annotations(self) -> pd.DataFrame:
+        """Return nodes with child counts, order annotations, and path metrics."""
         df = self.nodes.copy()
         df = df.merge(self.child_counts.rename("n_children"), left_on="node_id", right_index=True, how="left")
         branch_orders = self.branch_orders().rename("branch_order")
@@ -212,10 +279,12 @@ class MorphologyTree:
         return df
 
     def branch_segments(self) -> List[pd.DataFrame]:
-        """Return proximal-to-distal polylines between critical nodes.
-
-        Critical nodes are roots, branch points, and tips. Each returned dataframe contains
-        contiguous samples along a single branch segment.
+        """
+        Return proximal-to-distal polylines between critical nodes.
+        
+        Critical nodes are roots, branch points, and tips. Each returned dataframe
+        contains contiguous samples along a single branch segment and includes
+        segment-level branch and Strahler annotations.
         """
         critical = set(self.roots) | set(self.branch_point_ids) | set(self.tip_ids)
         ann = self.nodes.copy().set_index("node_id")
@@ -249,7 +318,12 @@ class MorphologyTree:
 
 @dataclass
 class MorphologyBundle:
-    """Convenience container for a reconstruction and associated SNT tables."""
+    """
+    Convenience container for a reconstruction and associated SNT tables.
+    
+    The bundle groups a parsed tree with optional quick/full measurement tables,
+    Sholl data, tracing/image paths, and other sidecar files from the same folder.
+    """
 
     tree: MorphologyTree
     quick_measurements: Optional[pd.DataFrame] = None

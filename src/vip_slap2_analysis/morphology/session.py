@@ -1,3 +1,13 @@
+"""
+Discover morphology reconstruction assets for a session.
+
+This module contains lightweight utilities for locating morphology-related
+files beneath a session directory. The discovery logic is intentionally
+conservative: it identifies likely reconstruction folders and gathers SWC,
+Fiji/SNT tracing, measurement, and prepared TIFF files without loading or
+modifying the data.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -7,6 +17,13 @@ from typing import Dict, List, Optional
 
 @dataclass
 class MorphologyAssets:
+    """
+    Container describing morphology files discovered for one session.
+    
+    Attributes capture the session root, an optional morphology-specific folder,
+    lists of reconstruction/tracing/measurement/image files, and any additional
+    metadata supplied by upstream session-discovery code.
+    """
     session_id: str
     session_dir: Path
     morphology_dir: Optional[Path] = None
@@ -26,6 +43,26 @@ MORPHOLOGY_DIR_NAMES = [
 
 
 def discover_morphology_assets(session_dir: str | Path, session_id: Optional[str] = None) -> MorphologyAssets:
+    """
+    Discover morphology-related files beneath a session directory.
+    
+    The function first searches for directories with names commonly used for
+    morphology reconstructions, then scans the selected root for SWC files,
+    Fiji/SNT ``.traces`` files, measurement or Sholl CSVs, and TIFF image stacks.
+    
+    Parameters
+    ----------
+    session_dir
+        Root session directory to search.
+    session_id
+        Optional explicit session identifier. When omitted, the directory name is
+        used.
+    
+    Returns
+    -------
+    MorphologyAssets
+        File-discovery summary for the session.
+    """
     session_dir = Path(session_dir)
     if session_id is None:
         session_id = session_dir.name
