@@ -1,3 +1,12 @@
+"""
+Trace reconstruction and stimulus-alignment helpers for glutamate imaging.
+
+This module contains low-level utilities for parsing corrected Bonsai event logs,
+filtering events to valid imaging epochs, reconstructing continuous DMD traces
+from trial-wise SLAP2 outputs, aligning traces to stimulus onsets, and summarizing
+fixed-length or ragged event tensors.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -17,6 +26,12 @@ StimIntervalDict = Dict[str, StimIntervalList]
 
 @dataclass
 class EventWindows:
+    """
+    Pre- and post-event window durations for each stimulus family.
+    
+    Each tuple stores ``(pre_seconds, post_seconds)`` and is used to determine the
+    length of aligned event snippets.
+    """
     image: Tuple[float, float] = (0.25, 0.50)
     change: Tuple[float, float] = (1.00, 0.75)
     omission: Tuple[float, float] = (1.00, 1.50)
@@ -24,6 +39,12 @@ class EventWindows:
 
 @dataclass
 class OrderedImageEvent:
+    """
+    Metadata for one image presentation in corrected Bonsai event order.
+    
+    The ``is_change_target`` flag is later set for images immediately following a
+    change event.
+    """
     event_idx: int
     image_name: str
     onset: float
@@ -33,6 +54,12 @@ class OrderedImageEvent:
 
 @dataclass
 class ReconstructedTraceBundle:
+    """
+    Continuous DMD trace bundle reconstructed from trial-wise SLAP2 output.
+    
+    The bundle stores traces, sample times, trial validity, trial lengths, and session
+    time bounds needed for event alignment.
+    """
     traces: np.ndarray                 # (n_rois, n_total_samples)
     timebase_sec: np.ndarray          # (n_total_samples,)
     trial_valid_mask: np.ndarray      # (n_trials,)
@@ -48,6 +75,12 @@ class ReconstructedTraceBundle:
 # -----------------------------------------------------------------------------
 
 def load_corrected_bonsai_csv(path: Union[str, Path]) -> pd.DataFrame:
+    """
+    Load a behavior event log containing HARP-corrected Bonsai timestamps.
+    
+    The function validates that a corrected timestamp column and stimulus ``Value``
+    column are present before returning the DataFrame.
+    """
     df = pd.read_csv(path)
     if "corrected_timestamp" not in df.columns and "corrected_timestamps" not in df.columns:
         raise ValueError(
@@ -60,6 +93,12 @@ def load_corrected_bonsai_csv(path: Union[str, Path]) -> pd.DataFrame:
 
 
 def load_imaging_epochs_csv(path: Union[str, Path]) -> pd.DataFrame:
+    """
+    Load imaging epoch boundaries used to filter behavior events.
+    
+    The returned DataFrame must contain ``start_time`` and ``end_time`` columns in the
+    same corrected timebase as the event log.
+    """
     df = pd.read_csv(path)
     required = {"start_time", "end_time"}
     missing = required - set(df.columns)
@@ -69,6 +108,11 @@ def load_imaging_epochs_csv(path: Union[str, Path]) -> pd.DataFrame:
 
 
 def _time_col(stim_df: pd.DataFrame) -> str:
+    """
+    Return the corrected timestamp column used by a stimulus DataFrame.
+    
+    Both singular and plural historical column names are supported.
+    """
     if "corrected_timestamp" in stim_df.columns:
         return "corrected_timestamp"
     if "corrected_timestamps" in stim_df.columns:
@@ -81,24 +125,39 @@ def _time_col(stim_df: pd.DataFrame) -> str:
 # -----------------------------------------------------------------------------
 
 def _normalize_value_series(stim_df: pd.DataFrame) -> pd.Series:
+    """Return stimulus values as non-null strings for robust event parsing."""
     return stim_df["Value"].fillna("").astype(str)
 
 
 def _is_image_value(v: str) -> bool:
+    """
+    Return True when a stimulus value represents an image file presentation.
+    
+    Photodiode diagnostic strings are explicitly excluded even if they contain image
+    file-like text.
+    """
     vl = v.lower()
     return vl.endswith((".tif", ".tiff")) and ("photodiode" not in vl)
 
 
 def _is_change_value(v: str) -> bool:
+    """Return True when a stimulus value marks a change event."""
     return "changeflash" in v.lower() or v.lower() == "change"
 
 
 def _is_omission_value(v: str) -> bool:
+    """Return True when a stimulus value marks an omitted-image event."""
     vl = v.lower()
     return vl == "omission" or "omission" in vl
 
 
 def _is_nonstimulus_value(v: str) -> bool:
+    """
+    Return True for behavior-log rows that should not be treated as stimuli.
+    
+    This helper captures frame markers, gray periods, intertrial markers, and
+    photodiode events.
+    """
     vl = v.lower()
     return (
         vl in {"frame", "endframe", "endflash", "gray", "intertrial"}
@@ -147,6 +206,12 @@ def extract_change_intervals(
     *,
     time_col: Optional[str] = None,
 ) -> StimIntervalList:
+    """
+    Extract corrected onset times for change events from a stimulus DataFrame.
+    
+    Intervals are returned as ``(onset, NaN)`` pairs to match the shared interval
+    schema used by alignment helpers.
+    """
     tcol = time_col or _time_col(stim_df)
     out: StimIntervalList = []
     for _, row in stim_df.iterrows():
@@ -161,6 +226,12 @@ def extract_omission_intervals(
     *,
     time_col: Optional[str] = None,
 ) -> StimIntervalList:
+    """
+    Extract corrected onset times for omission events from a stimulus DataFrame.
+    
+    Intervals are returned as ``(onset, NaN)`` pairs to match the shared interval
+    schema used by alignment helpers.
+    """
     tcol = time_col or _time_col(stim_df)
     out: StimIntervalList = []
     for _, row in stim_df.iterrows():
@@ -219,6 +290,12 @@ def extract_ordered_change_targets(
 # -----------------------------------------------------------------------------
 
 def _epoch_bounds(epoch_df: pd.DataFrame, pre: float, post: float) -> List[Tuple[float, float]]:
+    """
+    Compute event-onset bounds that allow full pre/post windows within imaging epochs.
+    
+    Epoch starts are shifted forward by the pre-window and epoch ends are shifted
+    backward by the post-window.
+    """
     bounds = []
     for _, row in epoch_df.iterrows():
         a = float(row["start_time"]) + pre
@@ -229,6 +306,7 @@ def _epoch_bounds(epoch_df: pd.DataFrame, pre: float, post: float) -> List[Tuple
 
 
 def _in_any_bound(t: float, bounds: List[Tuple[float, float]]) -> bool:
+    """Return True when a timestamp falls within any valid epoch bound."""
     for a, b in bounds:
         if a <= t <= b:
             return True
@@ -242,6 +320,12 @@ def filter_intervals_to_epochs(
     pre_time: float,
     post_time: float,
 ) -> Union[StimIntervalDict, StimIntervalList]:
+    """
+    Filter stimulus intervals to events whose full extraction window is in an epoch.
+    
+    The function preserves whether the input is a dictionary of image identities or a
+    single list of event intervals.
+    """
     keep_bounds = _epoch_bounds(epoch_df, pre_time, post_time)
 
     if isinstance(stim_times, dict):
@@ -260,6 +344,9 @@ def filter_ordered_images_to_epochs(
     pre_time: float,
     post_time: float,
 ) -> List[OrderedImageEvent]:
+    """
+    Filter ordered image events to those with full extraction windows inside epochs.
+    """
     keep_bounds = _epoch_bounds(epoch_df, pre_time, post_time)
     return [evt for evt in ordered_images if _in_any_bound(evt.onset, keep_bounds)]
 
@@ -491,6 +578,13 @@ def align_traces_to_session_intervals(
     post_time: float,
     return_used_onsets: bool = True,
 ):
+    """
+    Extract event-aligned trace snippets for stimulus intervals.
+    
+    The function supports image-identity dictionaries and flat interval lists, using
+    an explicit bundle timebase when available and otherwise falling back to fixed-rate
+    sample conversion.
+    """
     n_pre = int(round(pre_time * im_rate_hz))
     n_post = int(round(post_time * im_rate_hz))
     n_win = n_pre + n_post
@@ -498,6 +592,7 @@ def align_traces_to_session_intervals(
     traces, _session_start_arr, session_start_sec, timebase_sec = _resolve_bundle_timebase(bundle)
 
     def _extract_one_list(intervals):
+        """Extract aligned snippets and retained onset times for one interval list."""
         snippets = []
         kept_onsets = []
 
@@ -547,6 +642,12 @@ def align_traces_to_session_intervals(
 # -----------------------------------------------------------------------------
 
 def summarize_event_tensor(x: np.ndarray) -> Dict[str, np.ndarray]:
+    """
+    Summarize an event tensor with mean, standard deviation, event count, and finite
+    counts.
+    
+    The expected input shape is events by synapses by time.
+    """
     if x.ndim != 3:
         raise ValueError(f"Expected (n_events, n_synapses, n_time), got {x.shape}")
     n_events = int(x.shape[0])

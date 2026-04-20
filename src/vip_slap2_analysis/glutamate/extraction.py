@@ -1,3 +1,12 @@
+"""
+Glutamate event-extraction pipeline.
+
+This module loads SLAP2 summary files and behavior-aligned stimulus logs, then
+reconstructs session-wide traces for each DMD. It extracts image-, change-, and
+omission-aligned snippets, builds change-locked image sequences, applies optional
+synapse QC masks, and writes compact ``.npz`` packages plus JSON QC metadata.
+"""
+
 from __future__ import annotations
 
 import json
@@ -27,6 +36,12 @@ from vip_slap2_analysis.glutamate.alignment import (
 
 
 def _resolve_im_rate_hz(asset: SessionAssets, metadata: Dict[str, Any]) -> float:
+    """
+    Resolve the imaging sample rate from explicit metadata or session asset metadata.
+    
+    Both ``im_rate_hz`` and ``im_rate_Hz`` spellings are accepted to accommodate
+    historical metadata conventions.
+    """
     if "im_rate_hz" in metadata:
         return float(metadata["im_rate_hz"])
     if "im_rate_Hz" in metadata:
@@ -40,6 +55,11 @@ def _resolve_im_rate_hz(asset: SessionAssets, metadata: Dict[str, Any]) -> float
 
 
 def _load_synapse_qc_mask(asset: SessionAssets, dmd: int) -> Optional[np.ndarray]:
+    """
+    Load the optional boolean valid-synapse mask for a DMD.
+    
+    Returns None when no QC directory or mask file is available.
+    """
     if asset.qc_dir is None:
         return None
     p = Path(asset.qc_dir) / f"valid_synapses_dmd{dmd}.npy"
@@ -49,6 +69,12 @@ def _load_synapse_qc_mask(asset: SessionAssets, dmd: int) -> Optional[np.ndarray
 
 
 def _apply_synapse_mask_to_array(x: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
+    """
+    Apply a one-dimensional synapse mask to event or trace arrays.
+    
+    Three-dimensional arrays are interpreted as events by synapses by time, and
+    two-dimensional arrays are interpreted as synapses by time.
+    """
     if mask is None:
         return x
     if x.ndim == 3:
@@ -59,6 +85,12 @@ def _apply_synapse_mask_to_array(x: np.ndarray, mask: Optional[np.ndarray]) -> n
 
 
 def _time_vectors(windows: EventWindows, im_rate_hz: float) -> Dict[str, np.ndarray]:
+    """
+    Build relative time vectors for image, change, and omission event windows.
+    
+    Each vector spans from negative pre-event time through post-event time at the
+    configured imaging sample rate.
+    """
     return {
         "image": np.arange(-windows.image[0], windows.image[1], 1.0 / im_rate_hz),
         "change": np.arange(-windows.change[0], windows.change[1], 1.0 / im_rate_hz),
@@ -67,10 +99,20 @@ def _time_vectors(windows: EventWindows, im_rate_hz: float) -> Dict[str, np.ndar
 
 
 def _empty_event_array(n_syn: int, n_time: int) -> np.ndarray:
+    """
+    Create an empty event tensor with the expected synapse and time dimensions.
+    
+    The tensor has zero events and is filled with NaNs for downstream consistency.
+    """
     return np.full((0, n_syn, n_time), np.nan, dtype=float)
 
 
 def _stack_snippets(snippets: List[np.ndarray], n_syn: int, n_time: int) -> np.ndarray:
+    """
+    Stack event snippets or return a correctly shaped empty event tensor.
+    
+    This helper keeps event-summary code robust when no events survive filtering.
+    """
     if len(snippets) == 0:
         return _empty_event_array(n_syn, n_time)
     return np.stack(snippets, axis=0)
@@ -83,6 +125,12 @@ def _build_sequence_output(
     n_syn_kept: int,
     n_time: int,
 ) -> Dict[str, Any]:
+    """
+    Build prechange, repeated, and terminal sequence summaries for each image.
+    
+    The function groups ordered image snippets around change targets and summarizes
+    ragged sequence-position arrays into mean, standard deviation, and count fields.
+    """
     out: Dict[str, Any] = {}
 
     for image_name, groups in seq_events.items():
@@ -135,14 +183,22 @@ def _build_sequence_output(
 
 
 def _jsonify_onset_dict(d: Dict[str, np.ndarray]) -> Dict[str, List[float]]:
+    """Convert a dictionary of NumPy onset arrays into JSON-serializable lists."""
     return {k: [float(x) for x in v.tolist()] for k, v in d.items()}
 
 
 def _jsonify_onset_array(x: np.ndarray) -> List[float]:
+    """Convert a NumPy onset array into a JSON-serializable list of floats."""
     return [float(v) for v in x.tolist()]
 
 
 def _trace_suffix(trace_signal: str, trace_mode: Optional[str]) -> str:
+    """
+    Construct the filename suffix that identifies the extracted trace signal and mode.
+    
+    The F0 signal is stored without a mode suffix because it is already a baseline
+    trace rather than a processed signal variant.
+    """
     signal = str(trace_signal)
     if signal == "F0":
         return "F0"
@@ -159,6 +215,14 @@ def process_glutamate_extraction(
     trace_signal: str = "dF",
     trace_mode: Optional[str] = "ls",
 ) -> Dict[str, Any]:
+    """
+    Extract event-aligned glutamate response packages for one registered session asset.
+    
+    The pipeline loads corrected stimulus events and imaging epochs, reconstructs
+    continuous traces for each DMD, extracts event-aligned image/change/omission
+    snippets, builds change-locked sequence summaries, applies optional synapse QC,
+    writes compressed NPZ outputs, and saves extraction QC metadata as JSON.
+    """
     metadata = metadata or {}
     pp = metadata.get("prepost_sec", {})
     windows = EventWindows(

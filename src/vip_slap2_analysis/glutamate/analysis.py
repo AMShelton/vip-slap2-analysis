@@ -1,3 +1,13 @@
+"""
+Glutamate response analysis utilities.
+
+This module converts event-aligned glutamate extraction products into tabular
+analysis outputs used for synapse activation, image tuning, and sequence-dynamics
+analyses. The functions operate on compressed ``.npz`` packages produced by
+``glutamate.extraction`` and save reviewable CSV/parquet tables for downstream
+notebooks and presentations.
+"""
+
 from __future__ import annotations
 
 import json
@@ -75,6 +85,12 @@ class GlutamateAnalysisConfig:
 
 @dataclass
 class GlutamateAnalysisPaths:
+    """
+    Container for the canonical glutamate analysis input and output paths.
+    
+    Attributes point to the extraction products required by analysis routines and to
+    the directory where CSV/parquet tables should be written.
+    """
     single_trial_npz: Path
     mean_npz: Path
     sequence_npz: Path
@@ -82,6 +98,12 @@ class GlutamateAnalysisPaths:
 
 
 def _bh_fdr(pvals: Sequence[float]) -> np.ndarray:
+    """
+    Apply Benjamini-Hochberg false-discovery-rate correction to p-values.
+    
+    NaN values are preserved, finite values are adjusted together, and q-values are
+    returned in the original input order.
+    """
     pvals = np.asarray(pvals, dtype=float)
     out = np.full_like(pvals, np.nan, dtype=float)
     finite = np.isfinite(pvals)
@@ -101,6 +123,12 @@ def _bh_fdr(pvals: Sequence[float]) -> np.ndarray:
 
 
 def _safe_wilcoxon_zero(x: np.ndarray) -> float:
+    """
+    Run a one-sample Wilcoxon signed-rank test against zero.
+    
+    Returns NaN when the test is undefined and returns one for all-zero finite input,
+    which represents no evidence against the zero-centered null hypothesis.
+    """
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
     if x.size == 0:
@@ -114,6 +142,12 @@ def _safe_wilcoxon_zero(x: np.ndarray) -> float:
 
 
 def _safe_kruskal(groups: Sequence[np.ndarray]) -> float:
+    """
+    Run a Kruskal-Wallis test across non-empty finite-valued groups.
+    
+    Groups containing only NaNs are ignored. NaN is returned when fewer than two
+    valid groups remain or SciPy raises because the comparison is ill-defined.
+    """
     valid = []
     for g in groups:
         g = np.asarray(g, dtype=float)
@@ -129,12 +163,23 @@ def _safe_kruskal(groups: Sequence[np.ndarray]) -> float:
 
 
 def _basename_stimulus(stim_name: str) -> str:
+    """
+    Normalize a stimulus path or filename to the image label used in tables.
+    
+    The returned label strips directory components and the ``.tiff`` suffix while
+    leaving other filename content unchanged.
+    """
     stim = str(stim_name).replace("\\", "/")
     leaf = stim.split("/")[-1]
     return leaf.replace(".tiff", "")
 
 
 def _load_npz_dict(path: str | Path) -> dict[str, Any]:
+    """
+    Load a compressed extraction package saved with a top-level ``data`` object.
+    
+    Raises a clear error when the expected schema key is absent.
+    """
     arr = np.load(Path(path), allow_pickle=True)
     if "data" not in arr.files:
         raise KeyError(f"Expected top-level key 'data' in {path}, found {arr.files}")
@@ -144,6 +189,12 @@ def _load_npz_dict(path: str | Path) -> dict[str, Any]:
 def _load_activation_summary_source(
     activation_summary: pd.DataFrame | str | Path | None,
 ) -> pd.DataFrame | None:
+    """
+    Load an activation summary from a DataFrame, CSV file, or parquet file.
+    
+    The returned DataFrame is copied and cleaned of common notebook index columns so
+    analysis functions can safely filter it by session.
+    """
     if activation_summary is None:
         return None
     if isinstance(activation_summary, pd.DataFrame):
@@ -165,6 +216,12 @@ def _load_activation_summary_source(
 
 
 def _get_session_id_from_single_trial_npz(single_trial_npz: str | Path) -> str:
+    """
+    Read the session identifier from a single-trial glutamate extraction package.
+    
+    The session ID is required when subsetting externally concatenated activation
+    summary tables to the current session.
+    """
     root = _load_npz_dict(single_trial_npz)
     metadata = root.get("metadata", {})
     session_id = metadata.get("session_id")
@@ -178,6 +235,12 @@ def _subset_activation_summary_for_session(
     *,
     session_id: str,
 ) -> pd.DataFrame:
+    """
+    Return activation-summary rows for one session with normalized key columns.
+    
+    The helper keeps string representations of DMD and synapse IDs consistent across
+    stored tables and freshly loaded extraction products.
+    """
     if activation_summary_df is None:
         raise ValueError("activation_summary_df must not be None.")
     if "session_id" not in activation_summary_df.columns:
@@ -195,6 +258,12 @@ def load_session_activation_summary(
     single_trial_npz: str | Path,
     activation_summary: pd.DataFrame | str | Path,
 ) -> pd.DataFrame:
+    """
+    Load and subset an activation summary for the session represented by an NPZ file.
+    
+    This is the public helper used when tuning or sequence analyses reuse activation
+    labels generated by an earlier batch run.
+    """
     activation_summary_df = _load_activation_summary_source(activation_summary)
     session_id = _get_session_id_from_single_trial_npz(single_trial_npz)
     subset = _subset_activation_summary_for_session(
@@ -208,6 +277,12 @@ def resolve_glutamate_analysis_paths(
     session_dir_or_analysis_dir: str | Path,
     output_dir: str | Path | None = None,
 ) -> GlutamateAnalysisPaths:
+    """
+    Resolve canonical glutamate analysis paths from a session or analysis directory.
+    
+    The function accepts either a session root or its ``analysis`` subdirectory and
+    returns paths to expected extraction products and the output table directory.
+    """
     base = Path(session_dir_or_analysis_dir)
     analysis_dir = base if base.name == "analysis" else base / "analysis"
     derived = analysis_dir / "derived" / "glutamate"
@@ -221,6 +296,12 @@ def resolve_glutamate_analysis_paths(
 
 
 def _window_metric(windows: np.ndarray, pre: tuple[int, int], post: tuple[int, int]) -> np.ndarray:
+    """
+    Compute post-minus-pre area-under-curve values for event windows.
+    
+    The input may contain leading dimensions for events and synapses; integration is
+    performed along the final time axis.
+    """
     windows = np.asarray(windows, dtype=float)
     pre_auc = np.nansum(windows[..., pre[0]:pre[1]], axis=-1)
     post_auc = np.nansum(windows[..., post[0]:post[1]], axis=-1)
@@ -228,6 +309,11 @@ def _window_metric(windows: np.ndarray, pre: tuple[int, int], post: tuple[int, i
 
 
 def _nanmean_last_axis(arr: np.ndarray) -> np.ndarray:
+    """
+    Compute a NaN-aware mean along the final axis without empty-slice warnings.
+    
+    Positions with no finite values are returned as NaN.
+    """
     arr = np.asarray(arr, dtype=float)
     valid = np.isfinite(arr)
     denom = valid.sum(axis=-1)
@@ -237,6 +323,12 @@ def _nanmean_last_axis(arr: np.ndarray) -> np.ndarray:
 
 
 def _window_delta_mean(windows: np.ndarray, pre: tuple[int, int], post: tuple[int, int]) -> np.ndarray:
+    """
+    Compute post-minus-pre mean fluorescence values for event windows.
+    
+    This is the mean-amplitude analogue of ``_window_metric`` and preserves leading
+    array dimensions.
+    """
     windows = np.asarray(windows, dtype=float)
     pre_mean = _nanmean_last_axis(windows[..., pre[0]:pre[1]])
     post_mean = _nanmean_last_axis(windows[..., post[0]:post[1]])
@@ -244,6 +336,12 @@ def _window_delta_mean(windows: np.ndarray, pre: tuple[int, int], post: tuple[in
 
 
 def _rolling_nanmean_1d(x: np.ndarray, window: int) -> np.ndarray:
+    """
+    Compute a valid-mode rolling mean for a one-dimensional vector with NaN support.
+    
+    Each output sample averages finite values within its window and is NaN when the
+    window contains no finite observations.
+    """
     x = np.asarray(x, dtype=float)
     if x.ndim != 1:
         raise ValueError("_rolling_nanmean_1d expects a 1D array.")
@@ -260,6 +358,12 @@ def _rolling_nanmean_1d(x: np.ndarray, window: int) -> np.ndarray:
 
 
 def _peak_window_response(trace: np.ndarray, pre: tuple[int, int], post: tuple[int, int], peak_window_samples: int) -> float:
+    """
+    Estimate a response amplitude from the largest rolling post-stimulus mean.
+    
+    The returned value is the peak rolling post-window mean minus the pre-window
+    baseline mean for a single average trace.
+    """
     trace = np.asarray(trace, dtype=float)
     if trace.ndim != 1:
         raise ValueError("_peak_window_response expects a 1D trace.")
@@ -280,6 +384,12 @@ def _sequence_metric_from_mean(
     post: tuple[int, int],
     peak_window_samples: int,
 ) -> np.ndarray:
+    """
+    Compute sequence response amplitudes from mean traces.
+    
+    Supports a single trace or an array of traces and applies ``_peak_window_response``
+    along the final time dimension.
+    """
     mean_traces = np.asarray(mean_traces, dtype=float)
     if mean_traces.ndim == 1:
         return np.array([_peak_window_response(mean_traces, pre=pre, post=post, peak_window_samples=peak_window_samples)], dtype=float)
@@ -294,6 +404,12 @@ def _sequence_response_metric_from_mean(
     *,
     config: GlutamateAnalysisConfig,
 ) -> np.ndarray:
+    """
+    Select the configured response-amplitude metric for sequence analyses.
+    
+    Current options reproduce either the binned-peak pipeline metric or the notebook
+    mean-response slope metric.
+    """
     method = str(config.sequence_slope_method).lower()
     mean_traces = np.asarray(mean_traces, dtype=float)
     if method == "binned_peak":
@@ -317,6 +433,12 @@ def _sequence_time_midpoints_s(
     *,
     config: GlutamateAnalysisConfig,
 ) -> np.ndarray:
+    """
+    Convert repeated-image sequence positions to approximate flash midpoints in seconds.
+    
+    The conversion uses the configured flash start offset, flash duration, and gray
+    inter-flash interval.
+    """
     positions = np.asarray(positions, dtype=float)
     cycle_dur = float(config.sequence_flash_duration_s) + float(config.sequence_gray_duration_s)
     return float(config.sequence_flash_start_offset_s) + 0.5 * float(config.sequence_flash_duration_s) + positions * cycle_dur
@@ -326,6 +448,12 @@ def build_event_response_table(
     single_trial_npz: str | Path,
     config: GlutamateAnalysisConfig | None = None,
 ) -> pd.DataFrame:
+    """
+    Build a long-form table of event-level image, change, and omission responses.
+    
+    Rows are generated for every event-by-synapse combination and include both
+    post-minus-pre AUC and post-minus-pre mean response metrics.
+    """
     config = config or GlutamateAnalysisConfig()
     root = _load_npz_dict(single_trial_npz)
     meta = root.get("metadata", {})
@@ -392,6 +520,12 @@ def classify_activation(
     single_trial_npz: str | Path,
     config: GlutamateAnalysisConfig | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Classify synapses as activated, deactivated, or unchanged for each stimulus family.
+    
+    The routine computes event-level responses, tests median response changes against
+    zero, applies within-synapse FDR correction, and returns event and summary tables.
+    """
     config = config or GlutamateAnalysisConfig()
     event_df = build_event_response_table(single_trial_npz=single_trial_npz, config=config)
 
@@ -459,6 +593,12 @@ def classify_activation(
 
 
 def _normalize_response_classes(response_classes: Sequence[str] | None) -> tuple[str, ...]:
+    """
+    Normalize user-provided response-class labels to internal canonical names.
+    
+    Common spelling variants are mapped to ``activated``, ``deactivated``, or
+    ``no_change`` while preserving unknown custom labels.
+    """
     if response_classes is None:
         return ("activated",)
     norm_map = {
@@ -480,6 +620,12 @@ def _normalize_response_classes(response_classes: Sequence[str] | None) -> tuple
 
 
 def _collapse_trials_to_amplitude(arr: np.ndarray, amplitude_func: str = "mean") -> np.ndarray:
+    """
+    Collapse each trial trace to a scalar response amplitude.
+    
+    Supported reductions include mean, maximum, sum, and mean of the ten largest
+    samples within the provided trace window.
+    """
     arr = np.asarray(arr, dtype=float)
     if arr.ndim != 2:
         raise ValueError("_collapse_trials_to_amplitude expects a 2D array.")
@@ -504,6 +650,12 @@ def _compute_trace_variance_decomposition(
     mode: str = "trace",
     amplitude_func: str = "mean",
 ) -> dict[str, Any]:
+    """
+    Decompose trial-response variance into mean- and image-explained components.
+    
+    The returned dictionary contains total variance, residual variances, FVE metrics,
+    per-image FVE values, and counts describing the valid trial/image set.
+    """
     traces = np.asarray(traces, dtype=float)
     labels = np.asarray(labels)
     mode = str(mode).lower()
@@ -609,6 +761,12 @@ def _slice_traces_for_tuning(
     *,
     sample_slice: tuple[int, int] | None,
 ) -> np.ndarray:
+    """
+    Return the trace samples used for tuning/FVE calculations.
+    
+    When ``sample_slice`` is None, the original two-dimensional trace matrix is
+    returned unchanged.
+    """
     traces = np.asarray(traces, dtype=float)
     if traces.ndim != 2:
         raise ValueError("_slice_traces_for_tuning expects a 2D array.")
@@ -625,6 +783,12 @@ def _compute_tuning_fve(
     mode: str,
     amplitude_func: str,
 ) -> dict[str, Any]:
+    """
+    Compute tuning-related fraction-of-variance-explained metrics.
+    
+    This wrapper keeps the tuning-analysis call site explicit while delegating the
+    actual decomposition to ``_compute_trace_variance_decomposition``.
+    """
     return _compute_trace_variance_decomposition(
         traces=traces,
         labels=labels,
@@ -634,6 +798,11 @@ def _compute_tuning_fve(
 
 
 def _compute_fve(values: np.ndarray, labels: np.ndarray) -> float:
+    """
+    Compute scalar response variance explained by image identity.
+    
+    The prediction for each trial is the mean response of trials with the same label.
+    """
     values = np.asarray(values, dtype=float)
     labels = np.asarray(labels)
     finite = np.isfinite(values)
@@ -653,6 +822,11 @@ def _compute_fve(values: np.ndarray, labels: np.ndarray) -> float:
 
 
 def _interp_nans_1d(x: np.ndarray) -> np.ndarray:
+    """
+    Linearly interpolate NaNs in a one-dimensional vector.
+    
+    All-NaN input is returned unchanged because no finite interpolation anchors exist.
+    """
     x = np.asarray(x, dtype=float).copy()
     if x.ndim != 1:
         raise ValueError("_interp_nans_1d expects a 1D array.")
@@ -668,6 +842,12 @@ def _interp_nans_1d(x: np.ndarray) -> np.ndarray:
 
 
 def _select_manova_timepoints(n_obs: int, n_groups: int, n_time: int, max_timepoints: int) -> np.ndarray:
+    """
+    Select a feasible number of time points for MANOVA testing.
+    
+    The dimensionality is limited by the configured maximum, available observations,
+    number of groups, and available trace samples.
+    """
     max_dv = max(2, min(int(max_timepoints), int(n_obs - n_groups - 1), int(n_time)))
     if max_dv < 2:
         return np.array([], dtype=int)
@@ -683,6 +863,13 @@ def _run_manova_trace_test(
     interpolate_nans: bool = True,
     max_nan_fraction_per_trial: float = 0.1,
 ) -> dict[str, Any]:
+    """
+    Run a MANOVA test for image identity effects on multivariate trace responses.
+    
+    The helper filters trials with excessive NaNs, optionally interpolates remaining
+    NaNs, selects a feasible subset of time points, and extracts the requested test
+    statistic from statsmodels.
+    """
     out = {
         "p_manova": np.nan,
         "f_manova": np.nan,
@@ -776,6 +963,13 @@ def analyze_image_tuning(
     activation_summary_df: pd.DataFrame,
     config: GlutamateAnalysisConfig | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Analyze image tuning for synapses that pass the configured activation filter.
+    
+    The function computes per-image response summaries, FVE/shuffle statistics,
+    optional MANOVA statistics, preferred-image metadata, and a per-synapse tuning
+    summary table.
+    """
     config = config or GlutamateAnalysisConfig()
     rng = np.random.default_rng(config.random_seed)
     root = _load_npz_dict(single_trial_npz)
@@ -1079,12 +1273,23 @@ def analyze_image_tuning(
 
 
 def _normalize_sequence_response_classes(response_classes: Sequence[str] | None) -> tuple[str, ...] | None:
+    """
+    Normalize response-class filters for sequence analysis.
+    
+    A value of None means sequence analysis should include all image-responsive
+    synapses available in the activation metadata.
+    """
     if response_classes is None:
         return None
     return _normalize_response_classes(response_classes)
 
 
 def _assign_quantile_bins(values: np.ndarray, n_bins: int) -> np.ndarray:
+    """
+    Assign one-dimensional values to approximately equal-count quantile bins.
+    
+    Stable sorting is used so tied values are assigned deterministically.
+    """
     values = np.asarray(values, dtype=float)
     if values.ndim != 1:
         raise ValueError("_assign_quantile_bins expects a 1D array.")
@@ -1101,6 +1306,11 @@ def _assign_quantile_bins(values: np.ndarray, n_bins: int) -> np.ndarray:
 
 
 def _safe_polyfit_slope(x: np.ndarray, y: np.ndarray) -> float:
+    """
+    Fit a first-order polynomial slope while tolerating NaNs and degenerate inputs.
+    
+    NaN is returned when fewer than two valid points remain or all x-values are equal.
+    """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     keep = np.isfinite(x) & np.isfinite(y)
@@ -1115,6 +1325,12 @@ def _safe_polyfit_slope(x: np.ndarray, y: np.ndarray) -> float:
 
 
 def _epoch_label_from_bin(bin_index: int, n_bins: int) -> str:
+    """
+    Convert a sequence-bin index into a human-readable epoch label.
+    
+    The first and last bins are labeled early and late, with middle labels assigned
+    for intermediate bins.
+    """
     if n_bins <= 1:
         return "all"
     if bin_index == 0:
@@ -1134,6 +1350,12 @@ def _summarize_binned_sequence(
     counts: np.ndarray,
     n_bins: int,
 ) -> tuple[pd.DataFrame, float, float, float, float, float, float]:
+    """
+    Summarize a sequence-response profile after quantile binning by position.
+    
+    Returns binned response summaries plus overall, normalized, early, and late slope
+    estimates used for per-image sequence classification.
+    """
     positions = np.asarray(positions, dtype=float)
     responses = np.asarray(responses, dtype=float)
     responses_norm = np.asarray(responses_norm, dtype=float)
@@ -1195,6 +1417,13 @@ def _summarize_sequence_profile(
     counts: np.ndarray,
     config: GlutamateAnalysisConfig,
 ) -> tuple[pd.DataFrame, np.ndarray, float, float, float, float, float, float, str]:
+    """
+    Summarize repeated-image sequence responses according to the configured slope
+    method.
+    
+    The binned-peak method fits sequence-position slopes; the notebook-mean method
+    fits slopes over approximate elapsed time in seconds.
+    """
     method = str(config.sequence_slope_method).lower()
     positions = np.asarray(positions, dtype=float)
     responses = np.asarray(responses, dtype=float)
@@ -1294,6 +1523,12 @@ def _normalize_sequence_responses(
     strategy: str,
     r0: float,
 ) -> np.ndarray:
+    """
+    Normalize sequence response amplitudes for cross-image or cross-synapse comparison.
+    
+    Supported strategies divide by either the first response magnitude, the maximum
+    absolute response, or return unnormalized responses.
+    """
     responses = np.asarray(responses, dtype=float)
     strategy = str(strategy).lower()
     if strategy == "none":
@@ -1317,6 +1552,12 @@ def _classify_sequence_pattern(
     min_abs_slope: float,
     slope_frac: float,
 ) -> str:
+    """
+    Assign a descriptive sequence-dynamics label from early, late, and overall slopes.
+    
+    Labels distinguish stable, facilitating, adapting, late-facilitating, and
+    late-adapting response profiles using configurable slope thresholds.
+    """
     vals = np.array([early_slope, late_slope, overall_slope], dtype=float)
     max_abs = np.nanmax(np.abs(vals)) if np.any(np.isfinite(vals)) else np.nan
     if not np.isfinite(max_abs) or max_abs < float(min_abs_slope):
@@ -1344,6 +1585,12 @@ def _build_sequence_rank_table(
     tuning_summary_df: pd.DataFrame | None,
     rank_by: str,
 ) -> pd.DataFrame:
+    """
+    Build image-preference ranks for merging tuning results into sequence tables.
+    
+    The rank can be based on selectivity, response amplitude, or a hybrid score and
+    marks the preferred ranked image for each synapse.
+    """
     expected_cols = [
         "session_id", "dmd", "synapse_id", "stimulus_name", "stimulus_label",
         "image_selectivity_score", "ranking_score", "image_rank_within_synapse",
@@ -1411,6 +1658,13 @@ def analyze_sequence_dynamics(
     tuning_per_image_df: pd.DataFrame | None = None,
     tuning_summary_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Analyze repeated-image sequence dynamics for each synapse and stimulus identity.
+    
+    The function summarizes response amplitudes across repeated positions, terminal
+    responses, adaptation indices, slopes, labels, and optional tuning-based image
+    ranks into position-, per-image-, and per-synapse-level tables.
+    """
     config = config or GlutamateAnalysisConfig()
     root = _load_npz_dict(sequence_npz)
     meta = root.get("metadata", {})
@@ -1778,6 +2032,11 @@ def save_analysis_tables(
     output_dir: str | Path,
     metadata: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Path]:
+    """
+    Write analysis tables to CSV and, when available, parquet files.
+    
+    Optional metadata are saved beside the tables as JSON for reproducibility.
+    """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     written: dict[str, Path] = {}
@@ -1868,6 +2127,13 @@ def run_glutamate_analysis(
     activation_summary: pd.DataFrame | str | Path | None = None,
     recompute_activation: bool = True,
 ) -> dict[str, pd.DataFrame]:
+    """
+    Run the full glutamate response-analysis workflow for one session.
+    
+    The workflow resolves extraction paths, computes or loads activation labels,
+    calculates image tuning, analyzes sequence dynamics, saves all standard output
+    tables, and returns them as DataFrames.
+    """
     config = config or GlutamateAnalysisConfig()
     paths = resolve_glutamate_analysis_paths(session_dir_or_analysis_dir, output_dir=output_dir)
 
