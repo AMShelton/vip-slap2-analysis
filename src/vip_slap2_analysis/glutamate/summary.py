@@ -1,3 +1,17 @@
+"""Load, normalize, and process SLAP2 glutamate summary files.
+
+This module wraps MATLAB ``summarize_LoCo.m`` ExperimentSummary exports stored as
+MATLAB v7.3 / HDF5 files. It provides lazy access to per-trial DMD groups,
+synapse/source traces, manual soma ROI traces, summary images, footprints, and
+paired glutamate/calcium processing utilities.
+
+Public methods intentionally use 1-indexed DMD and trial numbers so notebooks can
+stay close to the MATLAB-facing terminology. Internally, synapse/source traces
+are normalized to ``(samples, rois, channels)``. Manual user ROI traces are
+returned as ``(rois, channels, samples)`` to preserve the legacy
+ExperimentSummary convention used by downstream extraction code.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,6 +33,20 @@ ChannelSpec = Union[None, int, str, Sequence[Union[int, str]]]
 
 @dataclass
 class UnmixResult:
+    """Container for glutamate-to-calcium unmixing results.
+
+    Attributes
+    ----------
+    ca_unmixed : np.ndarray
+        Calcium traces after subtracting the fitted high-pass glutamate component,
+        shaped ``(n_rois, n_samples)``.
+    beta : np.ndarray
+        Per-ROI regression coefficient for the glutamate high-pass nuisance term.
+    intercept : np.ndarray
+        Per-ROI intercept estimated during nuisance regression.
+    method : str
+        Name of the unmixing method used to produce the result.
+    """
     ca_unmixed: np.ndarray      # (n_rois, n_samples)
     beta: np.ndarray            # (n_rois,)
     intercept: np.ndarray       # (n_rois,)
@@ -27,6 +55,17 @@ class UnmixResult:
 
 @dataclass
 class DffResult:
+    """Container for calcium baseline and dF/F output.
+
+    Attributes
+    ----------
+    dff : np.ndarray
+        Baseline-normalized calcium traces, shaped ``(n_rois, n_samples)``.
+    baseline : np.ndarray
+        Estimated fluorescence baseline, shaped ``(n_rois, n_samples)``.
+    method : str
+        Name of the baseline estimation method.
+    """
     dff: np.ndarray             # (n_rois, n_samples)
     baseline: np.ndarray        # (n_rois, n_samples)
     method: str
@@ -37,9 +76,11 @@ def _nan_pad_artifacts_by_diff(
     std_factor: float = 20.0,
     nan_pad: int = 10,
 ) -> np.ndarray:
-    """
-    Port of ExperimentSummary.process_ca_trace artifact masking:
-    detect big jumps in diff(x) and NaN-pad around them.
+    """Mask abrupt one-dimensional trace artifacts with local NaNs.
+
+    This mirrors the artifact-masking logic used in the MATLAB ExperimentSummary
+    calcium trace processing: large first-difference jumps are detected and a small
+    window around each jump is replaced with NaN.
     """
     x = np.asarray(x, float).copy()
     x[np.isinf(x)] = np.nan
@@ -59,6 +100,21 @@ def _nan_pad_artifacts_by_diff(
 
 
 def _moving_average_reflect(x: np.ndarray, win: int) -> np.ndarray:
+    """Return a centered moving average with reflected edge padding.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        One-dimensional signal to smooth.
+    win : int
+        Moving-average window in samples. Even values are promoted to the next odd
+        value to keep the filter centered.
+
+    Returns
+    -------
+    np.ndarray
+        Smoothed signal with the same length as ``x``.
+    """
     x = np.asarray(x, float)
     if win <= 1:
         return x.copy()
@@ -78,9 +134,11 @@ def _baseline_percentile_filter(
     smooth_s: float = 1.0,
     eps: float = 1e-6,
 ) -> np.ndarray:
-    """
-    Practical stand-in for "compute_f0(... hull_window ... denoise_window ...)".
-    Uses a percentile filter to follow the lower envelope + optional smoothing.
+    """Estimate a lower-envelope baseline with a percentile filter.
+
+    This is a practical Python stand-in for the MATLAB hull-style baseline
+    estimator. NaNs are filled only for filtering, and the returned baseline is
+    floored by ``eps``.
     """
     x = np.asarray(x, float)
     n = x.size
@@ -110,8 +168,10 @@ def _baseline_percentile_filter(
     return np.maximum(base, eps)
 
 def _movmean_nan(x: np.ndarray, win: int) -> np.ndarray:
-    """
-    NaN-aware moving mean using pandas. Returns same length as x.
+    """Return a NaN-aware centered moving mean.
+
+    The output has the same length as the input. Missing values are ignored within
+    each rolling window rather than treated as zeros.
     """
     x = np.asarray(x, float)
     if win <= 1:
@@ -125,20 +185,22 @@ def _movmean_nan(x: np.ndarray, win: int) -> np.ndarray:
 
 
 def compute_f0(Fin, denoise_window: int, hull_window: int):
-    """
-    Baseline estimator (hull-like) used by your colleague.
+    """Estimate a fluorescence baseline with a hull-like procedure.
 
-    Args
-    ----
-    Fin : array_like, shape (T, ...) with time along axis 0 (NaNs allowed)
+    Parameters
+    ----------
+    Fin : array_like
+        Fluorescence array with time along axis 0. Additional dimensions are flattened
+        during processing and restored on output.
     denoise_window : int
-        Median filter window (time samples).
+        Rolling median window in samples.
     hull_window : int
-        Window that controls the “convex hull”-like operation.
+        Window controlling the lower-hull-like envelope operation.
 
     Returns
     -------
-    F0 : ndarray, same shape as Fin
+    np.ndarray
+        Baseline estimate with the same shape as ``Fin``.
     """
     F = np.asarray(Fin)
     orig_shape = F.shape
@@ -209,17 +271,12 @@ def unmix_ca_with_glu_hp_regress(
     ridge: float = 1e-6,
     min_finite_frac: float = 0.5,
 ) -> UnmixResult:
-    """
-    Remove glutamate-shaped contamination from Ca by fitting on high-pass components:
-      ca_hp ≈ beta * glu_hp + intercept
-    and subtracting only the fitted high-pass glutamate nuisance from the raw Ca trace.
+    """Regress high-pass glutamate contamination out of calcium traces.
 
-    Notes
-    -----
-    The fitted coefficient is estimated on high-pass traces, so we subtract
-    ``beta * glu_hp`` rather than ``beta * glu``. Subtracting the full glutamate
-    trace can introduce slow step-like offsets and remove meaningful biological
-    structure from the Ca signal.
+    For each ROI, the function fits ``ca_hp ~= beta * glu_hp + intercept`` on
+    high-pass traces and subtracts only the fitted high-pass glutamate component from
+    the raw calcium trace. This avoids removing slow calcium structure when the
+    glutamate channel contains low-frequency offsets.
     """
     ca = np.asarray(ca, float)
     glu = np.asarray(glu, float)
@@ -268,6 +325,7 @@ def unmix_ca_with_glu_hp_regress(
 
 
 def _as_1d_bool(x: np.ndarray) -> np.ndarray:
+    """Convert an input mask to a flat one-dimensional boolean array."""
     x = np.asarray(x).astype(bool).squeeze()
     if x.ndim != 1:
         x = x.reshape(-1)
@@ -275,7 +333,11 @@ def _as_1d_bool(x: np.ndarray) -> np.ndarray:
 
 
 def _align_bool_mask(mask: np.ndarray, n: int) -> np.ndarray:
-    """Ensure mask is 1D length n. Truncate if longer; pad False if shorter."""
+    """Align a boolean mask to a requested length.
+
+    Masks longer than ``n`` are truncated. Masks shorter than ``n`` are padded with
+    ``False``.
+    """
     mask = _as_1d_bool(mask)
     if mask.size == n:
         return mask
@@ -288,24 +350,33 @@ def _align_bool_mask(mask: np.ndarray, n: int) -> np.ndarray:
 
 @dataclass
 class GlutamateSummary:
-    """
-    Fast, lazy loader for summarize_LoCo.m ExperimentSummary files.
+    """Lazy reader and processor for SLAP2 ExperimentSummary files.
 
-    Expected layout (MATLAB -v7.3 / HDF5):
-      - top-level group: exptSummary
-      - exptSummary/E: ref-typed dataset (MATLAB cell array) indexing per-trial groups
-      - per-trial group commonly contains:
-          dF/events, dF/denoised, dF/ls
-          F0, SNR, footprints, discardFrames
-          frameLines
-          ROIs/F, ROIs/Fsvd
-          global/F
-      - summary images (ref-cells):
-          meanIM{dmd}, actIM{dmd}, selPix{dmd}, userROIs{dmd}
-    Notes:
-      - Some files reserve a 2-channel axis even when channel 2 is all-NaNs.
-      - For synapse/source traces we normalize to (samples, rois, channels) internally.
-      - For *user ROI* traces we return (rois, channels, samples) to match legacy ExperimentSummary.
+    The expected source file is the MATLAB v7.3 / HDF5 output from
+    ``summarize_LoCo.m`` with a top-level ``exptSummary`` group. The class handles
+    several conventions that vary across summary files, including whether
+    ``exptSummary/E`` is stored as ``(dmd, trial)`` or ``(trial, dmd)``, whether trace
+    datasets contain explicit channel axes, and whether footprints are dense images
+    or sparse selected-pixel matrices.
+
+    Attributes
+    ----------
+    file_path : str or pathlib.Path
+        Path to the ``SummaryLoCo`` MATLAB/HDF5 file.
+    keep_open : bool
+        Keep the underlying HDF5 handle open between reads.
+    swap_xy_images : bool
+        Swap image axes when loading summary images and footprints to match Python
+        display orientation.
+    cache_e_groups : bool
+        Cache dereferenced per-trial HDF5 groups.
+    max_group_cache : int
+        Maximum number of dereferenced per-trial groups to retain in the cache.
+
+    Notes
+    -----
+    Public methods use 1-indexed DMD and trial numbers. Internal helpers generally
+    use 0-indexed values and suffix those variables with ``0``.
     """
 
     file_path: Union[str, Path]
@@ -315,6 +386,12 @@ class GlutamateSummary:
     max_group_cache: int = 64  # cap for cached dereferenced E groups
 
     def __post_init__(self) -> None:
+        """Open the HDF5 file and infer summary-file structure.
+
+        This dataclass hook initializes cached metadata fields, validates that the file
+        contains ``exptSummary``, and populates trial/DMD bookkeeping by calling
+        ``_get_info``.
+        """
         self.file_path = Path(self.file_path)
         self._mat = MatV73File(self.file_path, keep_open=self.keep_open)
 
@@ -347,11 +424,18 @@ class GlutamateSummary:
     # ----------------- lifecycle -----------------
 
     def close(self) -> None:
+        """Close the underlying HDF5/MAT file handle."""
         self._mat.close()
 
     # ----------------- structure inference -----------------
 
     def _get_info(self) -> None:
+        """Infer DMD count, trial count, valid trials, and synapse counts.
+
+        The method inspects ``exptSummary/E`` without loading full trace arrays. It also
+        records DMD z positions when available and determines the orientation of the
+        MATLAB cell array used to store per-DMD/per-trial groups.
+        """
         f = self._mat.f
         E = f["exptSummary"]["E"]
 
@@ -416,6 +500,10 @@ class GlutamateSummary:
                 self.n_synapses[dmd0] = 0
 
     def _E_ref(self, dmd0: int, trial0: int) -> Optional[h5py.Reference]:
+        """Return the raw HDF5 reference for a DMD/trial ExperimentSummary entry.
+
+        Parameters are 0-indexed. Empty MATLAB references are returned as ``None``.
+        """
         E = self._mat.f["exptSummary"]["E"]
         if self._E_layout == "dmd_trial":
             ref = E[dmd0, trial0]
@@ -432,6 +520,11 @@ class GlutamateSummary:
         return ref
 
     def _E_group(self, dmd0: int, trial0: int) -> h5py.Group:
+        """Dereference and optionally cache a per-DMD/per-trial group.
+
+        Parameters are 0-indexed. The returned HDF5 group contains trial-level datasets
+        such as ``dF``, ``F0``, ``frameLines``, ``ROIs``, and ``footprints`` when present.
+        """
         key = (dmd0, trial0)
         if self.cache_e_groups and key in self._e_cache:
             return self._e_cache[key]
@@ -456,6 +549,11 @@ class GlutamateSummary:
     # ----------------- grab aData structure from summary .mat file -----------------
 
     def _aData_ref(self, dmd0: int, trial0: int) -> Optional[h5py.Reference]:
+        """Return the raw HDF5 reference for a DMD/trial ``aData`` entry.
+
+        Parameters are 0-indexed. Missing ``aData`` structures or empty MATLAB references
+        are returned as ``None``.
+        """
         f = self._mat.f
         if "aData" not in f["exptSummary"]:
             return None
@@ -475,6 +573,11 @@ class GlutamateSummary:
         return ref
 
     def _aData_group(self, dmd0: int, trial0: int) -> Optional[h5py.Group]:
+        """Dereference an ``aData`` entry for motion-regressor extraction.
+
+        Parameters are 0-indexed. Returns ``None`` when the entry is absent or does not
+        dereference to an HDF5 group.
+        """
         ref = self._aData_ref(dmd0, trial0)
         if ref is None:
             return None
@@ -485,14 +588,18 @@ class GlutamateSummary:
 
     @property
     def metadata(self) -> Dict[str, Any]:
-        """Decode exptSummary/params into a python dict (lazy)."""
+        """Decode and cache ``exptSummary/params`` as a Python dictionary."""
         if self._metadata is None:
             self._metadata = self._read_params_group("exptSummary/params")
         return self._metadata
 
     @property
     def align_params(self) -> Dict[str, Any]:
-        """Decode exptSummary/trialTable/alignParams into a python dict (lazy)."""
+        """Decode and cache ``exptSummary/trialTable/alignParams``.
+
+        Returns an empty dictionary when alignment parameters are not present in the
+        summary file.
+        """
         if self._align_params is None:
             try:
                 self._align_params = self._read_params_group("exptSummary/trialTable/alignParams")
@@ -501,6 +608,11 @@ class GlutamateSummary:
         return self._align_params
 
     def _read_params_group(self, group_path: str) -> Dict[str, Any]:
+        """Decode scalar, numeric, and string datasets from a parameter group.
+
+        Datasets that cannot be decoded are skipped. The output is intended for metadata
+        and alignment-parameter access rather than strict schema validation.
+        """
         out: Dict[str, Any] = {}
         g = self._mat.f[group_path]
         for k, ds in g.items():
@@ -531,10 +643,11 @@ class GlutamateSummary:
     # ----------------- channel selection -----------------
 
     def _normalize_channels(self, channels: ChannelSpec, n_channels: int) -> Optional[np.ndarray]:
-        """
-        Return 0-based channel indices or None meaning 'all'.
+        """Normalize channel specifiers to 0-indexed channel indices.
 
-        Accepted: None, int, "green"/"red", list/tuple of those.
+        Accepted inputs are ``None`` for all channels, integer channel indices, named
+        channels such as ``"green"``/``"glutamate"`` and ``"red"``/``"calcium"``, or a
+        sequence mixing those forms.
         """
         if channels is None:
             return None
@@ -571,12 +684,10 @@ class GlutamateSummary:
     # ----------------- trace helpers -----------------
 
     def _infer_n_rois_from_trace_dataset(self, ds: h5py.Dataset, g: Optional[h5py.Group] = None) -> int:
-        """
-        Infer number of sources/rois in a synapse-trace dataset.
+        """Infer ROI/source count from a trace dataset shape.
 
-        Works for shapes:
-          - (time, rois)
-          - (time, rois, ch) or (time, ch, rois) or (ch, time, rois)
+        The inference uses ``frameLines`` when available to identify the time axis, then
+        chooses the likely ROI axis while accounting for optional small channel axes.
         """
         shape = tuple(ds.shape)
 
@@ -625,8 +736,10 @@ class GlutamateSummary:
         pad_value: float = np.nan,
         drop_nan_channels: bool = False,
     ) -> Tuple[int, int, int]:
-        """
-        Determine (T, n_rois, n_channels) from the first readable valid synapse trial.
+        """Find the reference synapse trace shape for a DMD.
+
+        The first readable valid trial is loaded through ``get_traces`` and used to
+        determine ``(n_samples, n_rois, n_channels)`` for later padding across trials.
         """
         dmd0 = dmd - 1
         keep = np.asarray(self.keep_trials[dmd0], dtype=bool)
@@ -688,18 +801,18 @@ class GlutamateSummary:
         drop_nan_channels: bool = False,
         squeeze_channels: bool = False,
     ) -> Union[np.ndarray, List[Optional[np.ndarray]]]:
-        """
-        Load synapse/source traces across all trials.
+        """Load one synapse/source trace request across all trials.
+
+        The returned array is padded across trials unless ``pad_to="none"`` is requested.
+        Invalid trials are either left as NaN blocks or represented as ``None`` in the
+        list-returning mode.
 
         Returns
         -------
-        If pad_to != 'none':
-            ndarray of shape (n_trials, Tpad, n_rois, n_channels)
-            or (n_trials, Tpad, n_rois) if squeeze_channels=True and n_channels==1
-
-        If pad_to == 'none':
-            list of per-trial arrays, with invalid trials left as None when
-            include_invalid=False or as all-NaN arrays when include_invalid=True.
+        np.ndarray or list
+            If padded, an array shaped ``(n_trials, Tpad, n_rois, n_channels)`` or
+            ``(n_trials, Tpad, n_rois)`` when the single channel is squeezed. If unpadded,
+            a list of per-trial arrays is returned.
         """
         T_ref, n_rois_ref, n_ch_ref = self._ref_trial_shape_traces(
             dmd=dmd,
@@ -828,8 +941,10 @@ class GlutamateSummary:
         channels: Optional[np.ndarray],
         n_time: Optional[int],
     ) -> np.ndarray:
-        """
-        Normalize raw to (time, rois, ch).
+        """Normalize a raw trace array to ``(time, rois, channels)``.
+
+        The method uses the known time length and channel count when available and falls
+        back to shape heuristics for older or ambiguous LoCo exports.
         """
         x = np.asarray(raw)
 
@@ -897,8 +1012,11 @@ class GlutamateSummary:
         t_slice: Optional[slice],
         roi_inds: Optional[Sequence[int]],
     ) -> np.ndarray:
-        """
-        Read ds (optionally sliced) and return normalized (time, rois, ch).
+        """Read, slice, and normalize an HDF5 trace dataset.
+
+        Time, ROI, and channel axes are inferred before loading so optional time slices,
+        ROI selections, and channel selections can be applied directly to the HDF5
+        dataset.
         """
         shape = tuple(ds.shape)
         ndim = len(shape)
@@ -988,6 +1106,7 @@ class GlutamateSummary:
 
     @staticmethod
     def _squeeze_channels(x: np.ndarray, squeeze_channels: bool) -> np.ndarray:
+        """Drop a singleton channel axis when requested."""
         if squeeze_channels and x.ndim == 3 and x.shape[2] == 1:
             return x[:, :, 0]
         return x
@@ -1000,9 +1119,10 @@ class GlutamateSummary:
         *,
         eps: float = 1e-8,
     ) -> np.ndarray:
-        """
-        Compute dF/F0 with guarded division.
-        Invalid or tiny F0 values are returned as NaN.
+        """Compute ``dF / F0`` with guarded division.
+
+        Entries with non-finite or near-zero baseline values are returned as NaN rather
+        than producing infinities or unstable ratios.
         """
         dF = np.asarray(dF, dtype=float)
         F0 = np.asarray(F0, dtype=float)
@@ -1040,15 +1160,11 @@ class GlutamateSummary:
         squeeze_channels: bool = True,
         dff_eps: float = 1e-8,
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
-        """
-        Resolve a stored or derived trace request.
+        """Load stored traces or derive safe dF/F traces on demand.
 
-        Supported requests
-        ------------------
-        - signal='dF'  : stored dF/<mode>
-        - signal='F0'  : stored F0
-        - signal='dFF' : stored dFF/<mode> if present, otherwise derived as
-                         dF/<mode> divided by F0 using safe division.
+        For ``signal="dFF"``, a stored ``dFF/<mode>`` dataset is used when present. If it
+        is absent, the method safely derives dF/F from ``dF/<mode>`` and ``F0`` while
+        preserving the requested channel/ROI/time slicing behavior.
         """
         signal = str(signal)
 
@@ -1152,23 +1268,10 @@ class GlutamateSummary:
         use_fields: Sequence[str] = ("onlineXshift", "onlineYshift", "onlineZshift", "motionDSr", "motionDSc"),
         motion_step_thresh_z: float = 3.0,
     ) -> Tuple[np.ndarray, List[str]]:
-        """
-        Build nuisance regressors aligned to the ROI trace length.
+        """Build z-scored motion nuisance regressors for one trial.
 
-        Returns
-        -------
-        Xz : (target_len, P) float
-            Z-scored regressors (mean 0, std 1 per column where possible).
-        names : list[str]
-            Names for each regressor column.
-
-        Notes
-        -----
-        - Pulls vectors from aData struct fields, interpolates each to `target_len`.
-        - Adds derived terms for dx/dy: quadratic + interaction + derivatives.
-        - Adds speed/accel terms.
-        - Adds a *signed* step regressor that can model down-then-up plateau artifacts
-        (unlike a monotonic cumsum-only step).
+        Regressors are read from the trial's ``aData`` group, interpolated to the target
+        trace length, augmented with derived motion terms, and z-scored column-wise.
         """
         dmd0, trial0 = dmd - 1, trial - 1
         g = self._aData_group(dmd0, trial0)
@@ -1310,18 +1413,21 @@ class GlutamateSummary:
         drop_nan_channels: bool = False,
         squeeze_channels: bool = True,
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
-        """
-        Load synapse/source traces.
+        """Load synapse/source traces for one DMD and trial.
 
-        Normalized return is (samples, rois, channels) internally.
-        If squeeze_channels=True and channels==1 => returns (samples, rois).
+        The method supports stored ``dF``, stored or derived ``dFF``, and ``F0`` traces.
+        Raw HDF5 datasets are normalized internally to ``(samples, rois, channels)`` and
+        optionally returned with singleton channel dimensions squeezed.
 
         Parameters
         ----------
-        signal : {'dF','dFF','F0'}
-            Raw loader for stored datasets. For a derived dFF request that falls
-            back to dF/F0 when dFF is not stored, use `get_requested_traces(...)`.
-        mode : e.g. 'ls', 'denoised', 'events'
+        dmd, trial : int
+            1-indexed DMD and trial numbers.
+        signal : {"dF", "dFF", "F0"}
+            Trace family to load.
+        mode : str
+            Subdataset under ``dF`` or ``dFF``, such as ``"ls"``, ``"denoised"``, or
+            ``"events"``.
         """
         dmd0, trial0 = dmd - 1, trial - 1
         if trial <= 0 or dmd <= 0:
@@ -1489,18 +1595,12 @@ class GlutamateSummary:
         dtype: Optional[np.dtype] = None,
         squeeze_channels: bool = False,
     ) -> np.ndarray:
-        """
-        Load user ROI traces from E/ROIs/<trace_type>.
+        """Load manual user ROI traces from ``E/ROIs/<trace_type>``.
 
-        UPDATED RETURN FORMAT (per your request):
-          - returns (n_rois, n_channels, n_samples)
-
-        Notes
-        -----
-        Under the hood, LoCo often stores ROIs traces in a few possible layouts.
-        We normalize internally to (time, rois, ch), then *transpose* to (rois, ch, time).
-
-        If squeeze_channels=True and n_channels==1, returns (n_rois, n_samples).
+        LoCo exports user ROI traces in several possible axis orders. This method
+        normalizes those arrays internally and returns ``(n_rois, n_channels, n_samples)``
+        by default to match legacy ExperimentSummary usage. With ``squeeze_channels=True``
+        and one channel, it returns ``(n_rois, n_samples)``.
         """
         dmd0, trial0 = dmd - 1, trial - 1
         if trial <= 0 or dmd <= 0:
@@ -1549,6 +1649,11 @@ class GlutamateSummary:
     # ----------------- images and footprints -----------------
 
     def _cell_item(self, name: str, dmd0: int) -> Optional[Union[h5py.Dataset, h5py.Group]]:
+        """Return a DMD-specific item stored as a MATLAB cell-like HDF5 dataset.
+
+        The helper handles direct datasets as well as reference datasets where DMD can be
+        indexed along either axis.
+        """
         f = self._mat.f
         if name not in f["exptSummary"]:
             return None
@@ -1573,10 +1678,10 @@ class GlutamateSummary:
         return None
 
     def get_summary_image(self, dmd: int, image_type: str) -> np.ndarray:
-        """
-        Load exptSummary meanIM or actIM for given DMD.
+        """Load a DMD-level summary image such as ``meanIM`` or ``actIM``.
 
-        image_type: 'meanIM' or 'actIM'
+        Images are returned in Python display orientation when ``swap_xy_images`` is
+        enabled.
         """
         if image_type not in ("meanIM", "actIM"):
             raise ValueError("image_type must be 'meanIM' or 'actIM'")
@@ -1601,29 +1706,11 @@ class GlutamateSummary:
         gamma: float = 1.0,
         fill_value: float = 0.0,
     ) -> np.ndarray:
-        """
-        Robustly normalize a 2D image for RGB overlay display.
+        """Normalize a two-dimensional image for RGB overlay construction.
 
-        Parameters
-        ----------
-        image : ndarray
-            2D image.
-        max_val : float, optional
-            Explicit normalization ceiling. If None, uses nanquantile(image, q).
-        q : float, default 0.99
-            Quantile used when max_val is None.
-        clip : bool, default True
-            If True, clip normalized image to [0, 1].
-        gamma : float, default 1.0
-            Gamma applied after normalization. Values < 1 brighten dim structure;
-            values > 1 increase contrast of bright features.
-        fill_value : float, default 0.0
-            Value used to replace NaNs/Infs after normalization.
-
-        Returns
-        -------
-        out : ndarray
-            Float32 normalized image with shape matching input.
+        Normalization can use an explicit maximum value or a robust quantile ceiling.
+        Optional clipping, gamma correction, and finite-value cleanup are applied before
+        returning a float32 image.
         """
         x = np.asarray(image, dtype=np.float32)
 
@@ -1677,65 +1764,11 @@ class GlutamateSummary:
         return_dict: bool = False,
         dtype: np.dtype = np.float32,
     ) -> Union[List[np.ndarray], Dict[int, np.ndarray]]:
-        """
-        Generate RGB overlays of structural and activity summary images for each DMD.
+        """Build RGB overlays of structural and activity summary images.
 
-        By default, this reproduces the classic cyan (meanIM) + magenta (actIM)
-        overlay used to visualize dendritic structure and glutamatergic synapse
-        activity, while exposing substantially more control over scaling and color.
-
-        Parameters
-        ----------
-        dmds : sequence of int, optional
-            DMD numbers to process. Defaults to all available DMDs.
-        mean_image_type : str, default "meanIM"
-            Summary image used for structure.
-        act_image_type : str, default "actIM"
-            Summary image used for activity.
-        mean_channel : int or str, default 0
-            Channel to use if mean image is multi-channel.
-            Accepts python-style 0-based channel indices, or strings such as
-            "green"/"glutamate" -> 0 and "red"/"calcium" -> 1.
-        q_mean : float, default 0.99
-            Quantile for structural image normalization if mean_max_val is None.
-        q_act : float, default 0.999
-            Quantile for activity image normalization if act_max_val is None.
-        mean_max_val : float, optional
-            Explicit normalization ceiling for mean image. Overrides q_mean.
-        act_max_val : float, optional
-            Explicit normalization ceiling for act image. Overrides q_act.
-        use_shared_scale : bool, default True
-            If True, compute one shared normalization ceiling across requested DMDs
-            for each image type. This makes DMD-to-DMD comparisons more consistent.
-            If False, normalize each DMD independently.
-        mean_gamma : float, default 1.0
-            Gamma applied to normalized structural image.
-        act_gamma : float, default 1.0
-            Gamma applied to normalized activity image.
-        mean_rgb : tuple of float, default (0, 1, 1)
-            RGB color assigned to the structural image.
-        act_rgb : tuple of float, default (1, 0, 1)
-            RGB color assigned to the activity image.
-        background_rgb : tuple of float, default (0, 0, 0)
-            Base RGB background color before adding overlays.
-        alpha_mean : float, default 1.0
-            Weight of structural image contribution.
-        alpha_act : float, default 1.0
-            Weight of activity image contribution.
-        clip : bool, default True
-            Clip final RGB image to [0, 1].
-        mask_to_selpix : bool, default False
-            If True, zero pixels outside exptSummary/selPix for each DMD when available.
-            Useful when you want the overlay restricted to analyzed SLAP2 pixels.
-        return_dict : bool, default False
-            If True, return {dmd: rgb_image}. Otherwise return a list ordered by dmds.
-        dtype : np.dtype, default np.float32
-            Output dtype.
-
-        Returns
-        -------
-        overlays : list of ndarray or dict
-            RGB overlay images with shape (y, x, 3), one per DMD.
+        By default, the method produces the cyan ``meanIM`` plus magenta ``actIM`` view
+        used for visual QC. It can normalize each DMD independently or use shared scaling
+        across DMDs for more comparable multi-plane displays.
         """
         if dmds is None:
             dmds = list(range(1, self.n_dmds + 1))
@@ -1887,6 +1920,11 @@ class GlutamateSummary:
         return [overlays[dmd] for dmd in dmds]
 
     def get_sel_pix(self, dmd: int) -> np.ndarray:
+        """Load the selected-pixel mask for a DMD.
+
+        The returned mask is boolean and is placed in Python display orientation when
+        ``swap_xy_images`` is enabled.
+        """
         dmd0 = dmd - 1
         node = self._cell_item("selPix", dmd0)
         if node is None or not isinstance(node, h5py.Dataset):
@@ -1898,13 +1936,11 @@ class GlutamateSummary:
         return m
 
     def get_footprints(self, dmd: int, trial: int) -> np.ndarray:
-        """
-        Load synapse footprints.
+        """Load synapse footprint images for one DMD/trial.
 
-        Handles:
-          - dense footprints: (n_rois, y, x) or (y, x, n_rois)
-          - sparse LoCo footprints: (n_rois, n_selected_pixels) (+ selPix mask)
-        Returns: (n_rois, y, x) in python display orientation.
+        Both dense footprint stacks and sparse selected-pixel footprint matrices are
+        supported. The returned array is shaped ``(n_rois, y, x)`` in Python display
+        orientation.
         """
         dmd0, trial0 = dmd - 1, trial - 1
         g = self._E_group(dmd0, trial0)
@@ -1955,22 +1991,10 @@ class GlutamateSummary:
     import numpy as np
 
     def mean_footprints_across_trials(self, dmd: int, trials=None, dtype=np.float32) -> np.ndarray:
-        """
-        Average synapse footprints across trials for one DMD without stacking all trials.
+        """Average synapse footprints across selected trials.
 
-        Parameters
-        ----------
-        dmd : int
-            DMD index, typically 1 or 2.
-        trials : sequence of int or None
-            Trials to include. If None, uses self.valid_trials[dmd - 1].
-        dtype : numpy dtype
-            Accumulator dtype. float32 is usually sufficient and saves memory.
-
-        Returns
-        -------
-        mean_footprints : np.ndarray
-            Array of shape (n_synapses, ny, nx), averaged across trials with NaNs ignored.
+        Footprints are accumulated one trial at a time to avoid stacking large dense
+        arrays in memory. NaNs are ignored during averaging.
         """
         if trials is None:
             trials = self.valid_trials[dmd - 1]
@@ -2008,24 +2032,10 @@ class GlutamateSummary:
         return mean_footprints
 
     def footprint_centroids(self, footprints: np.ndarray, weighted: bool = True) -> np.ndarray:
-        """
-        Compute centroids for a stack of synapse footprint images.
+        """Compute per-footprint centroids.
 
-        Parameters
-        ----------
-        footprints : np.ndarray
-            Array of shape (n_synapses, ny, nx) or (n_synapses, nx, ny).
-            Background should be NaN, and footprint pixels should contain values
-            such as 0-255.
-        weighted : bool, default=True
-            If True, compute an intensity-weighted centroid.
-            If False, compute the centroid of the non-NaN footprint mask.
-
-        Returns
-        -------
-        centroids : np.ndarray
-            Array of shape (n_synapses, 2), where each row is (y, x) in pixel coordinates.
-            Empty footprints return [np.nan, np.nan].
+        Centroids are returned as ``(y, x)`` pixel coordinates. Empty footprints return
+        ``[nan, nan]``.
         """
         footprints = np.asarray(footprints)
         if footprints.ndim != 3:
@@ -2064,8 +2074,10 @@ class GlutamateSummary:
     # ----------------- convenience -----------------
 
     def timebase(self, dmd: int, trial: int, hz_key: str = "analyzeHz") -> np.ndarray:
-        """
-        Uniform timebase in seconds using params.analyzeHz when available.
+        """Return a per-sample timebase for one DMD/trial.
+
+        When ``metadata[hz_key]`` is available and positive, the output is seconds.
+        Otherwise sample indices are returned.
         """
         dmd0, trial0 = dmd - 1, trial - 1
         g = self._E_group(dmd0, trial0)
@@ -2097,7 +2109,7 @@ class GlutamateSummary:
         if not np.isfinite(hz) or hz <= 0:
             return np.arange(n, dtype=float)
         return np.arange(n, dtype=float) / hz
-        
+
     def get_soma_glu_ca_traces(
         self,
         dmd: int = 1,
@@ -2105,9 +2117,13 @@ class GlutamateSummary:
         trace_type: str = "Fsvd",
         roi_inds: Optional[Sequence[int]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Convenience loader for somatic user ROI traces.
-        Returns (glu, ca) each shaped (n_rois, n_samples), guaranteed.
+        """Load paired glutamate and calcium traces for manual soma ROIs.
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray]
+            ``(glu, ca)``, each shaped ``(n_rois, n_samples)`` with matching time and ROI
+            dimensions.
         """
         glu = self.get_user_roi_traces(
             dmd=dmd, trial=trial, trace_type=trace_type,
@@ -2157,7 +2173,7 @@ class GlutamateSummary:
         # match ROI counts conservatively
         n = min(glu2.shape[0], ca2.shape[0])
         return glu2[:n], ca2[:n]
-    
+
     def _estimate_ca_baseline(
         self,
         x: np.ndarray,
@@ -2172,7 +2188,11 @@ class GlutamateSummary:
         eps: float = 1e-6,
         f0_floor_frac: float = 0.15,
     ) -> np.ndarray:
-        """Estimate a fluorescence-domain baseline for one ROI trace."""
+        """Estimate a fluorescence baseline for one calcium ROI trace.
+
+        Supported methods are the hull-like baseline estimator and the percentile-filter
+        baseline estimator. The baseline is floored to avoid unstable dF/F divisions.
+        """
         x = np.asarray(x, float)
         finite = np.isfinite(x)
         if finite.mean() < 0.5:
@@ -2206,7 +2226,11 @@ class GlutamateSummary:
         fs_hz: float,
         hp_window_s: float,
     ) -> np.ndarray:
-        """Build a standardized high-pass glutamate nuisance regressor."""
+        """Construct a standardized high-pass glutamate nuisance regressor.
+
+        The trace is high-pass filtered by subtracting a reflected moving average and
+        then z-scored when variance is finite.
+        """
         g = np.asarray(glu, float).reshape(-1)
         win = max(3, int(round(hp_window_s * fs_hz)))
         if win % 2 == 0:
@@ -2257,9 +2281,11 @@ class GlutamateSummary:
         baseline_smooth_s: float = 1.0,
         eps: float = 1e-6,
     ) -> Dict[str, Any]:
-        """
-        Process one trial of paired soma Ca / glutamate traces while preserving
-        the legacy return contract used by extraction and QC.
+        """Process paired soma calcium/glutamate traces for one trial.
+
+        The processing stages include optional artifact masking, optional glutamate
+        unmixing, optional motion regression, baseline estimation, and dF/F calculation.
+        The return dictionary preserves keys used by downstream QC and extraction code.
         """
         ca = np.asarray(ca, float)
         if ca.ndim != 2:
@@ -2452,16 +2478,11 @@ class GlutamateSummary:
         motion_names: Optional[Sequence[str]] = None,
         **_: Any,
     ) -> Dict[str, Any]:
-        """
-        Backward-compatible public wrapper for single-trial Ca processing.
+        """Backward-compatible public wrapper for soma calcium processing.
 
-        Notes
-        -----
-        - Glutamate loading and return keys are preserved.
-        - Motion correction now operates when `X_motion` is supplied.
-        - `use_motion_fields` is retained for API compatibility, but motion-field
-        construction is handled by `get_processed_soma_ca(...)` /
-        `get_processed_soma_ca_all_trials(...)`.
+        This preserves the historical function signature while delegating the actual
+        single-trial processing to ``_process_soma_ca_trial``. Motion regressors are
+        expected to be supplied by higher-level loaders.
         """
         _ = use_motion_fields
         return self._process_soma_ca_trial(
@@ -2504,7 +2525,12 @@ class GlutamateSummary:
         motion_step_thresh_z: float = 3.0,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Load one trial of soma ROI Glu/Ca traces and run processing."""
+        """Load and process soma calcium traces for one DMD/trial.
+
+        The method loads paired glutamate/calcium manual ROI traces, builds motion
+        regressors when requested, and returns the standard soma calcium processing
+        dictionary.
+        """
         if fs_hz is None:
             fs_hz = float(self.metadata.get("analyzeHz", np.nan))
         if not np.isfinite(fs_hz) or fs_hz <= 0:
@@ -2530,7 +2556,7 @@ class GlutamateSummary:
         )
 
     def _first_valid_trial(self, dmd0: int) -> Optional[int]:
-        """Return 0-based trial index of first valid trial for this DMD, else None."""
+        """Return the first valid 0-indexed trial for a DMD, if one exists."""
         v = np.argwhere(self.keep_trials[dmd0])
         if v.size == 0:
             return None
@@ -2542,13 +2568,10 @@ class GlutamateSummary:
         trace_type: str = "Fsvd",
         roi_inds: Optional[Sequence[int]] = None,
     ) -> Tuple[int, int]:
-        """
-        Determine (n_rois, n_time) from the first *readable* valid trial.
+        """Find the reference manual ROI trace shape for a DMD.
 
-        This is more defensive than the original implementation:
-        - it iterates over valid trials until it finds a usable user-ROI trace matrix
-        - it skips malformed/missing user-ROI exports
-        - it raises a clear error if no readable manual soma ROI traces exist
+        Valid trials are scanned until a readable ``ROIs/<trace_type>`` dataset is found.
+        The returned tuple is ``(n_rois, n_samples)``.
         """
         dmd0 = dmd - 1
         keep = np.asarray(self.keep_trials[dmd0], dtype=bool)
@@ -2620,13 +2643,11 @@ class GlutamateSummary:
         max_session_minutes: Optional[float] = None,
         **proc_kwargs: Any,
     ) -> Dict[str, Any]:
-        """
-        Process soma ROI Ca traces across all trials while preserving the existing
-        return contract used by QC and data extraction.
+        """Load and process soma calcium traces across all trials.
 
-        Returns arrays shaped (n_trials, n_rois, Tpad) when pad_to != "none".
-        When `max_session_minutes` is provided, later samples are left as NaN once
-        the cumulative kept duration exceeds that cutoff.
+        The returned arrays are padded to a reference or maximum valid trial length unless
+        ``pad_to="none"`` is requested. Invalid trials are represented as NaN blocks in
+        padded mode or ``None`` entries in list mode.
         """
         if fs_hz is None:
             fs_hz = float(self.metadata.get("analyzeHz", np.nan))
@@ -2794,12 +2815,11 @@ def regress_out_(
     X: np.ndarray,
     ridge: float = 1e-3,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    y: (T,) signal
-    X: (T, P) nuisance regressors
-    Returns:
-      y_resid: (T,)
-      beta: (P+1,) including intercept
+    """Regress nuisance variables out of a one-dimensional signal.
+
+    A ridge penalty is applied to nuisance regressors but not to the intercept. NaNs
+    are handled by fitting only on rows where both the signal and regressors are
+    finite.
     """
     y = np.asarray(y, float)
     X = np.asarray(X, float)
@@ -2827,7 +2847,11 @@ def regress_out_(
     return y_resid, beta
 
 def add_lags(X: np.ndarray, lags: Sequence[int]) -> np.ndarray:
-    """Return [X(t-l), ...] concatenated. Pads with edge values."""
+    """Concatenate lagged copies of a regressor matrix.
+
+    Positive lags shift regressors backward in time, negative lags shift them
+    forward, and edges are padded with repeated endpoint rows.
+    """
     T, P = X.shape
     outs = []
     for l in lags:

@@ -1,141 +1,405 @@
 # vip-slap2-analysis
 
-Utilities for loading, processing, quality controlling, analyzing, and visualizing multimodal VIP SLAP2 datasets, including behavior, glutamate, calcium, voltage, and now morphology reconstructions.
+`vip-slap2-analysis` contains data-access, preprocessing, quality-control,
+analysis, packaging, and plotting utilities for VIP SLAP2 experiments. The
+repository is organized around multimodal physiology datasets collected from VIP
+interneurons in mouse visual cortex, with an emphasis on glutamate imaging,
+calcium imaging, voltage imaging, behavior alignment, and morphology-derived
+context.
+
+The main goal of the package is to make the analysis path from raw/session-level
+assets to reviewable tables and figures explicit, reproducible, and easy to audit.
 
 ## Contents
 
-- [Experimental design with SLAP2](#experimental-design-with-slap2)
-- [Pipeline](#pipeline)
-- [Data modalities & formats](#data-modalities--formats)
-- [Metadata](#metadata)
-- [Analysis, figures, and findings](#analysis-figures-and-findings)
-- [References](#references)
-- [Acknowledgements](#acknowledgements)
-- [Install (editable)](#install-editable)
+- [Project scope](#project-scope)
+- [Repository layout](#repository-layout)
+- [Installation](#installation)
+- [Expected session assets](#expected-session-assets)
+- [Glutamate workflow](#glutamate-workflow)
+- [Calcium workflow](#calcium-workflow)
+- [Behavior alignment and validation](#behavior-alignment-and-validation)
+- [Metadata and manifests](#metadata-and-manifests)
+- [Morphology utilities](#morphology-utilities)
+- [Generated analysis outputs](#generated-analysis-outputs)
+- [Coding and documentation standards](#coding-and-documentation-standards)
+- [Current development notes](#current-development-notes)
 
-## Experimental design with SLAP2
+## Project scope
 
-This repository is organized around VIP synaptic dynamics experiments collected with SLAP2 in mouse visual cortex. The codebase is built to support alignment between behavior and physiology, source-extracted glutamate and calcium traces, session-level QC, and figure generation for downstream biological interpretation.
+This repository supports ongoing VIP synaptic dynamics analyses. Current use
+cases include:
 
-The main experimental context currently includes:
+- loading SLAP2 `SummaryLoCo*.mat` / MATLAB v7.3 HDF5 summary files;
+- extracting source, user-ROI, glutamate, and calcium traces;
+- reconstructing session-long traces from trial-wise SLAP2 outputs;
+- aligning physiology traces to BonVision/Bonsai/HARP stimulus events;
+- classifying stimulus-evoked activation, deactivation, and no-change responses;
+- estimating image tuning and image-response variance explained;
+- analyzing repeated-image sequence dynamics, including adaptation and
+  facilitation metrics;
+- running calcium ROI quality control and extraction;
+- generating session-level metadata manifests and quality summaries;
+- rendering figures, movies, morphology projections, and Illustrator-friendly
+  vector outputs.
 
-- passive change-detection style visual stimulation
-- glutamate imaging with iGluSnFR
-- calcium imaging with RCaMP when present
-- SLAP2 reference volumes and reconstruction-derived morphology for selected sessions
-- session-level metadata pulled from spreadsheet registries and on-disk assets
+The package is intended to be used both interactively from notebooks and as a
+library of reusable functions for batch processing.
 
-## Pipeline
+## Repository layout
 
-The package is developing toward a modality-aware but shared pipeline:
+```text
+vip-slap2-analysis/
+├── notebooks/
+│   ├── analysis/          # exploratory and batch analysis notebooks
+│   ├── behavior/          # behavior/HARP alignment notebooks
+│   ├── calcium/           # soma calcium extraction and plotting notebooks
+│   ├── glutamate/         # glutamate extraction, QC, and analysis notebooks
+│   ├── metadata/          # metadata construction and dataset organization
+│   ├── morphology/        # morphology/tracing notebooks
+│   ├── plotting/          # figure-generation notebooks
+│   ├── qc/                # quality-control notebooks
+│   └── voltage/           # voltage-imaging access and processing notebooks
+├── src/vip_slap2_analysis/
+│   ├── behavior/          # event-log validation, HARP/BonVision utilities
+│   ├── calcium/           # soma calcium extraction and QC
+│   ├── common/            # shared session/asset models
+│   ├── glutamate/         # SLAP2 summary loading, alignment, analyses
+│   ├── io/                # MATLAB v7.3/HDF5 helpers and session registry code
+│   ├── metadata/          # dataset manifest and quality overview builders
+│   ├── morphology/        # SNT/SWC loading, metrics, smoothing, plotting
+│   ├── packaging/         # reusable packaging helpers for derived datasets
+│   ├── plotting/          # movies, heatmaps, QC plots, and plot utilities
+│   ├── utils/             # one-off reorganization and helper utilities
+│   └── voltage/           # voltage-imaging processing scaffolding
+└── pyproject.toml
+```
 
-1. **Session discovery / registry**
-   - resolve session directories and expected assets
-2. **Behavior preprocessing**
-   - load BonVision / Bonsai and HARP outputs
-   - correct time bases and create event tables on a common clock
-3. **Physiology extraction**
-   - glutamate and calcium extraction aligned to behavior epochs
-4. **QC generation**
-   - metric tables and saved plots per session / modality
-5. **Analysis and figure generation**
-   - stimulus-aligned summaries, depth-aware comparisons, and publication-ready plots
-6. **Morphology**
-   - load SNT/SWC reconstructions, compute morphometrics, and export vector-friendly plots
+Important glutamate modules:
 
-Current morphology code lives in `src/vip_slap2_analysis/morphology/` and supporting documentation lives in `docs/morphology/`.
+- `vip_slap2_analysis.glutamate.summary`
+  - lazy reader for SLAP2 `ExperimentSummary` / `SummaryLoCo` files;
+  - handles MATLAB v7.3 HDF5 references and cell-array-like structures;
+  - exposes source traces, user-ROI traces, summary images, selected-pixel masks,
+    footprints, and processed soma calcium traces when present.
+- `vip_slap2_analysis.glutamate.alignment`
+  - loads corrected behavior/event tables;
+  - extracts image, change, and omission intervals;
+  - reconstructs DMD session traces;
+  - aligns traces to stimulus windows and summarizes event tensors.
+- `vip_slap2_analysis.glutamate.analysis`
+  - builds event response tables;
+  - classifies activation/deactivation;
+  - computes image tuning and variance-explained metrics;
+  - analyzes sequence-position dynamics;
+  - writes analysis tables and metadata.
 
-## Data modalities & formats
+## Installation
 
-The repo currently works with several kinds of inputs:
-
-### Behavior
-- Bonsai / BonVision event logs (`bonsai_event_log.csv`)
-- HARP extracts and photodiode traces
-
-### Glutamate
-- `SummaryLoCo*.mat` and related SLAP2 outputs
-- source extraction products and aligned stimulus-response tables
-
-### Calcium
-- extracted ROI or user-ROI tables from SLAP2 summary outputs
-- detrended / dF/F-like processed traces and QC summaries
-
-### Voltage
-- voltage imaging summary / preprocessing code and downstream trace analysis
-
-### Morphology
-- SNT exported `.swc` reconstructions
-- `.traces` project files
-- `QuickMeasurements.csv`
-- `SNT_Measurements.csv`
-- `Sholl_Table*.csv`
-- prepared TIFF stacks used for reconstruction
-
-## Metadata
-
-Session-level metadata is handled through a mix of on-disk discovery and registry tables. Existing code in `vip_slap2_analysis.io.session_registry` and `vip_slap2_analysis.common.session` provides the current foundation for locating session assets and keeping derived outputs organized.
-
-For morphology, the code is designed to keep a tight link between:
-
-- session ID
-- source image stack
-- reconstruction outputs
-- user notes / provenance
-- exported metrics and figures
-
-## Analysis, figures, and findings
-
-The long-term goal of this repo is not just file IO, but interpretable analysis products. Existing and in-progress analysis targets include:
-
-- stimulus-aligned glutamate and calcium response summaries
-- session-level QC tables and saved figures
-- depth-aware and DMD-aware summaries
-- morphology-derived descriptors such as cable length, branch points, tips, branch order, and Sholl structure
-- clean batch-rendered figures suitable for review, talks, and Illustrator polishing
-
-Morphology plotting utilities currently support:
-
-- XY / XZ / ZY projections
-- display-only smoothing for anisotropic z sampling
-- PDF / SVG / PNG export for downstream figure editing
-
-## References
-
-Primary external tools and concepts currently reflected in this repository include:
-
-- Fiji / ImageJ
-- SNT (Simple Neurite Tracer / SNT)
-- Sholl analysis workflows
-- SLAP2 preprocessing and summary outputs
-- Allen Institute behavior and metadata tooling used alongside these analyses
-
-## Acknowledgements
-
-This codebase supports ongoing work on VIP synaptic dynamics and related multimodal physiology/morphology analysis. It reflects ongoing development across analysis notebooks, scripts, and reusable package code for the Podgorski / Svoboda context.
-
-## Install (editable)
+Install the package in editable mode from the repository root:
 
 ```bash
 python -m pip install -e .
 ```
 
-## Minimal morphology example
+The current `pyproject.toml` intentionally keeps package metadata minimal. In the
+active analysis environment, make sure the scientific Python dependencies used by
+the modules and notebooks are available, including at least:
+
+```bash
+python -m pip install numpy pandas scipy h5py matplotlib seaborn statsmodels pyarrow
+```
+
+Additional optional dependencies may be needed for specific notebooks or plotting
+workflows, such as TIFF/movie rendering, morphology plotting, or NWB packaging.
+
+## Expected session assets
+
+The exact session layout can vary, but the current workflows expect a session or
+analysis directory containing some combination of:
+
+```text
+session_root/
+├── slap2/
+│   └── dynamic_data/
+│       └── ExperimentSummary/
+│           └── SummaryLoCo-*.mat
+├── behavior/
+│   └── VCO1_Behavior.harp/
+│       ├── bonsai_event_log.csv
+│       └── device.yml
+├── extracted_files/
+│   └── photodiode.pkl
+├── qc/
+│   ├── imaging_epochs.csv
+│   ├── glutamate_qc.json
+│   ├── calcium_qc.json
+│   └── synapse_qc.csv
+└── analysis/
+    └── derived/
+        └── glutamate/
+            ├── glutamate_single_trial_df.npz
+            ├── glutamate_mean_df.npz
+            └── glutamate_sequence_df.npz
+```
+
+Not every workflow needs every file. For example, `GlutamateSummary` can inspect a
+single `SummaryLoCo*.mat` file directly, while `run_glutamate_analysis` expects the
+derived glutamate `.npz` products created by the extraction/alignment workflow.
+
+## Glutamate workflow
+
+### Open a SLAP2 summary file
 
 ```python
-from vip_slap2_analysis.morphology import (
-    load_snt_bundle,
-    compute_basic_metrics,
-    plot_morphology_triptych,
+from pathlib import Path
+
+from vip_slap2_analysis.glutamate.summary import GlutamateSummary
+
+summary_path = Path(r"path\to\SummaryLoCo-file.mat")
+
+exp = GlutamateSummary(summary_path)
+
+print(exp.n_dmds)
+print(exp.n_trials)
+print(exp.valid_trials)
+print(exp.n_synapses)
+
+# Public methods use 1-indexed DMD and trial numbers.
+traces = exp.get_traces(
+    dmd=1,
+    trial=1,
+    signal="dF",
+    mode="ls",
 )
 
-bundle = load_snt_bundle(r"path\to\reconstruction_folder")
-metrics = compute_basic_metrics(bundle.tree)
-print(metrics)
+mean_image = exp.get_summary_image(dmd=1, image_type="meanIM")
+selected_pixels = exp.get_sel_pix(dmd=1)
 
-fig, axes = plot_morphology_triptych(
-    bundle.tree,
-    smooth=True,
-    save_path_stem=r"path\to\figures\cell01_triptych",
+exp.close()
+```
+
+`GlutamateSummary` is designed to read data lazily. Large arrays are not loaded
+unless a method explicitly requests them.
+
+### Run the derived glutamate response analysis
+
+```python
+from vip_slap2_analysis.glutamate.analysis import (
+    GlutamateAnalysisConfig,
+    run_glutamate_analysis,
+)
+
+session_root = r"path\to\session_root"
+
+config = GlutamateAnalysisConfig(
+    alpha=0.05,
+    tuning_method="fve",
+    tuning_fve_mode="trace",
+    sequence_slope_method="binned_peak",
+)
+
+tables = run_glutamate_analysis(
+    session_root,
+    config=config,
+)
+
+activation_summary = tables["activation_summary_table"]
+tuning_summary = tables["tuning_summary_table"]
+sequence_summary = tables["sequence_summary_table"]
+```
+
+By default, `run_glutamate_analysis` resolves paths under:
+
+```text
+analysis/derived/glutamate/
+analysis/derived/glutamate/glutamate_analysis/
+```
+
+The output directory can be overridden with `output_dir=...`.
+
+### Run tuning analysis using a precomputed activation summary
+
+```python
+from vip_slap2_analysis.glutamate.analysis import run_glutamate_tuning_analysis
+
+results = run_glutamate_tuning_analysis(
+    session_root,
+    activation_summary=r"path\to\activation_summary_table.parquet",
 )
 ```
+
+This is useful when activation labels have already been computed in a batch run
+and tuning should be recomputed with a new configuration.
+
+## Calcium workflow
+
+The calcium modules support soma/user-ROI extraction and QC for sessions with a
+second indicator channel, such as RCaMP-like soma calcium data.
+
+Key modules:
+
+- `vip_slap2_analysis.calcium.extraction`
+  - reconstructs calcium session traces;
+  - aligns calcium traces to image/change/omission windows;
+  - packages mean, single-trial, and sequence outputs.
+- `vip_slap2_analysis.calcium.qc`
+  - checks whether a session contains a processable calcium indicator;
+  - computes ROI-level trace metrics;
+  - evaluates ROIs against configurable quality thresholds;
+  - writes calcium QC results.
+
+Example QC entry point:
+
+```python
+from vip_slap2_analysis.calcium.qc import CalciumQcThresholds, run_calcium_qc
+
+thresholds = CalciumQcThresholds()
+qc_result = run_calcium_qc(asset, thresholds=thresholds)
+```
+
+Here, `asset` is a `SessionAssets` object describing the session paths and
+metadata.
+
+## Behavior alignment and validation
+
+Behavior-related utilities are used to keep stimulus events and physiology on a
+common clock. Current workflows include:
+
+- loading corrected Bonsai/BonVision event tables;
+- validating event-log structure and expected columns;
+- extracting image, change, and omission events;
+- auditing whether events fall within imaging epochs;
+- using HARP and photodiode-derived timing information when available.
+
+Common event classes:
+
+- image presentations, usually `.tiff` values in the event log;
+- `Change` events;
+- `Omission` events;
+- photodiode state rows, which should not be treated as stimulus identities.
+
+## Metadata and manifests
+
+Session metadata and asset discovery are represented with shared models such as
+`SessionAssets`:
+
+```python
+from pathlib import Path
+
+from vip_slap2_analysis.common.session import SessionAssets
+
+asset = SessionAssets(
+    session_id="826033_2026-02-17_13-13-55",
+    subject_id=826033,
+    session_dir=Path(r"path\to\session"),
+    summary_mat=Path(r"path\to\SummaryLoCo-file.mat"),
+    qc_dir=Path(r"path\to\session\qc"),
+    derived_dir=Path(r"path\to\session\analysis\derived"),
+    metadata={
+        "dmd1_depth": 25,
+        "dmd2_depth": 200,
+        "session_type": "familiar",
+    },
+)
+
+asset.ensure_dirs()
+```
+
+Manifest utilities in `vip_slap2_analysis.metadata` build session-level and
+mouse-level summaries from on-disk assets and QC files. These manifest tables are
+intended to make batch analyses auditable by exposing which files were present,
+which QC outputs were generated, and how sessions were categorized.
+
+## Morphology utilities
+
+Morphology utilities support reconstruction-derived context for selected VIP
+neurons. Current inputs include SNT/SWC reconstructions and measurement exports.
+The plotting utilities are intended to produce clean vector graphics that can be
+edited in Illustrator.
+
+Typical morphology outputs include:
+
+- XY, XZ, and ZY projections;
+- smoothed display traces for anisotropic z sampling;
+- cable length, branch-point, tip, and branch-order metrics;
+- Sholl-style summaries when exported measurement tables are available.
+
+## Generated analysis outputs
+
+`run_glutamate_analysis` writes CSV files for all output tables and attempts to
+write Parquet copies when Parquet support is installed. It also writes a metadata
+JSON file describing the analysis configuration and input paths.
+
+Main glutamate analysis outputs:
+
+```text
+glutamate_analysis/
+├── activation_event_table.csv
+├── activation_event_table.parquet
+├── activation_summary_table.csv
+├── activation_summary_table.parquet
+├── tuning_per_image_table.csv
+├── tuning_per_image_table.parquet
+├── tuning_summary_table.csv
+├── tuning_summary_table.parquet
+├── sequence_position_table.csv
+├── sequence_position_table.parquet
+├── sequence_per_image_table.csv
+├── sequence_per_image_table.parquet
+├── sequence_summary_table.csv
+├── sequence_summary_table.parquet
+└── glutamate_analysis_metadata.json
+```
+
+High-level table meanings:
+
+- `activation_event_table`
+  - event-level pre/post response metrics and test statistics;
+- `activation_summary_table`
+  - per-synapse activation class summaries;
+- `tuning_per_image_table`
+  - per-synapse/per-image response and selectivity metrics;
+- `tuning_summary_table`
+  - per-synapse image-tuning summaries;
+- `sequence_position_table`
+  - response metrics as a function of repeated-image sequence position;
+- `sequence_per_image_table`
+  - sequence metrics grouped by synapse and image identity;
+- `sequence_summary_table`
+  - per-synapse sequence/adaptation/facilitation summaries.
+
+## Coding and documentation standards
+
+This repository is being documented iteratively while preserving working analysis
+behavior. The intended standard is:
+
+- keep executable logic stable unless a change is explicitly requested;
+- prefer small, reviewable updates over sweeping rewrites;
+- document public functions, classes, dataclasses, and non-obvious private helpers;
+- make assumptions about array shape, time base, and indexing explicit;
+- preserve scientific provenance by writing input paths and configuration values to
+  output metadata;
+- keep code PEP8-compliant where possible without obscuring scientific intent;
+- avoid silent changes to analysis definitions, thresholds, or statistical tests.
+
+For review-facing code, especially modules used to open, process, and analyze
+physiology data, docstrings should answer:
+
+1. What data structure does this function expect?
+2. What shape and units are the key arrays?
+3. What clock or sampling rate is assumed?
+4. What biological or statistical quantity is being computed?
+5. What is returned, and how should downstream code interpret it?
+
+## Current development notes
+
+- The package is actively evolving and several workflows still live primarily in
+  notebooks.
+- The editable install works as a local analysis package, but dependency metadata
+  in `pyproject.toml` is currently minimal.
+- Some modules are mature analysis entry points, while others are scaffolding for
+  future packaging or processing workflows.
+- Derived-data schemas should be treated as part of the analysis contract. If a
+  table column, `.npz` field, or event-label convention changes, update this
+  README and the relevant docstrings together.
