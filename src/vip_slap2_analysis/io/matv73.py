@@ -1,3 +1,14 @@
+"""Utilities for reading MATLAB v7.3 MAT files.
+
+MATLAB v7.3 files are HDF5 containers. This module provides a thin wrapper
+around :mod:`h5py` that makes common MATLAB/HDF5 structures easier to access,
+including object references, cell arrays, scalar datasets, and MATLAB string
+encodings.
+
+The helpers are deliberately low-level so higher-level readers can avoid loading
+large arrays until a specific dataset is requested.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -48,6 +59,11 @@ def bytes_to_str(x: Any) -> Any:
 
 
 def _is_ref_dtype(dset: h5py.Dataset) -> bool:
+    """Return whether ``dset`` stores HDF5 object references.
+
+    MATLAB cell arrays and object references are represented in v7.3 MAT files
+    as datasets with HDF5 reference dtype.
+    """
     # MATLAB cell arrays and object refs are stored as HDF5 references
     try:
         return dset.dtype == h5py.ref_dtype
@@ -82,17 +98,20 @@ class MatV73File:
     keep_open: bool = True
 
     def __post_init__(self) -> None:
+        """Normalize ``path`` and optionally open the HDF5 file handle."""
         self.path = Path(self.path)
         self._fh: Optional[h5py.File] = None
         if self.keep_open:
             self.open()
 
     def open(self) -> h5py.File:
+        """Open the MAT/HDF5 file if needed and return the file handle."""
         if self._fh is None:
             self._fh = h5py.File(self.path, "r")
         return self._fh
 
     def close(self) -> None:
+        """Close the cached HDF5 file handle if it is open."""
         if self._fh is not None:
             try:
                 self._fh.close()
@@ -100,15 +119,18 @@ class MatV73File:
                 self._fh = None
 
     def __enter__(self) -> "MatV73File":
+        """Enter a context manager and ensure the file is open."""
         self.open()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        """Exit a context manager and close the file when configured to do so."""
         if not self.keep_open:
             self.close()
 
     @property
     def f(self) -> h5py.File:
+        """Return an open HDF5 file handle for the MAT file."""
         return self.open()
 
     # ---------- low-level helpers ----------

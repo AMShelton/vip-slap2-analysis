@@ -1,9 +1,20 @@
+"""Small HARP reader wrapper for behavior acquisition files.
+
+The module exposes ``HarpReader``, a convenience class around ``harp`` device
+readers, and a simple command-line entry point for exporting commonly used
+behavior streams to pickle files.
+"""
 import harp
 import argparse
 import pandas as pd
 from pathlib import Path
 
 class HarpReader:
+    """Convenience wrapper around a HARP device reader.
+    
+    The class exposes commonly used behavior streams as pandas DataFrames while
+    keeping the underlying ``harp`` reader available through ``reader``.
+    """
     def __init__(self, harp_dir) -> harp.reader.DeviceReader:
         """ Reads harp data
 

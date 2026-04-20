@@ -1,3 +1,9 @@
+"""Validation and event-coverage helpers for behavior preprocessing.
+
+These functions check Bonsai event logs, HARP digital-input data, photodiode
+signals, and whether relevant stimulus events fall inside detected imaging
+epochs.
+"""
 from __future__ import annotations
 
 from typing import Any, Dict
@@ -7,6 +13,11 @@ import pandas as pd
 
 
 def validate_bonsai_event_log(stim_df: pd.DataFrame) -> Dict[str, Any]:
+    """Validate the minimum Bonsai event-log structure needed for preprocessing.
+    
+    Checks required columns, stimulus-name diversity, corrected-timestamp presence,
+    and whether BonVision photodiode rows are present.
+    """
     required = {"Frame", "Timestamp", "Value"}
     cols = set(stim_df.columns)
     missing = sorted(required - cols)
@@ -42,6 +53,11 @@ def validate_bonsai_event_log(stim_df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def validate_harp_data(harp_df: pd.DataFrame, photodiode_df: pd.DataFrame) -> Dict[str, Any]:
+    """Validate HARP digital-input and photodiode data needed for alignment.
+    
+    The function checks the DI3 acquisition channel, time monotonicity, and
+    photodiode dynamic range.
+    """
     warnings = []
     passed = True
 
@@ -76,6 +92,11 @@ def validate_harp_data(harp_df: pd.DataFrame, photodiode_df: pd.DataFrame) -> Di
 
 
 def get_event_time_column(stim_df: pd.DataFrame) -> str:
+    """Return the preferred event-time column from a Bonsai event table.
+    
+    Corrected timestamp columns are preferred when present; raw ``Timestamp`` is used
+    as the fallback.
+    """
     if "corrected_timestamps" in stim_df.columns:
         return "corrected_timestamps"
     if "corrected_timestamp" in stim_df.columns:
@@ -84,6 +105,10 @@ def get_event_time_column(stim_df: pd.DataFrame) -> str:
 
 
 def extract_event_times(stim_df: pd.DataFrame) -> Dict[str, np.ndarray]:
+    """Extract image, change, and omission event times from a Bonsai event table.
+    
+    The selected time column is determined by ``get_event_time_column``.
+    """
     tcol = get_event_time_column(stim_df)
     vals = stim_df["Value"].astype(str)
 
@@ -99,6 +124,10 @@ def extract_event_times(stim_df: pd.DataFrame) -> Dict[str, np.ndarray]:
 
 
 def count_events_in_epochs(event_times: np.ndarray, epoch_df: pd.DataFrame) -> int:
+    """Count how many event times fall inside at least one imaging epoch.
+    
+    Epoch membership is inclusive at both the start and end boundaries.
+    """
     if len(event_times) == 0 or len(epoch_df) == 0:
         return 0
 
@@ -110,6 +139,11 @@ def count_events_in_epochs(event_times: np.ndarray, epoch_df: pd.DataFrame) -> i
 
 
 def audit_event_coverage(stim_df: pd.DataFrame, epoch_df: pd.DataFrame) -> Dict[str, Any]:
+    """Report total and in-epoch counts for image, change, and omission events.
+    
+    This summary helps determine whether a behavior session is usable for physiology
+    event extraction.
+    """
     ev = extract_event_times(stim_df)
     out = {}
     for k, times in ev.items():

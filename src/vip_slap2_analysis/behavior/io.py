@@ -1,3 +1,16 @@
+"""Behavior-file path resolution and lightweight loaders.
+
+This module centralizes filesystem conventions for behavior-session assets used by
+``vip_slap2_analysis``.  It resolves paths to Bonsai event logs, HARP binary
+folders, extracted HARP products, corrected event logs, and behavior-QC outputs,
+then provides small loader/saver helpers used by the behavior preprocessing
+pipeline.
+
+The functions here intentionally do not perform alignment or validation.  They
+only locate files, ensure extracted HARP products exist when requested, and load
+or save tabular data in the formats expected by downstream processing.
+"""
+
 from __future__ import annotations
 
 import glob
@@ -9,13 +22,35 @@ import numpy as np
 import pandas as pd
 
 from vip_slap2_analysis.behavior.read_harp import HarpReader
-# from vip_slap2_analysis.behavior.preprocess import process_single_harp_session  # move this import if needed
+from vip_slap2_analysis.behavior.preprocess import process_single_harp_session
 
 PathLike = Union[str, Path]
 
 
 @dataclass
 class BehaviorPaths:
+    """Resolved filesystem locations for one behavior/imaging session.
+
+    Attributes
+    ----------
+    session_dir:
+        Root directory for the session.
+    bonsai_csv:
+        Path to the raw or corrected Bonsai event-log CSV.
+    harp_dir:
+        Directory containing the HARP binary files for the session.
+    extracted_dir:
+        Directory containing extracted HARP-derived files.
+    photodiode_pkl:
+        Pickled photodiode analog-input trace produced from HARP data.
+    harp_df_csv:
+        CSV cache of the HARP digital-input dataframe used for epoch detection.
+    corrected_bonsai_csv:
+        Destination/path for the Bonsai event log after timestamp correction.
+    qc_dir:
+        Behavior-specific QC output directory under the session analysis folder.
+    """
+
     session_dir: Path
     bonsai_csv: Path
     harp_dir: Path
@@ -27,6 +62,28 @@ class BehaviorPaths:
 
 
 def resolve_behavior_paths(asset) -> BehaviorPaths:
+    """Resolve behavior input/output paths from a session asset object.
+
+    Parameters
+    ----------
+    asset:
+        Session-like object with at least ``session_dir`` and ``qc_dir``
+        attributes.  If present, ``bonsai_event_log`` and ``harp_dir`` are used
+        directly; otherwise, they are discovered recursively under the session
+        directory.
+
+    Returns
+    -------
+    BehaviorPaths
+        Dataclass containing the resolved Bonsai, HARP, extracted-data, and QC
+        paths for the session.
+
+    Raises
+    ------
+    FileNotFoundError
+        If a Bonsai event log or HARP behavior directory cannot be found.
+    """
+
     session_dir = Path(asset.session_dir)
 
     bonsai_csv = getattr(asset, "bonsai_event_log", None)
@@ -73,6 +130,26 @@ def ensure_harp_extracted(
     overwrite: bool = False,
     harp_extract_fn=None,
 ) -> Dict[str, bool]:
+    """Ensure the HARP photodiode pickle and digital-input CSV exist.
+
+    Parameters
+    ----------
+    paths:
+        Resolved behavior paths for the current session.
+    overwrite:
+        If ``True``, regenerate extracted HARP products even when cached files
+        are already present.
+    harp_extract_fn:
+        Optional callable used to extract HARP binary data into pickle files.
+        When omitted, the function falls back to ``process_single_harp_session``
+        as expected by the existing pipeline.
+
+    Returns
+    -------
+    dict
+        Metadata indicating whether existing extracted files were reused.
+    """
+
     if harp_extract_fn is None:
         harp_extract_fn = process_single_harp_session
 
@@ -92,6 +169,20 @@ def ensure_harp_extracted(
 
 
 def load_harp_df(harp_dir: PathLike) -> Tuple[pd.DataFrame, np.ndarray]:
+    """Load HARP digital-input data and build a relative acquisition timebase.
+
+    Parameters
+    ----------
+    harp_dir:
+        Directory containing the HARP binary files for one behavior session.
+
+    Returns
+    -------
+    tuple[pandas.DataFrame, numpy.ndarray]
+        Digital-input dataframe sorted by time, with an added ``time`` column,
+        and a zero-referenced acquisition-time vector in seconds.
+    """
+
     harp_handler = HarpReader(harp_dir)
     harp_df = harp_handler.reader.DigitalInputState.read().copy()
     harp_df["time"] = harp_df.index.astype(float)
@@ -101,13 +192,50 @@ def load_harp_df(harp_dir: PathLike) -> Tuple[pd.DataFrame, np.ndarray]:
 
 
 def load_photodiode_df(photodiode_pkl: PathLike) -> pd.DataFrame:
+    """Load the extracted HARP photodiode trace from a pickle file.
+
+    Parameters
+    ----------
+    photodiode_pkl:
+        Path to the pickled photodiode dataframe, typically
+        ``extracted_files/photodiode.pkl``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Copy of the stored photodiode dataframe.
+    """
+
     return pd.read_pickle(photodiode_pkl).copy()
 
 
 def load_bonsai_df(bonsai_csv: PathLike) -> pd.DataFrame:
+    """Load a Bonsai event-log CSV into a dataframe.
+
+    Parameters
+    ----------
+    bonsai_csv:
+        Path to the Bonsai event log, either raw or timestamp-corrected.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Event log dataframe as read from disk.
+    """
+
     return pd.read_csv(bonsai_csv)
 
 
 def save_epochs_csv(epoch_df: pd.DataFrame, out_csv: PathLike) -> None:
+    """Write detected imaging epochs to CSV, creating the parent directory.
+
+    Parameters
+    ----------
+    epoch_df:
+        Dataframe containing detected imaging epochs.
+    out_csv:
+        Destination CSV path.
+    """
+
     Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
     epoch_df.to_csv(out_csv, index=False)

@@ -1,3 +1,14 @@
+"""Session registry utilities for VIP SLAP2 analysis datasets.
+
+This module reads the project-level session summary workbook and resolves
+per-session file assets used by downstream behavior, glutamate, calcium, and
+quality-control pipelines.
+
+The registry intentionally keeps discovery lightweight: it normalizes the
+summary tables, applies simple metadata filters, and locates the most recently
+modified matching files under a session directory.
+"""
+
 from __future__ import annotations
 
 import os
@@ -12,12 +23,39 @@ from vip_slap2_analysis.common.session import SessionAssets
 
 
 def _coerce_path(x) -> Optional[Path]:
+    """Convert a spreadsheet path-like value to ``Path`` or ``None``.
+
+    Parameters
+    ----------
+    x:
+        Value read from the summary spreadsheet. Missing values, including
+        pandas ``NaN`` entries, are treated as absent paths.
+
+    Returns
+    -------
+    pathlib.Path or None
+        Normalized path when ``x`` is present; otherwise ``None``.
+    """
     if pd.isna(x) or x is None:
         return None
     return Path(str(x))
 
 
 def _find_one(base: Path, pattern: str) -> Optional[Path]:
+    """Find the newest file or directory matching ``pattern`` below ``base``.
+
+    Parameters
+    ----------
+    base:
+        Root directory for the recursive search.
+    pattern:
+        Glob pattern to search for under ``base``.
+
+    Returns
+    -------
+    pathlib.Path or None
+        Most recently modified match, or ``None`` if no match exists.
+    """
     matches = sorted(glob.glob(str(base / "**" / pattern), recursive=True))
     if matches:
         return Path(max(matches, key=os.path.getmtime))
@@ -27,12 +65,45 @@ def _find_one(base: Path, pattern: str) -> Optional[Path]:
 
 @dataclass
 class VIPSessionRegistry:
+    """Registry of VIP SLAP2 subjects, sessions, and resolved file assets.
+
+    The registry is backed by the project summary workbook. It provides a
+    table-level API for filtering sessions and a resolver that converts a
+    session row into a :class:`vip_slap2_analysis.common.session.SessionAssets`
+    object for downstream processing.
+
+    Attributes
+    ----------
+    summary_xlsx:
+        Path to the summary workbook used to construct the registry.
+    subjects_df:
+        DataFrame containing subject-level metadata.
+    sessions_df:
+        DataFrame containing session-level metadata.
+    """
     summary_xlsx: Path
     subjects_df: pd.DataFrame
     sessions_df: pd.DataFrame
 
     @classmethod
     def from_basepath(cls, basepath: str | Path) -> "VIPSessionRegistry":
+        """Construct a registry from the first ``*summary.xlsx`` under a root.
+
+        Parameters
+        ----------
+        basepath:
+            Directory to search for the project summary workbook.
+
+        Returns
+        -------
+        VIPSessionRegistry
+            Registry loaded from the discovered workbook.
+
+        Raises
+        ------
+        FileNotFoundError
+            If no matching summary workbook exists under ``basepath``.
+        """
         basepath = Path(basepath)
         matches = sorted(glob.glob(str(basepath / "**summary.xlsx")))
         if not matches:
@@ -41,6 +112,19 @@ class VIPSessionRegistry:
 
     @classmethod
     def from_excel(cls, summary_xlsx: str | Path) -> "VIPSessionRegistry":
+        """Load subject and session tables from a summary workbook.
+
+        Parameters
+        ----------
+        summary_xlsx:
+            Path to the Excel workbook containing ``sessions`` and ``subjects``
+            sheets.
+
+        Returns
+        -------
+        VIPSessionRegistry
+            Registry with normalized path and date columns.
+        """
         summary_xlsx = Path(summary_xlsx)
 
         # sessions sheet is tidy already
@@ -74,6 +158,29 @@ class VIPSessionRegistry:
         min_quality: Optional[str] = None,
         exclude_session_types: Optional[Sequence[str]] = None,
     ) -> pd.DataFrame:
+        """Return session rows matching optional metadata filters.
+
+        Parameters
+        ----------
+        subject_ids:
+            Subject IDs to include.
+        session_types:
+            Session types to include.
+        paradigms:
+            Behavioral or experimental paradigms to include.
+        indicators:
+            Values from the ``indicator1`` column to include.
+        min_quality:
+            Reserved for future quality filtering. The current implementation
+            accepts the argument but does not apply it.
+        exclude_session_types:
+            Session types to remove after any inclusion filters.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Filtered copy of the session table with a reset integer index.
+        """
         df = self.sessions_df.copy()
 
         if subject_ids is not None:
@@ -94,6 +201,25 @@ class VIPSessionRegistry:
         return df.reset_index(drop=True)
 
     def get_session_row(self, session_id: str) -> pd.Series:
+        """Return the unique session table row for ``session_id``.
+
+        Parameters
+        ----------
+        session_id:
+            Session identifier to retrieve.
+
+        Returns
+        -------
+        pandas.Series
+            Matching row from ``sessions_df``.
+
+        Raises
+        ------
+        KeyError
+            If the session ID is not present.
+        ValueError
+            If multiple rows share the same session ID.
+        """
         df = self.sessions_df[self.sessions_df["session_id"] == session_id]
         if len(df) == 0:
             raise KeyError(f"Session not found: {session_id}")
@@ -102,6 +228,18 @@ class VIPSessionRegistry:
         return df.iloc[0]
 
     def resolve_assets(self, session: pd.Series | str) -> SessionAssets:
+        """Resolve filesystem assets for a session row or session ID.
+
+        Parameters
+        ----------
+        session:
+            Either a session ID or a row from ``sessions_df``.
+
+        Returns
+        -------
+        SessionAssets
+            Object containing canonical session paths and row metadata.
+        """
         row = self.get_session_row(session) if isinstance(session, str) else session
         session_dir = Path(row["session_dir"])
 

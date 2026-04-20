@@ -1,3 +1,11 @@
+"""Behavior preprocessing and photodiode-alignment pipeline.
+
+This module coordinates behavior-side preprocessing for VIP SLAP2 sessions. It
+extracts HARP data when needed, validates Bonsai and HARP inputs, aligns
+BonVision event times to the HARP/photodiode time base, detects valid imaging
+epochs, audits event coverage, and writes QC metadata used by downstream
+physiology extraction.
+"""
 from __future__ import annotations
 
 import os
@@ -34,6 +42,12 @@ from .epochs import (
 )
 @dataclass
 class BehaviorProcessingResult:
+    """Container for the outputs and status of behavior preprocessing.
+    
+    The result records resolved paths, validation outputs, alignment metadata,
+    imaging-epoch summaries, event-coverage metrics, and whether the session is
+    ready for physiology extraction.
+    """
     paths: BehaviorPaths
     bonsai_validation: Dict[str, Any]
     harp_validation: Dict[str, Any]
@@ -58,6 +72,11 @@ def _write_behavior_failure_metadata(
     event_coverage: dict | None = None,
     metadata: dict | None = None,
 ) -> dict:
+    """Write a behavior QC JSON file for sessions that fail preprocessing.
+    
+    The metadata mirrors the successful QC schema where possible while marking the
+    session as not ready for physiology extraction.
+    """
     out = {
         "schema_version": "0.1.0",
         "status": status,
@@ -83,6 +102,11 @@ def make_behavior_qc_plots(
     epoch_df: pd.DataFrame,
     out_dir: Path,
 ) -> None:
+    """Save quick-look behavior QC plots for imaging epochs and photodiode signal.
+    
+    The plots are written into the provided output directory and are intended for
+    manual inspection during batch processing.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(10, 3))
@@ -119,6 +143,12 @@ def process_behavior_session(
     expected_trial_epoch_min: Optional[int] = None,
     use_piecewise_warp: bool = True,
 ) -> BehaviorProcessingResult:
+    """Run the full behavior preprocessing workflow for a session asset.
+    
+    This entry point resolves behavior files, extracts HARP streams as needed,
+    validates inputs, aligns Bonsai timestamps to HARP time, detects imaging epochs,
+    audits stimulus coverage, writes QC metadata, and returns a structured result.
+    """
     metadata = metadata or {}
     paths = resolve_behavior_paths(asset)
 
@@ -316,6 +346,12 @@ PathLike = Union[str, Path]
 
 @dataclass
 class AlignmentMeta:
+    """Metadata describing the Bonsai-to-HARP event-time alignment.
+    
+    Fields store the selected alignment pathway, affine parameters, display-rate
+    estimate, matched-edge diagnostics, duration checks, and optional fallback
+    parameters.
+    """
     alignment_method: str
     slope: float
     intercept: float
@@ -513,10 +549,18 @@ def correct_event_log(
 # =============================================================================
 
 def _drop_unnamed(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove pandas-generated unnamed index columns from a DataFrame.
+    
+    This is used when reloading CSV files that may have been saved with an index.
+    """
     return df.loc[:, ~df.columns.str.contains(r"^Unnamed")]
 
 
 def _load_bonsai_event_log(path: Path) -> pd.DataFrame:
+    """Load a Bonsai event log and validate required event-log columns.
+    
+    The returned table has unnamed columns removed but is otherwise left unchanged.
+    """
     df = pd.read_csv(path)
     df = _drop_unnamed(df)
     for c in ("Frame", "Timestamp", "Value"):
@@ -526,6 +570,11 @@ def _load_bonsai_event_log(path: Path) -> pd.DataFrame:
 
 
 def _load_photodiode(path: Path) -> pd.DataFrame:
+    """Load a photodiode pickle and normalize its column/index convention.
+    
+    The returned DataFrame uses ``AnalogInput0`` as the photodiode column and a
+    floating-point time index named ``Time``.
+    """
     df = pd.read_pickle(path)
     if isinstance(df, pd.Series):
         df = df.to_frame("AnalogInput0")
@@ -553,6 +602,11 @@ def _add_bv_photodiode_columns_dense(stim_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _choose_bv_t0(bv: pd.DataFrame) -> float:
+    """Choose the BonVision reference time for relative event timestamps.
+    
+    The first ``Frame`` row is preferred; otherwise the minimum timestamp in the log
+    is used.
+    """
     frame_mask = bv["Value"].astype(str).str.lower().eq("frame")
     if frame_mask.any():
         return float(bv.loc[frame_mask, "Timestamp"].iloc[0])
@@ -560,6 +614,11 @@ def _choose_bv_t0(bv: pd.DataFrame) -> float:
 
 
 def _insert_first_stim_rows(event_log: pd.DataFrame) -> pd.DataFrame:
+    """Insert synthetic first-frame and first-stimulus rows when needed.
+    
+    This helper supports logs that otherwise omit the first stimulus onset required
+    for downstream alignment.
+    """
     df = event_log.copy()
     tif_mask = df["Value"].astype(str).str.contains(r"\.tif{1,2}f?$", case=False, na=False)
     if not tif_mask.any():
@@ -577,6 +636,11 @@ def _insert_first_stim_rows(event_log: pd.DataFrame) -> pd.DataFrame:
 
 
 def _estimate_bv_duration_seconds(bv: pd.DataFrame, *, t_bv0: float) -> float:
+    """Estimate the BonVision event-log duration relative to the chosen start time.
+    
+    Frame rows are used when available because they most directly represent display
+    timing.
+    """
     frame_mask = bv["Value"].astype(str).str.lower().eq("frame")
     if frame_mask.any():
         return float(bv.loc[frame_mask, "Timestamp"].max() - t_bv0)
@@ -593,6 +657,11 @@ def _get_signal_edges(
     *,
     min_edge_separation_s: float,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    """Detect rising and falling edges in a thresholded analog signal.
+    
+    The signal is median-filtered before thresholding, and detected edges are
+    debounced using the requested minimum edge separation.
+    """
     sig = np.asarray(signal)
     t = np.asarray(time)
 
@@ -608,6 +677,10 @@ def _get_signal_edges(
     t_fall = t[fall_idx]
 
     def _debounce(tt: np.ndarray) -> np.ndarray:
+        """Remove threshold crossings that occur too close to the previously kept edge.
+        
+        This nested helper operates on one vector of candidate edge times.
+        """
         if len(tt) <= 1:
             return tt
         keep = [0]
@@ -693,6 +766,11 @@ def _bv_photodiode_rises_from_state(
         return None
 
     def rises_with(m: str) -> np.ndarray:
+        """Return BonVision rise times according to the requested timestamp convention.
+        
+        This nested helper supports the current-, midpoint-, and previous-frame modes
+        evaluated by the automatic photodiode parser.
+        """
         if m == "current":
             return t[idx]
         if m == "midpoint":
@@ -749,6 +827,11 @@ def _best_start_offset_by_intervals(
     *,
     max_shift: int = 5
 ) -> Tuple[int, float]:
+    """Find the best small start offset between two edge trains using interval RMSE.
+    
+    The comparison uses early inter-edge intervals to determine whether either edge
+    train should be shifted before affine fitting.
+    """
     bv_times = np.asarray(bv_times, dtype=float)
     harp_times = np.asarray(harp_times, dtype=float)
 
@@ -786,6 +869,10 @@ def _best_start_offset_by_intervals(
 
 
 def _apply_shift(bv: np.ndarray, hp: np.ndarray, shift: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply a start-index shift between BonVision and HARP edge-time arrays.
+    
+    Positive shifts drop BonVision edges; negative shifts drop HARP edges.
+    """
     bv = np.asarray(bv, dtype=float)
     hp = np.asarray(hp, dtype=float)
     if shift > 0:
@@ -797,6 +884,10 @@ def _apply_shift(bv: np.ndarray, hp: np.ndarray, shift: int) -> Tuple[np.ndarray
 
 
 def _fit_affine(bv_edge_times: np.ndarray, harp_edge_times: np.ndarray) -> Tuple[float, float, int]:
+    """Fit a linear mapping from BonVision edge times to HARP edge times.
+    
+    Returns slope, intercept, and the number of paired edges used for the fit.
+    """
     bv = np.asarray(bv_edge_times, dtype=float)
     hp = np.asarray(harp_edge_times, dtype=float)
     n = min(len(bv), len(hp))
@@ -809,6 +900,10 @@ def _fit_affine(bv_edge_times: np.ndarray, harp_edge_times: np.ndarray) -> Tuple
 
 
 def _piecewise_warp(t_query: np.ndarray, t_src: np.ndarray, t_dst: np.ndarray) -> np.ndarray:
+    """Map event times through a piecewise-linear warp defined by matched edge anchors.
+    
+    Times outside the anchor range are extrapolated using the first or last segment.
+    """
     t_query = np.asarray(t_query, dtype=float)
     t_src = np.asarray(t_src, dtype=float)
     t_dst = np.asarray(t_dst, dtype=float)
@@ -976,6 +1071,10 @@ def _fit_frame_modclass_to_harp_edges_anchored_edges(
 
     # Candidate generation on a given segment
     def _candidates_for_segment(seg_edges: np.ndarray) -> List[Dict[str, Any]]:
+        """Generate frame-modulo alignment candidates for one contiguous HARP edge segment.
+        
+        Candidates are scored using edge-fit RMSE plus optional affine-parameter priors.
+        """
         seg_edges = np.asarray(seg_edges, dtype=float)
         seg_edges = np.sort(seg_edges)
 
@@ -1103,6 +1202,10 @@ def _fit_frame_modclass_to_harp_edges_anchored_edges(
 # (Not required, but pairs nicely with dropout handling.)
 # =============================================================================
 def _edge_train_qc_summary(harp_edge_s: np.ndarray) -> Dict[str, Any]:
+    """Summarize spacing and sample-count diagnostics for a HARP edge train.
+    
+    The output is intended for QC metadata and error messages.
+    """
     edges = np.asarray(harp_edge_s, float)
     edges = np.sort(edges)
     if edges.size < 5:

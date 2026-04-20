@@ -1,3 +1,9 @@
+"""Imaging-epoch detection utilities for behavior-aligned physiology sessions.
+
+The functions in this module detect continuous or trial-wise imaging intervals
+from the HARP acquisition signal, shift epochs into the photodiode time base, and
+format/summarize epoch outputs for QC.
+"""
 from __future__ import annotations
 
 from typing import List, Optional, Tuple
@@ -8,6 +14,11 @@ from scipy.ndimage import label
 
 
 def detect_imaging_epochs(signal, time, gap_threshold=0.05, min_duration=5.0, mode="trial"):
+    """Detect imaging intervals from a binary acquisition signal.
+    
+    In ``continuous`` mode, all active regions are merged into one interval. In
+    ``trial`` mode, active regions are split when gaps exceed the threshold.
+    """
     if mode not in ["trial", "continuous"]:
         raise ValueError("mode must be 'trial' or 'continuous'")
 
@@ -65,6 +76,11 @@ def detect_epochs_adaptive(
     gap_start: float = 0.02,
     target_min: Optional[int] = None,
 ) -> Tuple[List[List[float]], float]:
+    """Detect imaging epochs while optionally relaxing the trial gap threshold.
+    
+    For trial-wise acquisitions, the gap threshold is increased until at least the
+    target number of epochs is recovered.
+    """
     gap = gap_start
     epochs = detect_imaging_epochs(
         harp_df["DI3"].to_numpy(),
@@ -93,6 +109,11 @@ def shift_epochs_to_photodiode_time(
     harp_df: pd.DataFrame,
     photodiode_df: pd.DataFrame,
 ) -> List[List[float]]:
+    """Shift detected HARP epochs into the photodiode time coordinate system.
+    
+    The shift is computed from the offset between the HARP digital-input time column
+    and the photodiode DataFrame index.
+    """
     t_shift = float(harp_df["time"].iloc[0]) - float(photodiode_df.index[0])
     out = [e.copy() for e in epochs]
     for e in out:
@@ -102,6 +123,10 @@ def shift_epochs_to_photodiode_time(
 
 
 def epochs_to_dataframe(epochs: List[List[float]]) -> pd.DataFrame:
+    """Convert detected epoch tuples into a standard DataFrame.
+    
+    The output includes start/end sample indices, start/end times, and duration.
+    """
     epoch_df = pd.DataFrame(
         epochs,
         columns=["start_idx", "end_idx", "start_time", "end_time"],
@@ -114,6 +139,11 @@ def epochs_to_dataframe(epochs: List[List[float]]) -> pd.DataFrame:
 
 
 def summarize_epochs(epoch_df: pd.DataFrame, *, mode: str, gap_threshold_used: float) -> dict:
+    """Build a compact QC summary for detected imaging epochs.
+    
+    The summary records mode, threshold used, epoch durations, timebase, pass/fail
+    status, and warnings.
+    """
     return {
         "mode": mode,
         "gap_threshold_used": float(gap_threshold_used),
