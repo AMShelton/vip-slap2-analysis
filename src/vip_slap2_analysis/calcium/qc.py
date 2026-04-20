@@ -1,3 +1,15 @@
+"""Quality-control utilities for soma calcium-imaging outputs.
+
+This module determines whether a session contains a calcium indicator, evaluates
+processed soma ROI traces against conservative quality-control thresholds, and
+writes per-DMD keep masks plus JSON/CSV QC summaries for downstream calcium
+extraction.
+
+The code is intentionally session-asset oriented: callers provide a
+``SessionAssets`` object that points to the SummaryLoCo MAT file and analysis/QC
+directories. The resulting masks are consumed by calcium extraction so that only
+ROIs passing the configured checks are packaged for event-aligned analysis.
+"""
 from __future__ import annotations
 
 import json
@@ -18,6 +30,11 @@ DEFAULT_CAMP_REGEX = r"(?i)^[A-Za-z]*CaMP\d+[A-Za-z0-9._-]*$"
 
 @dataclass
 class CalciumQcThresholds:
+    """Thresholds used to decide whether soma calcium ROIs pass QC.
+
+    The defaults are intentionally conservative and combine session-level trial
+    coverage with per-ROI finite-data, amplitude, SNR-like, and drift checks.
+    """
     min_valid_trial_fraction: float = 0.5
     min_finite_fraction: float = 0.75
     min_dynamic_range: float = 0.10
@@ -29,6 +46,12 @@ class CalciumQcThresholds:
 
 @dataclass
 class CalciumQcResult:
+    """Paths and per-DMD metadata produced by calcium QC.
+
+    Attributes summarize whether calcium processing should proceed, where QC
+    artifacts were written, and which ROI keep-mask files are available for each
+    DMD.
+    """
     should_process_calcium: bool
     indicator2: Optional[str]
     indicator_regex: str
@@ -39,6 +62,21 @@ class CalciumQcResult:
 
 
 def _resolve_indicator2(asset: SessionAssets, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Resolve the secondary indicator name for a session.
+
+    Parameters
+    ----------
+    asset
+        Session asset bundle, potentially carrying spreadsheet metadata.
+    metadata
+        Optional caller-supplied metadata dictionary. Values in this dictionary take
+        precedence over ``asset.metadata``.
+
+    Returns
+    -------
+    Optional[str]
+        The resolved ``indicator2`` value, or ``None`` when no value is available.
+    """
     metadata = metadata or {}
     if metadata.get("indicator2") is not None:
         return str(metadata.get("indicator2"))
@@ -48,12 +86,42 @@ def _resolve_indicator2(asset: SessionAssets, metadata: Optional[Dict[str, Any]]
 
 
 def should_process_calcium_indicator(indicator2: Optional[str], pattern: str = DEFAULT_CAMP_REGEX) -> bool:
+    """Return whether the secondary indicator looks like a CaMP sensor.
+
+    Parameters
+    ----------
+    indicator2
+        Indicator string from the session registry or caller metadata.
+    pattern
+        Regular expression used to identify calcium indicators.
+
+    Returns
+    -------
+    bool
+        ``True`` when ``indicator2`` matches the configured calcium-indicator
+        pattern.
+    """
     if indicator2 is None:
         return False
     return re.match(pattern, str(indicator2)) is not None
 
 
 def _resolve_fs_hz(asset: SessionAssets, metadata: Optional[Dict[str, Any]], exp: GlutamateSummary) -> float:
+    """Resolve the sampling rate used for calcium QC.
+
+    The lookup order is caller metadata, session-asset metadata, and finally the
+    ``analyzeHz`` value exposed by the SummaryLoCo reader.
+
+    Returns
+    -------
+    float
+        Imaging or analysis sampling rate in hertz.
+
+    Raises
+    ------
+    ValueError
+        If no sampling-rate field can be found.
+    """
     metadata = metadata or {}
     for key in ["im_rate_hz", "im_rate_Hz", "fs_hz", "fs_Hz"]:
         if key in metadata:
@@ -76,12 +144,43 @@ def _concat_trials_with_nans(dff: np.ndarray) -> np.ndarray:
 
 
 def _safe_nanpercentile(x: np.ndarray, q: float) -> float:
+    """Compute a percentile while returning NaN for all-missing input.
+
+    Parameters
+    ----------
+    x
+        Numeric array that may contain NaNs or infinities.
+    q
+        Percentile to compute.
+
+    Returns
+    -------
+    float
+        Requested percentile across finite values, or ``np.nan`` if no finite values
+        are present.
+    """
     if not np.isfinite(x).any():
         return np.nan
     return float(np.nanpercentile(x, q))
 
 
 def _roi_metrics(y: np.ndarray) -> Dict[str, float]:
+    """Compute robust QC metrics for one concatenated ROI trace.
+
+    The metrics include finite-data coverage, robust scale, percentile amplitudes,
+    an SNR-like amplitude-to-MAD ratio, and a coarse early-versus-late drift
+    estimate.
+
+    Parameters
+    ----------
+    y
+        One-dimensional concatenated ROI trace.
+
+    Returns
+    -------
+    dict[str, float]
+        Scalar QC metrics used by :func:`_evaluate_roi`.
+    """
     finite = np.isfinite(y)
     yf = y[finite]
     n_total = int(y.size)
@@ -142,6 +241,21 @@ def _roi_metrics(y: np.ndarray) -> Dict[str, float]:
 
 
 def _evaluate_roi(metrics: Dict[str, float], thr: CalciumQcThresholds) -> Tuple[bool, Dict[str, bool], List[str]]:
+    """Evaluate one ROI's QC metrics against configured thresholds.
+
+    Parameters
+    ----------
+    metrics
+        Output from :func:`_roi_metrics`.
+    thr
+        QC thresholds defining pass/fail criteria.
+
+    Returns
+    -------
+    tuple[bool, dict[str, bool], list[str]]
+        Overall keep decision, individual boolean checks, and human-readable failed
+        check names.
+    """
     checks = {
         "pass_finite_fraction": bool(metrics["finite_fraction"] >= thr.min_finite_fraction),
         "pass_dynamic_range": bool(np.isfinite(metrics["dynamic_range_p95_p05"]) and metrics["dynamic_range_p95_p05"] >= thr.min_dynamic_range),
@@ -215,6 +329,40 @@ def run_calcium_qc(
     overwrite: bool = False,
     process_kwargs: Optional[Dict[str, Any]] = None,
 ) -> CalciumQcResult:
+    """Run soma calcium QC for a session and write keep-mask artifacts.
+
+    The routine first checks whether ``indicator2`` matches the configured calcium
+    indicator regex. If so, it loads processed soma calcium traces from the
+    SummaryLoCo file, concatenates trial traces per ROI, computes robust QC metrics,
+    and writes a per-DMD boolean keep mask plus JSON/CSV summaries.
+
+    Parameters
+    ----------
+    asset
+        Session asset bundle with SummaryLoCo, QC, and metadata paths.
+    metadata
+        Optional metadata overriding or supplementing ``asset.metadata``.
+    indicator_regex
+        Regular expression used to decide whether ``indicator2`` is calcium-like.
+    trace_type
+        SummaryLoCo soma trace type to read.
+    motion_correct
+        Whether to request motion-corrected calcium traces from the SummaryLoCo
+        reader.
+    max_session_minutes
+        Optional limit passed through to calcium trace processing.
+    thresholds
+        Optional :class:`CalciumQcThresholds` instance.
+    overwrite
+        Recompute QC even if output artifacts already exist.
+    process_kwargs
+        Additional keyword arguments forwarded to calcium trace processing.
+
+    Returns
+    -------
+    CalciumQcResult
+        Paths and per-DMD summaries for generated QC artifacts.
+    """
     thresholds = thresholds or CalciumQcThresholds()
     process_kwargs = process_kwargs or {}
     metadata = metadata or {}
