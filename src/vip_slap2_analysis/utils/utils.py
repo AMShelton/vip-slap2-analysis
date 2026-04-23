@@ -11,7 +11,7 @@ import glob
 import json
 import numpy as np
 import pandas as pd
-from read_harp import HarpReader
+from vip_slap2_analysis.behavior.read_harp import HarpReader
 from scipy.signal import butter, filtfilt
 
 
