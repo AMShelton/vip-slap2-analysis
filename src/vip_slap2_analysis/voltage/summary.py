@@ -202,19 +202,25 @@ class VoltageSummary:
                 "Trace file contains '/traces' but no trial_XXXX datasets or continuous/DMD datasets."
             )
 
+        # Preserve the MATLAB metadata trial count whenever it is available.
+        # Continuous-only H5 outputs have no /traces/trial_XXXX datasets, but the
+        # metadata still knows how many behavioral/acquisition trials existed.
         if self.n_trials <= 0:
             self.n_trials = len(trial_keys) if trial_keys else 1
+        elif trial_keys:
+            self.n_trials = max(self.n_trials, len(trial_keys))
 
         self.keep_trials = np.zeros((self.n_dmds, max(self.n_trials, 1)), dtype=bool)
         if trial_keys:
+            available = set(trial_keys)
             for trial in range(1, self.n_trials + 1):
                 name = f"trial_{trial:04d}"
-                if name in self._h5["traces"]:
-                    for dmd0 in range(self.n_dmds):
-                        self.keep_trials[dmd0, trial - 1] = True
+                if name in available:
+                    self.keep_trials[:, trial - 1] = True
         else:
-            self.keep_trials[:, 0] = True
-            self.n_trials = 1
+            # Continuous traces can be read for any trial index conceptually because
+            # the trial argument is ignored in trace_mode='continuous'.
+            self.keep_trials[:, :] = True
 
         self.valid_trials = [
             list(1 + np.flatnonzero(self.keep_trials[dmd0])) for dmd0 in range(self.n_dmds)
@@ -318,10 +324,15 @@ class VoltageSummary:
             return 0
         trial_keys = self._trial_dataset_keys()
         if trial_keys:
-            return int(self._h5["traces"][trial_keys[0]].shape[0])
+            ds = self._h5["traces"][trial_keys[0]]
+            return self._infer_time_len_from_split_dataset(ds, self.n_total_rois)
         continuous_keys = self._continuous_dataset_keys()
         if continuous_keys:
-            return int(self._h5["traces/continuous"][continuous_keys[0]].shape[0])
+            key = continuous_keys[0]
+            ds = self._h5["traces/continuous"][key]
+            match = re.search(r"DMD(\d+)$", key)
+            dmd = int(match.group(1)) if match else 1
+            return self._infer_time_len_from_split_dataset(ds, self.n_rois[dmd - 1])
         return 0
 
     def _init_from_flat_summary(self, summary: h5py.Group) -> None:
@@ -513,6 +524,60 @@ class VoltageSummary:
         return roi_inds_arr
 
     @staticmethod
+    def _slice_len(slc: slice, n: int) -> int:
+        """Return the number of elements selected by a slice of length ``n``."""
+        return len(range(*slc.indices(n)))
+
+    @staticmethod
+    def _infer_split_orientation(ds: h5py.Dataset, n_rois_expected: int) -> str:
+        """Infer whether h5py sees split-H5 data as ROI x time or time x ROI.
+
+        MATLAB writes these datasets as ``[n_lines x n_rois]``. In practice, h5py
+        can expose the same datasets as ``(n_rois, n_lines)``, which is why the QC
+        notebook reads the whole dataset and transposes it. This keeps the public
+        API stable as ``(n_samples, n_rois)`` for either orientation.
+        """
+        if len(ds.shape) != 2:
+            raise ValueError(f"Expected a 2D trace dataset, got shape {ds.shape}")
+        s0, s1 = map(int, ds.shape)
+        n_rois_expected = int(n_rois_expected)
+        if s0 == n_rois_expected and s1 != n_rois_expected:
+            return "rois_time"
+        if s1 == n_rois_expected and s0 != n_rois_expected:
+            return "time_rois"
+        return "rois_time" if s0 <= s1 else "time_rois"
+
+    @classmethod
+    def _infer_time_len_from_split_dataset(cls, ds: h5py.Dataset, n_rois_expected: int) -> int:
+        """Return the time/line dimension length for a split-H5 dataset."""
+        orient = cls._infer_split_orientation(ds, n_rois_expected)
+        return int(ds.shape[1] if orient == "rois_time" else ds.shape[0])
+
+    @classmethod
+    def _read_split_columns(
+        cls,
+        ds: h5py.Dataset,
+        rows: slice,
+        cols: np.ndarray,
+        n_rois_expected: int,
+    ) -> np.ndarray:
+        """Read selected ROI columns from split-H5 data as ``(time, rois)``."""
+        cols = np.asarray(cols, dtype=int)
+        orient = cls._infer_split_orientation(ds, n_rois_expected)
+        n_time = int(ds.shape[1] if orient == "rois_time" else ds.shape[0])
+        if cols.size == 0:
+            return np.empty((cls._slice_len(rows, n_time), 0), dtype=ds.dtype)
+
+        order = np.argsort(cols)
+        sorted_cols = cols[order]
+        if orient == "rois_time":
+            x = np.asarray(ds[sorted_cols, rows]).T
+        else:
+            x = np.asarray(ds[rows, sorted_cols])
+        inv = np.argsort(order)
+        return x[:, inv]
+
+    @staticmethod
     def _read_columns(ds: h5py.Dataset, rows: slice, cols: np.ndarray) -> np.ndarray:
         """Read selected HDF5 columns and restore the requested order."""
         cols = np.asarray(cols, dtype=int)
@@ -640,14 +705,18 @@ class VoltageSummary:
             if ds_name not in self._h5:
                 raise KeyError(f"Trial dataset not found: /{ds_name}")
             cols = self._global_roi_cols(dmd, roi_inds)
-            return self._read_columns(self._h5[ds_name], t_slice, cols)
+            return self._read_split_columns(
+                self._h5[ds_name], t_slice, cols, self.n_total_rois
+            )
 
         self._validate_dmd(dmd)
         ds_name = f"traces/continuous/DMD{dmd}"
         if ds_name not in self._h5:
             raise KeyError(f"Continuous dataset not found: /{ds_name}")
         cols = self._local_roi_cols(dmd, roi_inds)
-        return self._read_columns(self._h5[ds_name], t_slice, cols)
+        return self._read_split_columns(
+            self._h5[ds_name], t_slice, cols, self.n_rois[dmd - 1]
+        )
 
     def _get_flat_traces(
         self,
@@ -719,9 +788,10 @@ class VoltageSummary:
         trial0 = self._validate_trial(trial)
         ds = self._h5[f"traces/trial_{trial0 + 1:04d}"]
         if roi_inds is None:
-            x = np.asarray(ds[t_slice, :])
+            cols = np.arange(self.n_total_rois, dtype=int)
         else:
-            x = self._read_columns(ds, t_slice, np.asarray(list(roi_inds), dtype=int))
+            cols = np.asarray(list(roi_inds), dtype=int)
+        x = self._read_split_columns(ds, t_slice, cols, self.n_total_rois)
         if dtype is not None:
             x = x.astype(dtype, copy=False)
         return x
