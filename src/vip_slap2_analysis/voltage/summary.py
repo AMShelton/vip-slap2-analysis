@@ -1,83 +1,119 @@
-# vip_slap2_analysis/voltage/summary.py
-"""Read MATLAB voltage-summary files and expose ROI traces lazily.
+"""Lazy accessors for SLAP2 dendritic-voltage summary and trace outputs.
 
-This module provides :class:`VoltageSummary`, a lightweight HDF5/MATLAB v7.3
-reader for voltage-imaging summary files. It supports both the original
-per-DMD/per-trial ``summary/E`` layout and newer flat session-wide trace exports.
-The public API uses 1-indexed DMD and trial arguments to stay consistent with the
-MATLAB pipeline while returning NumPy arrays suitable for downstream Python
-postprocessing and QC.
+This module provides :class:`VoltageSummary`, a lightweight reader for voltage
+imaging outputs created by the MATLAB ``extractDendrites_new.m`` pipeline and
+older single-file voltage summaries.  The new pipeline stores lightweight
+metadata in ``dendriticVoltageSummary-<timestamp>.mat`` and large traces in a
+paired ``dendriticVoltageTraces-<timestamp>.h5`` file.  ``VoltageSummary`` accepts
+the summary ``.mat`` path, discovers the paired trace ``.h5`` file when possible,
+and exposes trial-sliced or continuous traces through one consistent Python API.
+
+Public methods use 1-indexed ``dmd`` and ``trial`` arguments to match MATLAB and
+other summary readers in ``vip_slap2_analysis``.  Trace arrays are returned as
+``(n_samples, n_rois)`` unless otherwise noted.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Union, List
+import re
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-import numpy as np
 import h5py
+import numpy as np
 
-from vip_slap2_analysis.io.matv73 import MatV73File
+from vip_slap2_analysis.io.matv73 import MatV73File, bytes_to_str
+
+
+PathLike = Union[str, Path]
 
 
 @dataclass
 class VoltageSummary:
+    """Lazy loader for dendritic-voltage MATLAB summaries and HDF5 traces.
+
+    Parameters
+    ----------
+    file_path : str or pathlib.Path
+        Path to a voltage summary ``.mat`` file.  For new ``extractDendrites_new``
+        outputs, this should be ``dendriticVoltageSummary-<timestamp>.mat``.
+    trace_path : str or pathlib.Path, optional
+        Explicit path to the paired trace ``.h5`` file.  If omitted, the class first
+        checks ``summary.outputH5`` and then searches beside ``file_path`` for a file
+        with the same timestamp, such as ``dendriticVoltageTraces-<timestamp>.h5``.
+    keep_open : bool
+        Keep HDF5 file handles open between calls.
+    swap_xy_images : bool
+        Swap the first two image/mask axes on read for display consistency with the
+        glutamate summary reader.
+
+    Notes
+    -----
+    Three layouts are supported:
+
+    1. ``split_h5``: new separated metadata/traces format from
+       ``extractDendrites_new.m``.
+    2. ``flat_traces``: older single-file summaries with ``summary/traces``.
+    3. ``event_trial``: older per-DMD/per-trial summaries with ``summary/E``.
     """
-    Lazy loader for summarize_Voltage MAT files.
 
-    Supports two layouts:
-
-    1) Event/trial layout
-       summary/E -> per-(dmd, trial) groups containing ROIs/F, discardFrames, etc.
-
-    2) Flat-traces layout
-       summary/traces -> single session-wide traces matrix
-       summary/nAnalysisROIs -> number of ROIs per DMD
-       summary/masks -> per-DMD ROI masks
-       summary/refIM -> per-DMD reference image
-
-    Public API remains 1-indexed for dmd/trial, matching MATLAB conventions.
-    For flat-traces files, only trial=1 is valid.
-    """
-
-    file_path: Union[str, Path]
+    file_path: PathLike
+    trace_path: Optional[PathLike] = None
     keep_open: bool = True
-    swap_xy_images: bool = True  # convenience for ref images / masks display orientation
+    swap_xy_images: bool = True
 
     def __post_init__(self) -> None:
-        """Open the MAT file and infer the supported voltage-summary layout.
-
-        The constructor initializes shared session metadata such as number of
-        DMDs, trials, samples, ROI counts, valid-trial masks, and ROI offsets.
-        It does not eagerly load large trace arrays; those remain HDF5-backed
-        until requested by accessor methods.
-        """
+        """Open metadata/traces and infer the available storage layout."""
         self.file_path = Path(self.file_path)
         self._mat = MatV73File(self.file_path, keep_open=self.keep_open)
 
         if "summary" not in self._mat.f:
-            raise KeyError(f"Top-level variable 'summary' not found. Keys: {list(self._mat.f.keys())}")
+            raise KeyError(
+                f"Top-level variable 'summary' not found. Keys: {list(self._mat.f.keys())}"
+            )
+
+        self.trace_path = Path(self.trace_path) if self.trace_path is not None else None
+        self._h5: Optional[h5py.File] = None
 
         self.n_trials: int = 0
         self.n_dmds: int = 0
         self.n_samples: int = 0
-        self.keep_trials: np.ndarray
+        self.keep_trials: np.ndarray = np.zeros((0, 0), dtype=bool)
         self.valid_trials: List[List[int]] = []
         self.n_rois: List[int] = []
-        self._E_layout: str = "dmd_trial"   # only used for event/trial files
-        self._summary_layout: str = "unknown"  # "event_trial" or "flat_traces"
-        self._trace_axis: Optional[str] = None  # "rois_samples" or "samples_rois"
-        self._roi_offsets: List[int] = []
+        self.n_total_rois: int = 0
+        self.roi_global_offsets: List[int] = []
+
+        self._summary_layout: str = "unknown"
+        self._trace_axis: Optional[str] = None
+        self._E_layout: str = "dmd_trial"
+        self._metadata: Optional[Dict[str, Any]] = None
+        self._h5_attrs: Optional[Dict[str, Any]] = None
 
         self._get_info()
 
-    # ----------------- lifecycle -----------------
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Close the underlying HDF5 file handle."""
+        """Close open metadata and trace HDF5 handles."""
+        if self._h5 is not None:
+            self._h5.close()
+            self._h5 = None
         self._mat.close()
 
-    # ----------------- structure inference -----------------
+    def __enter__(self) -> "VoltageSummary":
+        """Return ``self`` for context-manager use."""
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Close file handles when leaving a context manager."""
+        self.close()
+
+    # ------------------------------------------------------------------
+    # structure inference
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _is_ref_dataset(node: object) -> bool:
@@ -87,9 +123,28 @@ class VoltageSummary:
             and (node.dtype == h5py.ref_dtype or getattr(node.dtype, "kind", None) == "O")
         )
 
+    @staticmethod
+    def _scalar(node: h5py.Dataset, default: Any = None) -> Any:
+        """Read a scalar-like HDF5 dataset and decode simple MATLAB values."""
+        try:
+            val = bytes_to_str(node[()])
+            if isinstance(val, np.ndarray):
+                val = np.squeeze(val)
+                if val.ndim == 0:
+                    return val.item()
+                return val.tolist()
+            return val
+        except Exception:
+            return default
+
     def _get_info(self) -> None:
-        """Detect summary layout and populate object-level shape metadata."""
+        """Detect the summary layout and populate shape/bookkeeping metadata."""
         summary = self._mat.f["summary"]
+
+        if self._looks_like_split_h5(summary):
+            self._summary_layout = "split_h5"
+            self._init_from_split_h5(summary)
+            return
 
         if "E" in summary:
             self._summary_layout = "event_trial"
@@ -106,19 +161,207 @@ class VoltageSummary:
             f"Available keys: {list(summary.keys())}"
         )
 
-    def _init_from_E(self, summary: h5py.Group) -> None:
-        """
-        Original summarize_Voltage layout:
-          summary/E -> 2D ref array of per-(dmd, trial) groups
-        """
-        E = summary["E"]
+    def _looks_like_split_h5(self, summary: h5py.Group) -> bool:
+        """Return True for new metadata-only summaries paired with trace HDF5 files."""
+        if "outputH5" in summary or "nTotalROIs" in summary or "roiGlobalOffsets" in summary:
+            return True
+        if self.trace_path is not None:
+            return True
+        return False
 
+    def _init_from_split_h5(self, summary: h5py.Group) -> None:
+        """Initialize metadata for ``extractDendrites_new`` split MAT/H5 outputs."""
+        self.n_dmds = int(self._scalar(summary["nDMDs"], 0)) if "nDMDs" in summary else 0
+        self.n_trials = int(self._scalar(summary["nTrials"], 0)) if "nTrials" in summary else 0
+
+        if "nAnalysisROIs" not in summary:
+            raise KeyError("summary/nAnalysisROIs is required for split-H5 voltage summaries.")
+        nrois_raw = np.asarray(summary["nAnalysisROIs"][()]).astype(int).squeeze()
+        if nrois_raw.ndim == 0:
+            nrois_raw = np.array([int(nrois_raw)])
+        self.n_rois = [int(x) for x in np.ravel(nrois_raw)]
+        if self.n_dmds <= 0:
+            self.n_dmds = len(self.n_rois)
+        self.n_total_rois = int(np.sum(self.n_rois))
+
+        if "roiGlobalOffsets" in summary:
+            offsets = np.asarray(summary["roiGlobalOffsets"][()]).astype(int).squeeze()
+            self.roi_global_offsets = [int(x) for x in np.ravel(offsets)]
+        else:
+            self.roi_global_offsets = [0] + list(np.cumsum(self.n_rois[:-1]).astype(int))
+
+        self.trace_path = self._resolve_trace_path(summary)
+        self._h5 = h5py.File(self.trace_path, "r")
+        if "traces" not in self._h5:
+            raise KeyError(f"Trace file does not contain '/traces': {self.trace_path}")
+
+        trial_keys = self._trial_dataset_keys()
+        continuous_keys = self._continuous_dataset_keys()
+        if len(trial_keys) == 0 and len(continuous_keys) == 0:
+            raise KeyError(
+                "Trace file contains '/traces' but no trial_XXXX datasets or continuous/DMD datasets."
+            )
+
+        if self.n_trials <= 0:
+            self.n_trials = len(trial_keys) if trial_keys else 1
+
+        self.keep_trials = np.zeros((self.n_dmds, max(self.n_trials, 1)), dtype=bool)
+        if trial_keys:
+            for trial in range(1, self.n_trials + 1):
+                name = f"trial_{trial:04d}"
+                if name in self._h5["traces"]:
+                    for dmd0 in range(self.n_dmds):
+                        self.keep_trials[dmd0, trial - 1] = True
+        else:
+            self.keep_trials[:, 0] = True
+            self.n_trials = 1
+
+        self.valid_trials = [
+            list(1 + np.flatnonzero(self.keep_trials[dmd0])) for dmd0 in range(self.n_dmds)
+        ]
+
+        self.n_samples = self._infer_representative_sample_count()
+
+    def _resolve_trace_path(self, summary: h5py.Group) -> Path:
+        """Find the paired ``dendriticVoltageTraces-<timestamp>.h5`` file."""
+        if self.trace_path is not None:
+            p = Path(self.trace_path)
+            if p.exists():
+                return p
+            raise FileNotFoundError(f"Explicit trace_path does not exist: {p}")
+
+        candidates: List[Path] = []
+
+        if "outputH5" in summary:
+            out_h5 = self._decode_matlab_string_dataset(summary["outputH5"])
+            if out_h5:
+                candidates.append(Path(out_h5))
+                candidates.append(self.file_path.parent / Path(out_h5).name)
+
+        timestamp = self._timestamp_from_summary_name(self.file_path.name)
+        if timestamp:
+            candidates.extend(
+                [
+                    self.file_path.with_name(f"dendriticVoltageTraces-{timestamp}.h5"),
+                    self.file_path.with_name(f"*Traces*{timestamp}*.h5"),
+                ]
+            )
+
+        candidates.extend(sorted(self.file_path.parent.glob("dendriticVoltageTraces-*.h5")))
+        candidates.extend(sorted(self.file_path.parent.glob("*Traces*.h5")))
+
+        expanded: List[Path] = []
+        for p in candidates:
+            if "*" in str(p):
+                expanded.extend(sorted(p.parent.glob(p.name)))
+            else:
+                expanded.append(p)
+
+        seen: set[Path] = set()
+        for p in expanded:
+            p = p.expanduser()
+            if p in seen:
+                continue
+            seen.add(p)
+            if p.exists():
+                return p
+
+        raise FileNotFoundError(
+            "Could not locate paired trace HDF5 file. Pass trace_path=... or place "
+            "dendriticVoltageTraces-<timestamp>.h5 beside the summary .mat file."
+        )
+
+    @staticmethod
+    def _timestamp_from_summary_name(name: str) -> Optional[str]:
+        """Extract ``YYMMDD-HHMMSS`` timestamp from a dendritic-voltage filename."""
+        m = re.search(r"dendriticVoltageSummary[-_](\d{6}-\d{6})", name)
+        if m:
+            return m.group(1)
+        m = re.search(r"(\d{6}-\d{6})", name)
+        return m.group(1) if m else None
+
+    @staticmethod
+    def _decode_matlab_string_dataset(ds: h5py.Dataset) -> str:
+        """Decode MATLAB char/string datasets into a Python string."""
+        try:
+            val = bytes_to_str(ds[()])
+            if isinstance(val, bytes):
+                return val.decode(errors="ignore")
+            if isinstance(val, str):
+                return val.rstrip("\x00")
+            arr = np.asarray(val)
+            if arr.dtype.kind in ("U", "S", "O"):
+                return "".join(np.ravel(arr).astype(str).tolist()).rstrip("\x00")
+            if np.issubdtype(arr.dtype, np.number):
+                return "".join(chr(int(x)) for x in np.ravel(arr) if int(x) != 0)
+        except Exception:
+            pass
+        return ""
+
+    def _trial_dataset_keys(self) -> List[str]:
+        """Return sorted ``/traces/trial_XXXX`` dataset names."""
+        if self._h5 is None or "traces" not in self._h5:
+            return []
+        keys = [k for k in self._h5["traces"].keys() if re.match(r"trial_\d{4}$", k)]
+        return sorted(keys)
+
+    def _continuous_dataset_keys(self) -> List[str]:
+        """Return sorted ``/traces/continuous/DMD#`` dataset names."""
+        if self._h5 is None or "traces/continuous" not in self._h5:
+            return []
+        keys = [k for k in self._h5["traces/continuous"].keys() if re.match(r"DMD\d+$", k)]
+        return sorted(keys, key=lambda x: int(x.replace("DMD", "")))
+
+    def _infer_representative_sample_count(self) -> int:
+        """Infer a representative sample count from available trace datasets."""
+        if self._h5 is None:
+            return 0
+        trial_keys = self._trial_dataset_keys()
+        if trial_keys:
+            return int(self._h5["traces"][trial_keys[0]].shape[0])
+        continuous_keys = self._continuous_dataset_keys()
+        if continuous_keys:
+            return int(self._h5["traces/continuous"][continuous_keys[0]].shape[0])
+        return 0
+
+    def _init_from_flat_summary(self, summary: h5py.Group) -> None:
+        """Initialize older single-file flat ``summary/traces`` outputs."""
+        traces = summary["traces"]
+        if len(traces.shape) != 2:
+            raise ValueError(f"Unexpected shape for summary/traces: {traces.shape}")
+
+        nrois_raw = np.asarray(summary["nAnalysisROIs"][()]).astype(int).squeeze()
+        if nrois_raw.ndim == 0:
+            nrois_raw = np.array([int(nrois_raw)])
+        self.n_rois = [int(x) for x in np.ravel(nrois_raw).tolist()]
+        self.n_dmds = len(self.n_rois)
+        self.n_total_rois = int(np.sum(self.n_rois))
+        self.roi_global_offsets = [0] + list(np.cumsum(self.n_rois[:-1]).astype(int))
+
+        s0, s1 = map(int, traces.shape)
+        if s0 == self.n_total_rois:
+            self._trace_axis = "rois_samples"
+            self.n_samples = s1
+        elif s1 == self.n_total_rois:
+            self._trace_axis = "samples_rois"
+            self.n_samples = s0
+        else:
+            raise ValueError(
+                "Could not reconcile summary/traces with summary/nAnalysisROIs. "
+                f"traces shape={traces.shape}, nAnalysisROIs={self.n_rois}"
+            )
+
+        self.n_trials = 1
+        self.keep_trials = np.ones((self.n_dmds, 1), dtype=bool)
+        self.valid_trials = [[1] for _ in range(self.n_dmds)]
+
+    def _init_from_E(self, summary: h5py.Group) -> None:
+        """Initialize original per-DMD/per-trial ``summary/E`` layout."""
+        E = summary["E"]
         if len(E.shape) != 2:
             raise ValueError(f"Unexpected shape for summary/E: {E.shape}")
 
         s0, s1 = E.shape
-
-        # Heuristic: DMD count is small (<=4 typically), trials larger.
         if s0 <= 4 and s1 > s0:
             self._E_layout = "dmd_trial"
             self.n_dmds, self.n_trials = int(s0), int(s1)
@@ -130,8 +373,6 @@ class VoltageSummary:
             self.n_dmds, self.n_trials = int(s0), int(s1)
 
         self.keep_trials = np.full((self.n_dmds, self.n_trials), False)
-
-        # Mark valid trials by checking dereferenceability
         for dmd0 in range(self.n_dmds):
             for trial0 in range(self.n_trials):
                 ref = self._E_ref(dmd0, trial0)
@@ -145,90 +386,419 @@ class VoltageSummary:
                 except Exception:
                     pass
 
-        # Determine ROI count from first valid trial for each DMD
         self.n_rois = [0 for _ in range(self.n_dmds)]
         for dmd0 in range(self.n_dmds):
             idx = np.argwhere(self.keep_trials[dmd0])
             if idx.size == 0:
                 continue
-            trial0 = int(idx[0, 0])
             try:
-                g = self._E_group(dmd0, trial0)
-                F = g["ROIs"]["F"]  # expected: (n_samples, n_rois)
-                if len(F.shape) != 2:
-                    self.n_rois[dmd0] = 0
-                else:
-                    self.n_rois[dmd0] = int(F.shape[1])  # fixed: ROI dimension, not sample dimension
+                g = self._E_group(dmd0, int(idx[0, 0]))
+                F = g["ROIs"]["F"]
+                self.n_rois[dmd0] = int(F.shape[1] if F.shape[0] >= F.shape[1] else F.shape[0])
             except Exception:
                 self.n_rois[dmd0] = 0
 
-        self.valid_trials = [
-            list(1 + np.argwhere(self.keep_trials[dmd0])[:, 0])
-            for dmd0 in range(self.n_dmds)
-        ]
+        self.n_total_rois = int(np.sum(self.n_rois))
+        self.roi_global_offsets = [0] + list(np.cumsum(self.n_rois[:-1]).astype(int))
+        self.valid_trials = [list(1 + np.argwhere(self.keep_trials[dmd0])[:, 0]) for dmd0 in range(self.n_dmds)]
 
-        # Infer sample count from first valid trial
         for dmd0 in range(self.n_dmds):
             idx = np.argwhere(self.keep_trials[dmd0])
             if idx.size == 0:
                 continue
-            trial0 = int(idx[0, 0])
             try:
-                g = self._E_group(dmd0, trial0)
+                g = self._E_group(dmd0, int(idx[0, 0]))
                 self.n_samples = int(g["ROIs"]["F"].shape[0])
                 break
             except Exception:
                 pass
 
-    def _init_from_flat_summary(self, summary: h5py.Group) -> None:
-        """
-        Flat session-wide layout:
-          summary/traces shape is either (n_total_rois, n_samples) or (n_samples, n_total_rois)
-          summary/nAnalysisROIs gives ROI count per DMD
-        """
-        traces = summary["traces"]
-        if len(traces.shape) != 2:
-            raise ValueError(f"Unexpected shape for summary/traces: {traces.shape}")
+    # ------------------------------------------------------------------
+    # metadata access
+    # ------------------------------------------------------------------
 
-        nrois_raw = np.asarray(summary["nAnalysisROIs"][()]).astype(int).squeeze()
-        if nrois_raw.ndim == 0:
-            nrois_raw = np.array([int(nrois_raw)])
-        self.n_rois = [int(x) for x in np.ravel(nrois_raw).tolist()]
-        self.n_dmds = len(self.n_rois)
-        total_rois = int(np.sum(self.n_rois))
+    @property
+    def layout(self) -> str:
+        """Storage layout: ``split_h5``, ``flat_traces``, or ``event_trial``."""
+        return self._summary_layout
 
-        s0, s1 = map(int, traces.shape)
-        if s0 == total_rois:
-            self._trace_axis = "rois_samples"
-            self.n_samples = s1
-        elif s1 == total_rois:
-            self._trace_axis = "samples_rois"
-            self.n_samples = s0
-        else:
-            raise ValueError(
-                "Could not reconcile summary/traces with summary/nAnalysisROIs. "
-                f"traces shape={traces.shape}, nAnalysisROIs={self.n_rois}"
+    @property
+    def metadata(self) -> Dict[str, Any]:
+        """Decode and cache simple values under ``summary`` and ``summary/params``."""
+        if self._metadata is None:
+            out: Dict[str, Any] = {}
+            summary = self._mat.f["summary"]
+            for key in ("createdAt", "completedAt", "sourceTrialTable", "sessionDir", "outputMode", "storageMode", "outputDir", "outputH5", "summaryPath", "isContinuousAcquisition", "complete"):
+                if key in summary and isinstance(summary[key], h5py.Dataset):
+                    val = self._scalar(summary[key])
+                    if isinstance(val, list):
+                        val = self._decode_matlab_string_dataset(summary[key])
+                    out[key] = val
+            if "params" in summary and isinstance(summary["params"], h5py.Group):
+                out["params"] = self._read_group_scalars(summary["params"])
+            self._metadata = out
+        return self._metadata
+
+    @property
+    def h5_attrs(self) -> Dict[str, Any]:
+        """Root attributes from the paired trace HDF5 file, if present."""
+        if self._h5_attrs is None:
+            out: Dict[str, Any] = {}
+            if self._h5 is not None:
+                for k, v in self._h5.attrs.items():
+                    out[k] = bytes_to_str(v)
+            self._h5_attrs = out
+        return self._h5_attrs
+
+    def _read_group_scalars(self, group: h5py.Group) -> Dict[str, Any]:
+        """Read scalar-like datasets from a metadata group into a dictionary."""
+        out: Dict[str, Any] = {}
+        for k, node in group.items():
+            if isinstance(node, h5py.Dataset):
+                val = self._scalar(node)
+                if isinstance(val, list):
+                    s = self._decode_matlab_string_dataset(node)
+                    out[k] = s if s else val
+                else:
+                    out[k] = val
+        return out
+
+    def analyze_hz(self) -> float:
+        """Return ``summary/params/analyzeHz`` when present, otherwise NaN."""
+        try:
+            hz = self._mat.f["summary"]["params"]["analyzeHz"][()]
+            return float(np.asarray(hz).squeeze())
+        except Exception:
+            return float("nan")
+
+    # ------------------------------------------------------------------
+    # index helpers
+    # ------------------------------------------------------------------
+
+    def _validate_dmd(self, dmd: int) -> int:
+        """Validate a 1-indexed DMD argument and return its 0-indexed value."""
+        dmd0 = int(dmd) - 1
+        if dmd0 < 0 or dmd0 >= self.n_dmds:
+            raise IndexError(f"dmd must be in [1, {self.n_dmds}], got {dmd}")
+        return dmd0
+
+    def _validate_trial(self, trial: int) -> int:
+        """Validate a 1-indexed trial argument and return its 0-indexed value."""
+        trial0 = int(trial) - 1
+        if trial0 < 0 or trial0 >= self.n_trials:
+            raise IndexError(f"trial must be in [1, {self.n_trials}], got {trial}")
+        return trial0
+
+    def _global_roi_cols(self, dmd: int, roi_inds: Optional[Sequence[int]]) -> np.ndarray:
+        """Map DMD-local ROI indices to global HDF5 trial-dataset columns."""
+        dmd0 = self._validate_dmd(dmd)
+        start = int(self.roi_global_offsets[dmd0])
+        n_rois = int(self.n_rois[dmd0])
+        if roi_inds is None:
+            return start + np.arange(n_rois, dtype=int)
+        roi_inds_arr = np.asarray(list(roi_inds), dtype=int)
+        if np.any(roi_inds_arr < 0) or np.any(roi_inds_arr >= n_rois):
+            raise IndexError(f"roi_inds out of range for dmd {dmd}; n_rois={n_rois}")
+        return start + roi_inds_arr
+
+    def _local_roi_cols(self, dmd: int, roi_inds: Optional[Sequence[int]]) -> np.ndarray:
+        """Return DMD-local ROI columns for continuous datasets."""
+        dmd0 = self._validate_dmd(dmd)
+        n_rois = int(self.n_rois[dmd0])
+        if roi_inds is None:
+            return np.arange(n_rois, dtype=int)
+        roi_inds_arr = np.asarray(list(roi_inds), dtype=int)
+        if np.any(roi_inds_arr < 0) or np.any(roi_inds_arr >= n_rois):
+            raise IndexError(f"roi_inds out of range for dmd {dmd}; n_rois={n_rois}")
+        return roi_inds_arr
+
+    @staticmethod
+    def _read_columns(ds: h5py.Dataset, rows: slice, cols: np.ndarray) -> np.ndarray:
+        """Read selected HDF5 columns and restore the requested order."""
+        cols = np.asarray(cols, dtype=int)
+        if cols.size == 0:
+            return np.empty((len(range(*rows.indices(ds.shape[0]))), 0), dtype=ds.dtype)
+        order = np.argsort(cols)
+        sorted_cols = cols[order]
+        x = np.asarray(ds[rows, sorted_cols])
+        inv = np.argsort(order)
+        return x[:, inv]
+
+    @staticmethod
+    def _align_bool_mask(mask: np.ndarray, n: int) -> np.ndarray:
+        """Ensure a boolean mask is one-dimensional with length ``n``."""
+        mask = np.asarray(mask).astype(bool).squeeze()
+        if mask.ndim != 1:
+            mask = mask.reshape(-1)
+        if mask.size == n:
+            return mask
+        if mask.size > n:
+            return mask[:n]
+        out = np.zeros(n, dtype=bool)
+        out[: mask.size] = mask
+        return out
+
+    # ------------------------------------------------------------------
+    # trace access
+    # ------------------------------------------------------------------
+
+    def available_trace_modes(self) -> List[str]:
+        """Return available split-H5 trace modes: ``trial`` and/or ``continuous``."""
+        if self._summary_layout != "split_h5" or self._h5 is None:
+            return []
+        modes: List[str] = []
+        if self._trial_dataset_keys():
+            modes.append("trial")
+        if self._continuous_dataset_keys():
+            modes.append("continuous")
+        return modes
+
+    def get_roi_traces(
+        self,
+        dmd: int = 1,
+        trial: int = 1,
+        roi_inds: Optional[Sequence[int]] = None,
+        t_slice: Optional[slice] = None,
+        drop_discarded: bool = False,
+        dtype: Optional[np.dtype] = None,
+        trace_mode: str = "auto",
+    ) -> np.ndarray:
+        """Return ROI traces as ``(n_samples, n_rois)``.
+
+        Parameters
+        ----------
+        dmd, trial : int
+            1-indexed DMD and trial.  ``trial`` is ignored only when
+            ``trace_mode='continuous'``.
+        roi_inds : sequence of int, optional
+            DMD-local 0-indexed ROI indices to load.  ``None`` loads all ROIs for
+            the requested DMD.
+        t_slice : slice, optional
+            Sample/line slice along the time axis.
+        drop_discarded : bool
+            Preserve API compatibility.  Older ``summary/E`` files use stored
+            ``discardFrames``.  New split-H5 outputs currently return all-False masks.
+        dtype : numpy dtype, optional
+            Cast output without copying when possible.
+        trace_mode : {"auto", "trial", "continuous"}
+            For split-H5 outputs, choose trial-sliced or continuous datasets.
+            ``auto`` prefers trial datasets when present.
+        """
+        if t_slice is None:
+            t_slice = slice(None)
+
+        if self._summary_layout == "split_h5":
+            x = self._get_split_h5_traces(
+                dmd=dmd,
+                trial=trial,
+                roi_inds=roi_inds,
+                t_slice=t_slice,
+                trace_mode=trace_mode,
             )
+        elif self._summary_layout == "flat_traces":
+            x = self._get_flat_traces(dmd=dmd, trial=trial, roi_inds=roi_inds, t_slice=t_slice)
+        else:
+            x = self._get_E_traces(dmd=dmd, trial=trial, roi_inds=roi_inds, t_slice=t_slice)
 
-        self.n_trials = 1
-        self.keep_trials = np.ones((self.n_dmds, 1), dtype=bool)
-        self.valid_trials = [[1] for _ in range(self.n_dmds)]
-        self._roi_offsets = [0] + list(np.cumsum(self.n_rois))
+        if drop_discarded:
+            df = self.get_discard_frames(dmd=dmd, trial=trial, trace_mode=trace_mode)
+            df = self._align_bool_mask(df, x.shape[0])
+            x = x[~df, :]
 
-    # ----------------- event/trial helpers -----------------
+        if dtype is not None:
+            x = x.astype(dtype, copy=False)
+        return x
+
+    def get_traces(self, *args: Any, **kwargs: Any) -> np.ndarray:
+        """Alias for :meth:`get_roi_traces` for consistency with other summaries."""
+        return self.get_roi_traces(*args, **kwargs)
+
+    def _get_split_h5_traces(
+        self,
+        dmd: int,
+        trial: int,
+        roi_inds: Optional[Sequence[int]],
+        t_slice: slice,
+        trace_mode: str,
+    ) -> np.ndarray:
+        """Read traces from new paired HDF5 files."""
+        if self._h5 is None:
+            raise RuntimeError("Trace HDF5 file is not open.")
+
+        mode = trace_mode.lower()
+        if mode not in ("auto", "trial", "continuous"):
+            raise ValueError("trace_mode must be 'auto', 'trial', or 'continuous'.")
+
+        trial_keys = self._trial_dataset_keys()
+        continuous_keys = self._continuous_dataset_keys()
+        if mode == "auto":
+            mode = "trial" if trial_keys else "continuous"
+
+        if mode == "trial":
+            trial0 = self._validate_trial(trial)
+            ds_name = f"traces/trial_{trial0 + 1:04d}"
+            if ds_name not in self._h5:
+                raise KeyError(f"Trial dataset not found: /{ds_name}")
+            cols = self._global_roi_cols(dmd, roi_inds)
+            return self._read_columns(self._h5[ds_name], t_slice, cols)
+
+        self._validate_dmd(dmd)
+        ds_name = f"traces/continuous/DMD{dmd}"
+        if ds_name not in self._h5:
+            raise KeyError(f"Continuous dataset not found: /{ds_name}")
+        cols = self._local_roi_cols(dmd, roi_inds)
+        return self._read_columns(self._h5[ds_name], t_slice, cols)
+
+    def _get_flat_traces(
+        self,
+        dmd: int,
+        trial: int,
+        roi_inds: Optional[Sequence[int]],
+        t_slice: slice,
+    ) -> np.ndarray:
+        """Read traces from older single-file ``summary/traces`` outputs."""
+        if trial != 1:
+            raise ValueError("Flat-trace voltage summaries expose the session as trial=1 only.")
+        traces = self._mat.f["summary"]["traces"]
+        row_inds = self._global_roi_cols(dmd, roi_inds)
+        if self._trace_axis == "rois_samples":
+            x = np.asarray(traces[row_inds, t_slice]).T
+        else:
+            x = self._read_columns(traces, t_slice, row_inds)
+        return np.atleast_2d(x)
+
+    def _get_E_traces(
+        self,
+        dmd: int,
+        trial: int,
+        roi_inds: Optional[Sequence[int]],
+        t_slice: slice,
+    ) -> np.ndarray:
+        """Read traces from original ``summary/E/ROIs/F`` outputs."""
+        dmd0 = self._validate_dmd(dmd)
+        trial0 = self._validate_trial(trial)
+        g = self._E_group(dmd0, trial0)
+        F = g["ROIs"]["F"]
+        if roi_inds is None:
+            x = np.asarray(F[t_slice, :])
+        else:
+            x = np.asarray(F[t_slice, list(roi_inds)])
+        return np.atleast_2d(x)
+
+    def get_trace_dataset(self, dmd: int = 1, trial: int = 1, trace_mode: str = "auto") -> h5py.Dataset:
+        """Return the underlying HDF5 trace dataset for advanced lazy access."""
+        if self._summary_layout != "split_h5" or self._h5 is None:
+            raise ValueError("get_trace_dataset is only available for split-H5 outputs.")
+        mode = trace_mode.lower()
+        if mode == "auto":
+            mode = "trial" if self._trial_dataset_keys() else "continuous"
+        if mode == "trial":
+            trial0 = self._validate_trial(trial)
+            return self._h5[f"traces/trial_{trial0 + 1:04d}"]
+        if mode == "continuous":
+            self._validate_dmd(dmd)
+            return self._h5[f"traces/continuous/DMD{dmd}"]
+        raise ValueError("trace_mode must be 'auto', 'trial', or 'continuous'.")
+
+    def get_trial_traces(
+        self,
+        trial: int = 1,
+        roi_inds: Optional[Sequence[int]] = None,
+        t_slice: Optional[slice] = None,
+        dtype: Optional[np.dtype] = None,
+    ) -> np.ndarray:
+        """Return a full trial-sliced dataset as ``(n_samples, n_total_rois)``.
+
+        ``roi_inds`` are global 0-indexed ROI columns in the trial dataset.  Use
+        :meth:`get_roi_traces` to select ROIs by DMD-local indices.
+        """
+        if self._summary_layout != "split_h5" or self._h5 is None:
+            raise ValueError("get_trial_traces requires a split-H5 voltage summary.")
+        if t_slice is None:
+            t_slice = slice(None)
+        trial0 = self._validate_trial(trial)
+        ds = self._h5[f"traces/trial_{trial0 + 1:04d}"]
+        if roi_inds is None:
+            x = np.asarray(ds[t_slice, :])
+        else:
+            x = self._read_columns(ds, t_slice, np.asarray(list(roi_inds), dtype=int))
+        if dtype is not None:
+            x = x.astype(dtype, copy=False)
+        return x
+
+    def get_roi_traces_all_trials(
+        self,
+        dmd: int = 1,
+        roi_inds: Optional[Sequence[int]] = None,
+        t_slice: Optional[slice] = None,
+        include_invalid: bool = True,
+        pad_to: str = "max_valid",
+        dtype: Optional[np.dtype] = None,
+    ) -> Union[np.ndarray, List[Optional[np.ndarray]]]:
+        """Load one DMD's trial-sliced traces across trials.
+
+        Parameters
+        ----------
+        pad_to : {"max_valid", "none"}
+            ``"max_valid"`` returns a padded array shaped
+            ``(n_trials, n_samples, n_rois)``.  ``"none"`` returns a list of per-trial
+            arrays, with invalid trials as ``None`` when ``include_invalid=False``.
+        """
+        if pad_to not in ("max_valid", "none"):
+            raise ValueError("pad_to must be 'max_valid' or 'none'.")
+
+        dmd0 = self._validate_dmd(dmd)
+        trials = range(1, self.n_trials + 1)
+        out_list: List[Optional[np.ndarray]] = []
+        max_t = 0
+        n_roi = len(self._local_roi_cols(dmd, roi_inds))
+
+        for tr in trials:
+            valid = bool(self.keep_trials[dmd0, tr - 1])
+            if not valid:
+                out_list.append(None if not include_invalid else np.full((0, n_roi), np.nan))
+                continue
+            try:
+                x = self.get_roi_traces(
+                    dmd=dmd,
+                    trial=tr,
+                    roi_inds=roi_inds,
+                    t_slice=t_slice,
+                    dtype=dtype,
+                    trace_mode="trial",
+                )
+            except Exception:
+                if not include_invalid:
+                    out_list.append(None)
+                    continue
+                x = np.full((0, n_roi), np.nan)
+            max_t = max(max_t, int(x.shape[0]))
+            out_list.append(x)
+
+        if pad_to == "none":
+            return out_list
+
+        arr = np.full(
+            (self.n_trials, max_t, n_roi),
+            np.nan,
+            dtype=(dtype if dtype is not None else float),
+        )
+        for i, x in enumerate(out_list):
+            if x is None or x.size == 0:
+                continue
+            arr[i, : x.shape[0], : x.shape[1]] = x
+        return arr
+
+    # ------------------------------------------------------------------
+    # older event-trial extras and shared masks/images
+    # ------------------------------------------------------------------
 
     def _E_ref(self, dmd0: int, trial0: int) -> Optional[h5py.Reference]:
         """Return the HDF5 reference for a zero-indexed DMD/trial pair."""
         if self._summary_layout != "event_trial":
-            raise ValueError("summary/E is not present in this file; this is a flat-traces voltage summary.")
-
+            raise ValueError("summary/E is not present for this voltage summary.")
         E = self._mat.f["summary"]["E"]
-
-        if self._E_layout == "dmd_trial":
-            ref = E[dmd0, trial0]
-        else:
-            ref = E[trial0, dmd0]
-
+        ref = E[dmd0, trial0] if self._E_layout == "dmd_trial" else E[trial0, dmd0]
         if ref is None:
             return None
         try:
@@ -242,131 +812,11 @@ class VoltageSummary:
         """Dereference a zero-indexed DMD/trial entry from ``summary/E``."""
         ref = self._E_ref(dmd0, trial0)
         if ref is None:
-            raise ValueError(f"No E ref for dmd={dmd0+1}, trial={trial0+1}")
-
+            raise ValueError(f"No E ref for dmd={dmd0 + 1}, trial={trial0 + 1}")
         node = self._mat.deref(ref)
         if not isinstance(node, h5py.Group):
             raise TypeError("E ref did not dereference to a Group")
         return node
-
-    # ----------------- params -----------------
-
-    def analyze_hz(self) -> float:
-        """
-        summary/params/analyzeHz if present, otherwise NaN.
-        """
-        try:
-            hz = self._mat.f["summary"]["params"]["analyzeHz"][()]
-            return float(np.array(hz).squeeze())
-        except Exception:
-            return float("nan")
-
-    # ----------------- helpers -----------------
-
-    @staticmethod
-    def _align_bool_mask(mask: np.ndarray, n: int) -> np.ndarray:
-        """
-        Ensure mask is 1D length n.
-        If longer: truncate. If shorter: pad False.
-        """
-        mask = np.asarray(mask).astype(bool).squeeze()
-        if mask.ndim != 1:
-            mask = mask.reshape(-1)
-
-        if mask.size == n:
-            return mask
-        if mask.size > n:
-            return mask[:n]
-        out = np.zeros(n, dtype=bool)
-        out[: mask.size] = mask
-        return out
-
-    def _require_trial1_for_flat_summary(self, trial: int) -> None:
-        """Validate flat-trace access, where the whole session is exposed as trial 1."""
-        if self._summary_layout == "flat_traces" and trial != 1:
-            raise ValueError(
-                "This voltage summary has no per-trial E structure. "
-                "Use trial=1 for the flattened session-wide traces."
-            )
-
-    def _flat_roi_row_inds(self, dmd: int, roi_inds: Optional[Sequence[int]]) -> np.ndarray:
-        """Map DMD-local ROI indices to rows in the flat session-wide trace matrix."""
-        dmd0 = dmd - 1
-        if dmd0 < 0 or dmd0 >= self.n_dmds:
-            raise IndexError(f"dmd must be in [1, {self.n_dmds}]")
-
-        start = self._roi_offsets[dmd0]
-        stop = self._roi_offsets[dmd0 + 1]
-
-        if roi_inds is None:
-            return np.arange(start, stop, dtype=int)
-
-        roi_inds = np.asarray(list(roi_inds), dtype=int)
-        if np.any(roi_inds < 0) or np.any(roi_inds >= self.n_rois[dmd0]):
-            raise IndexError(f"roi_inds out of range for dmd {dmd}")
-        return start + roi_inds
-
-    # ----------------- traces -----------------
-
-    def get_roi_traces(
-        self,
-        dmd: int,
-        trial: int,
-        roi_inds: Optional[Sequence[int]] = None,
-        t_slice: Optional[slice] = None,
-        drop_discarded: bool = False,
-        dtype: Optional[np.dtype] = None,
-    ) -> np.ndarray:
-        """
-        Returns ROI traces with shape (n_samples, n_rois).
-
-        For flat-traces summaries, only trial=1 is valid.
-        """
-        if t_slice is None:
-            t_slice = slice(None)
-
-        if self._summary_layout == "flat_traces":
-            self._require_trial1_for_flat_summary(trial)
-            traces = self._mat.f["summary"]["traces"]
-            row_inds = self._flat_roi_row_inds(dmd, roi_inds)
-
-            if self._trace_axis == "rois_samples":
-                x = np.asarray(traces[row_inds, t_slice]).T
-            else:
-                x = np.asarray(traces[t_slice, row_inds])
-
-            x = np.atleast_2d(x)
-            if x.shape[0] != self.n_samples and x.shape[1] == self.n_samples:
-                x = x.T
-
-            if drop_discarded:
-                df = self.get_discard_frames(dmd=dmd, trial=trial)
-                df = self._align_bool_mask(df, x.shape[0])
-                x = x[~df, :]
-
-            if dtype is not None:
-                x = x.astype(dtype, copy=False)
-            return x
-
-        dmd0, trial0 = dmd - 1, trial - 1
-        g = self._E_group(dmd0, trial0)
-        F = g["ROIs"]["F"]  # (n_samples, n_rois)
-
-        if roi_inds is None:
-            x = np.asarray(F[t_slice, :])
-        else:
-            roi_inds = list(roi_inds)
-            x = np.asarray(F[t_slice, roi_inds])
-
-        if drop_discarded:
-            df = self.get_discard_frames(dmd=dmd, trial=trial)
-            df = self._align_bool_mask(df, x.shape[0])
-            x = x[~df, :]
-
-        if dtype is not None:
-            x = x.astype(dtype, copy=False)
-
-        return x
 
     def get_roi_weights(
         self,
@@ -376,30 +826,16 @@ class VoltageSummary:
         t_slice: Optional[slice] = None,
         dtype: Optional[np.dtype] = None,
     ) -> np.ndarray:
-        """
-        Load ROI weights from E/ROIs/weight.
-
-        Returns shape: (n_samples, n_rois)
-        """
-        if self._summary_layout == "flat_traces":
-            raise KeyError("summary/ROIs/weight is not present in flat-traces voltage summaries.")
-
-        dmd0, trial0 = dmd - 1, trial - 1
-        g = self._E_group(dmd0, trial0)
-        W = g["ROIs"]["weight"]
-
+        """Load ``E/ROIs/weight`` from older event-trial summaries."""
+        if self._summary_layout != "event_trial":
+            raise KeyError("ROI weights are only stored in older event-trial voltage summaries.")
         if t_slice is None:
             t_slice = slice(None)
-
-        if roi_inds is None:
-            x = np.asarray(W[t_slice, :])
-        else:
-            roi_inds = list(roi_inds)
-            x = np.asarray(W[t_slice, roi_inds])
-
+        g = self._E_group(self._validate_dmd(dmd), self._validate_trial(trial))
+        W = g["ROIs"]["weight"]
+        x = np.asarray(W[t_slice, :] if roi_inds is None else W[t_slice, list(roi_inds)])
         if dtype is not None:
             x = x.astype(dtype, copy=False)
-
         return x
 
     def get_global_trace(
@@ -409,40 +845,25 @@ class VoltageSummary:
         t_slice: Optional[slice] = None,
         dtype: Optional[np.dtype] = None,
     ) -> np.ndarray:
-        """
-        Load global weighted trace: E/global/F
-
-        Returns shape: (n_samples,)
-        """
-        if self._summary_layout == "flat_traces":
-            raise KeyError("summary/global/F is not present in flat-traces voltage summaries.")
-
-        dmd0, trial0 = dmd - 1, trial - 1
-        g = self._E_group(dmd0, trial0)
-        F = g["global"]["F"]
-
+        """Load ``E/global/F`` from older event-trial summaries."""
+        if self._summary_layout != "event_trial":
+            raise KeyError("Global traces are only stored in older event-trial voltage summaries.")
         if t_slice is None:
             t_slice = slice(None)
-
-        x = np.asarray(F[t_slice]).squeeze()
+        g = self._E_group(self._validate_dmd(dmd), self._validate_trial(trial))
+        x = np.asarray(g["global"]["F"][t_slice]).squeeze()
         if dtype is not None:
             x = x.astype(dtype, copy=False)
         return x
 
-    def get_discard_frames(self, dmd: int, trial: int) -> np.ndarray:
-        """
-        Load discardFrames if present.
-
-        For flat-traces summaries, returns all-False since discardFrames are not stored.
-        """
-        if self._summary_layout == "flat_traces":
-            self._require_trial1_for_flat_summary(trial)
-            return np.zeros(self.n_samples, dtype=bool)
-
-        dmd0, trial0 = dmd - 1, trial - 1
-        g = self._E_group(dmd0, trial0)
-        df = g["discardFrames"]
-        return np.asarray(df[()]).astype(bool).squeeze()
+    def get_discard_frames(self, dmd: int, trial: int, trace_mode: str = "auto") -> np.ndarray:
+        """Return stored discard-frame mask, or all-False for split/flat outputs."""
+        if self._summary_layout == "event_trial":
+            g = self._E_group(self._validate_dmd(dmd), self._validate_trial(trial))
+            if "discardFrames" in g:
+                return np.asarray(g["discardFrames"][()]).astype(bool).squeeze()
+        n = self.get_roi_traces(dmd=dmd, trial=trial, roi_inds=[], trace_mode=trace_mode).shape[0]
+        return np.zeros(n, dtype=bool)
 
     def get_motion(
         self,
@@ -452,50 +873,36 @@ class VoltageSummary:
         t_slice: Optional[slice] = None,
         dtype: Optional[np.dtype] = None,
     ) -> Dict[str, np.ndarray]:
-        """
-        Load upsampled motion: E/upsampledMotion/<field>
-
-        For flat-traces summaries, returns {}.
-        """
-        if self._summary_layout == "flat_traces":
+        """Load ``E/upsampledMotion`` fields from older event-trial summaries."""
+        if self._summary_layout != "event_trial":
             return {}
-
-        dmd0, trial0 = dmd - 1, trial - 1
-        g = self._E_group(dmd0, trial0)
-        um = g["upsampledMotion"]
-
-        if keys is None:
-            keys = list(um.keys())
-
         if t_slice is None:
             t_slice = slice(None)
-
+        g = self._E_group(self._validate_dmd(dmd), self._validate_trial(trial))
+        if "upsampledMotion" not in g:
+            return {}
+        um = g["upsampledMotion"]
+        if keys is None:
+            keys = list(um.keys())
         out: Dict[str, np.ndarray] = {}
-        for k in keys:
-            if k not in um:
+        for key in keys:
+            if key not in um:
                 continue
-            arr = np.asarray(um[k][t_slice]).squeeze()
+            arr = np.asarray(um[key][t_slice]).squeeze()
             if dtype is not None:
                 arr = arr.astype(dtype, copy=False)
-            out[k] = arr
+            out[key] = arr
         return out
 
-    # ----------------- cell-array backed images -----------------
-
     def _cell_item(self, cell_name: str, dmd0: int) -> Optional[Union[h5py.Dataset, h5py.Group]]:
-        """
-        summary/<cell_name> is often a MATLAB cell array stored as an HDF5 ref dataset.
-        Dereference element {dmd}.
-        """
+        """Dereference DMD-indexed MATLAB cell arrays stored under ``summary``."""
         summary = self._mat.f["summary"]
         if cell_name not in summary:
             return None
-
         cell = summary[cell_name]
         if not self._is_ref_dataset(cell):
             return cell
-
-        for (i, j) in [(dmd0, 0), (0, dmd0)]:
+        for i, j in ((dmd0, 0), (0, dmd0)):
             try:
                 ref = cell[i, j]
                 if ref is None:
@@ -511,82 +918,98 @@ class VoltageSummary:
         return None
 
     def get_ref_plane(self, dmd: int) -> np.ndarray:
-        """
-        Supports either summary/refPlane{dmd} or summary/refIM{dmd}.
-        """
-        dmd0 = dmd - 1
+        """Return DMD reference image from ``summary/refPlane`` or ``summary/refIM``."""
+        dmd0 = self._validate_dmd(dmd)
         node = self._cell_item("refPlane", dmd0)
         if node is None:
             node = self._cell_item("refIM", dmd0)
-
         if node is None or not isinstance(node, h5py.Dataset):
-            raise KeyError(f"summary/refPlane{{{dmd}}} or summary/refIM{{{dmd}}} not found or unexpected type")
-
+            raise KeyError(f"summary/refPlane{{{dmd}}} or summary/refIM{{{dmd}}} not found")
         arr = np.asarray(node[()])
         if self.swap_xy_images and arr.ndim >= 2:
             arr = np.swapaxes(arr, 0, 1)
         return arr
 
-    def get_roi_masks(self, dmd: int) -> np.ndarray:
-        """
-        Returns masks as (y, x, n_rois) boolean.
+    def get_mean_image(self, dmd: int) -> np.ndarray:
+        """Alias for :meth:`get_ref_plane` for workflow compatibility."""
+        return self.get_ref_plane(dmd)
 
-        Handles either:
-          - (y, x, n_rois)
-          - (n_rois, y, x)
-        """
-        dmd0 = dmd - 1
+    def get_activity_image(self, dmd: int) -> np.ndarray:
+        """Return an activity/label image when available, otherwise ROI labels."""
+        dmd0 = self._validate_dmd(dmd)
+        for name in ("actIM", "maskImages", "userROIs"):
+            node = self._cell_item(name, dmd0)
+            if isinstance(node, h5py.Dataset):
+                arr = np.asarray(node[()])
+                if self.swap_xy_images and arr.ndim >= 2:
+                    arr = np.swapaxes(arr, 0, 1)
+                return arr
+        return self.get_user_roi_label_image(dmd)
+
+    def get_roi_masks(self, dmd: int) -> np.ndarray:
+        """Return masks as ``(y, x, n_rois)`` boolean array."""
+        dmd0 = self._validate_dmd(dmd)
         node = self._cell_item("masks", dmd0)
         if node is None or not isinstance(node, h5py.Dataset):
             raise KeyError(f"summary/masks{{{dmd}}} not found or unexpected type")
-
-        m = np.asarray(node[()])
-        expected = self.n_rois[dmd0] if dmd0 < len(self.n_rois) else None
-
-        if m.ndim == 3 and expected is not None:
-            if m.shape[0] == expected:
-                m = np.moveaxis(m, 0, -1)  # (n_rois, y, x) -> (y, x, n_rois)
-            elif m.shape[-1] == expected:
+        masks = np.asarray(node[()])
+        expected = self.n_rois[dmd0]
+        if masks.ndim == 3:
+            if masks.shape[0] == expected:
+                masks = np.moveaxis(masks, 0, -1)
+            elif masks.shape[-1] == expected:
                 pass
-
-        if self.swap_xy_images and m.ndim >= 2:
-            m = np.swapaxes(m, 0, 1)
-        return m.astype(bool)
+        if self.swap_xy_images and masks.ndim >= 2:
+            masks = np.swapaxes(masks, 0, 1)
+        return masks.astype(bool)
 
     def get_user_roi_label_image(self, dmd: int) -> np.ndarray:
-        """
-        summary/userROIs{dmd} label image if present.
-        Otherwise reconstruct a label image from masks.
-        """
-        dmd0 = dmd - 1
-        node = self._cell_item("userROIs", dmd0)
-        if node is not None and isinstance(node, h5py.Dataset):
-            img = np.asarray(node[()])
-            if self.swap_xy_images and img.ndim >= 2:
-                img = np.swapaxes(img, 0, 1)
-            return img
-
+        """Return stored ROI label image or reconstruct one from masks."""
+        dmd0 = self._validate_dmd(dmd)
+        for name in ("userROIs", "maskImages"):
+            node = self._cell_item(name, dmd0)
+            if isinstance(node, h5py.Dataset):
+                img = np.asarray(node[()])
+                if self.swap_xy_images and img.ndim >= 2:
+                    img = np.swapaxes(img, 0, 1)
+                return img
         masks = self.get_roi_masks(dmd)
         label_img = np.zeros(masks.shape[:2], dtype=np.int32)
         for i in range(masks.shape[2]):
             label_img[masks[:, :, i]] = i + 1
         return label_img
 
-    # ----------------- convenience -----------------
+    # ------------------------------------------------------------------
+    # trial metadata helpers
+    # ------------------------------------------------------------------
 
-    def timebase(self, dmd: int, trial: int) -> np.ndarray:
-        """
-        Uniform timebase in seconds based on analyzeHz when available.
-        If analyzeHz is missing, returns sample indices.
-        """
-        if self._summary_layout == "flat_traces":
-            self._require_trial1_for_flat_summary(trial)
-            n = self.n_samples
-        else:
-            dmd0, trial0 = dmd - 1, trial - 1
-            g = self._E_group(dmd0, trial0)
-            n = int(g["ROIs"]["F"].shape[0])
+    def trial_dataset_attrs(self, trial: int) -> Dict[str, Any]:
+        """Return HDF5 attributes for ``/traces/trial_XXXX``."""
+        if self._summary_layout != "split_h5" or self._h5 is None:
+            return {}
+        trial0 = self._validate_trial(trial)
+        ds_name = f"traces/trial_{trial0 + 1:04d}"
+        if ds_name not in self._h5:
+            return {}
+        return {k: bytes_to_str(v) for k, v in self._h5[ds_name].attrs.items()}
 
+    def continuous_dataset_attrs(self, dmd: int) -> Dict[str, Any]:
+        """Return HDF5 attributes for ``/traces/continuous/DMD#``."""
+        if self._summary_layout != "split_h5" or self._h5 is None:
+            return {}
+        self._validate_dmd(dmd)
+        ds_name = f"traces/continuous/DMD{dmd}"
+        if ds_name not in self._h5:
+            return {}
+        return {k: bytes_to_str(v) for k, v in self._h5[ds_name].attrs.items()}
+
+    def timebase(self, dmd: int = 1, trial: int = 1, trace_mode: str = "auto") -> np.ndarray:
+        """Return a uniform timebase in seconds when ``analyzeHz`` is available.
+
+        For split-H5 files, the length is taken from the selected trial or continuous
+        trace dataset.  If ``analyzeHz`` is unavailable, sample/line indices are returned.
+        """
+        n = int(self.get_roi_traces(dmd=dmd, trial=trial, roi_inds=[], trace_mode=trace_mode).shape[0])
         hz = self.analyze_hz()
         if not np.isfinite(hz) or hz <= 0:
             return np.arange(n, dtype=float)
