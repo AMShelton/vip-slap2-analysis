@@ -22,7 +22,6 @@ import numpy as np
 import pandas as pd
 
 from vip_slap2_analysis.behavior.read_harp import HarpReader
-from vip_slap2_analysis.behavior.preprocess import process_single_harp_session
 
 PathLike = Union[str, Path]
 
@@ -149,7 +148,8 @@ def ensure_harp_extracted(
     dict
         Metadata indicating whether existing extracted files were reused.
     """
-
+    from vip_slap2_analysis.behavior.preprocess import process_single_harp_session
+    
     if harp_extract_fn is None:
         harp_extract_fn = process_single_harp_session
 

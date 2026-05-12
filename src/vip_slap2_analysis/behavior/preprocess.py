@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 import matplotlib.pyplot as plt
-from read_harp import HarpReader
+from vip_slap2_analysis.behavior.read_harp import HarpReader
 from dataclasses import dataclass, asdict
 from scipy.signal import medfilt
 from typing import Optional, Tuple, Dict, Any, List,Union
