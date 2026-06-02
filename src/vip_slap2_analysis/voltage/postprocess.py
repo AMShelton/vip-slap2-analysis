@@ -16,7 +16,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from vip_slap2_analysis.glutamate.alignment import ReconstructedTraceBundle
+from src.vip_slap2_analysis.common.alignment import ReconstructedTraceBundle
 
 
 TrialSlice = Tuple[int, slice]

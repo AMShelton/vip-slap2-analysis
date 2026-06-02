@@ -82,7 +82,7 @@ Important glutamate modules:
   - handles MATLAB v7.3 HDF5 references and cell-array-like structures;
   - exposes source traces, user-ROI traces, summary images, selected-pixel masks,
     footprints, and processed soma calcium traces when present.
-- `vip_slap2_analysis.glutamate.alignment`
+- `vip_slap2_analysis.common.alignment`
   - loads corrected behavior/event tables;
   - extracts image, change, and omission intervals;
   - reconstructs DMD session traces;
