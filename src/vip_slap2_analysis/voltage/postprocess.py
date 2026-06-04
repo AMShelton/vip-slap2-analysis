@@ -6,17 +6,20 @@ reader, :class:`vip_slap2_analysis.voltage.summary.VoltageSummary`, exposes trac
 blocks in a time-major convention: ``(n_samples, n_rois)``.  This module preserves
 that convention for voltage I/O helpers and converts to the ROI-major convention
 ``(n_rois, n_samples)`` only when building a
-:class:`vip_slap2_analysis.glutamate.alignment.ReconstructedTraceBundle` for the
+:class:`vip_slap2_analysis.common.alignment.ReconstructedTraceBundle` for the
 shared event-alignment machinery.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-from src.vip_slap2_analysis.common.alignment import ReconstructedTraceBundle
+from vip_slap2_analysis.common.alignment import ReconstructedTraceBundle
+from vip_slap2_analysis.common.session import SessionAssets
+from vip_slap2_analysis.voltage.summary import VoltageSummary
 
 
 TrialSlice = Tuple[int, slice]
@@ -334,3 +337,175 @@ def reconstruct_voltage_dmd_session_traces(
         session_end_sec=session_end_sec,
         reconstructed_duration_sec=float(total_samples / sample_rate_hz),
     )
+
+
+def load_voltage_summary_from_asset(
+    asset: SessionAssets,
+    *,
+    keep_open: bool = True,
+    swap_xy_images: bool = True,
+) -> VoltageSummary:
+    """Load a :class:`VoltageSummary` from generic session assets.
+
+    The voltage session asset model stores the split extraction outputs as
+    ``asset.modality_assets["voltage"]`` rather than as voltage-specific
+    dataclass fields.  This helper is the canonical bridge between the generic
+    asset resolver and the voltage reader.
+
+    Parameters
+    ----------
+    asset
+        Session asset bundle returned by ``VIPSessionRegistry.resolve_assets``.
+    keep_open
+        Keep the underlying MAT/H5 file handles open between reader calls.
+    swap_xy_images
+        Passed through to :class:`VoltageSummary` for display-oriented image and
+        mask access.
+
+    Returns
+    -------
+    VoltageSummary
+        Reader initialized with the required voltage summary MAT file and, when
+        available, the paired trace H5 file resolved by the session registry.
+    """
+    summary_mat = asset.require_asset("voltage", "summary_mat")
+    trace_h5 = asset.get_asset("voltage", "trace_h5")
+    return VoltageSummary(
+        summary_mat,
+        trace_path=trace_h5,
+        keep_open=keep_open,
+        swap_xy_images=swap_xy_images,
+    )
+
+
+def resolve_voltage_sample_rate_hz(
+    *,
+    asset: Optional[SessionAssets] = None,
+    vs: Optional[VoltageSummary] = None,
+    sample_rate_hz: Optional[float] = None,
+    default_hz: float = 10_800.0,
+) -> float:
+    """Resolve the voltage sample/line rate used for timebase construction.
+
+    Current SLAP2 integration-mode voltage recordings use the line-scan rate as
+    the effective voltage sample rate, approximately 10.8 kHz.  The explicit
+    ``sample_rate_hz`` argument takes precedence so notebooks can override stale
+    or ambiguous metadata.  If no explicit value is supplied, the function checks
+    common metadata keys and then falls back to ``default_hz``.
+    """
+    if sample_rate_hz is not None:
+        rate = float(sample_rate_hz)
+        if np.isfinite(rate) and rate > 0:
+            return rate
+        raise ValueError(f"sample_rate_hz must be positive and finite, got {sample_rate_hz}.")
+
+    candidate_keys = (
+        "voltage_sample_rate_hz",
+        "sample_rate_hz",
+        "line_rate_hz",
+        "slap2_line_rate_hz",
+        "fs_hz",
+        "fs_Hz",
+    )
+
+    if asset is not None and getattr(asset, "metadata", None):
+        for key in candidate_keys:
+            if key in asset.metadata and asset.metadata[key] is not None:
+                try:
+                    rate = float(asset.metadata[key])
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(rate) and rate > 0:
+                    return rate
+
+    if vs is not None:
+        for mapping in (getattr(vs, "h5_attrs", {}), getattr(vs, "metadata", {})):
+            if not isinstance(mapping, dict):
+                continue
+            for key in candidate_keys:
+                if key in mapping and mapping[key] is not None:
+                    try:
+                        rate = float(mapping[key])
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(rate) and rate > 0:
+                        return rate
+
+    rate = float(default_hz)
+    if not np.isfinite(rate) or rate <= 0:
+        raise ValueError(f"default_hz must be positive and finite, got {default_hz}.")
+    return rate
+
+
+def _resolve_epoch_start_sec(
+    *,
+    epoch_start_sec: Optional[float],
+    imaging_epochs_csv: Optional[Union[str, Path]],
+    asset: Optional[SessionAssets],
+) -> float:
+    """Resolve the corrected-time start of voltage sample 0."""
+    if epoch_start_sec is not None:
+        return float(epoch_start_sec)
+
+    candidate: Optional[Path] = None
+    if imaging_epochs_csv is not None:
+        candidate = Path(imaging_epochs_csv)
+    elif asset is not None and asset.qc_dir is not None:
+        p = Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv"
+        if p.exists():
+            candidate = p
+
+    if candidate is None:
+        raise ValueError(
+            "epoch_start_sec was not provided and imaging_epochs.csv could not be "
+            "resolved from asset.qc_dir / 'behavior'."
+        )
+
+    import pandas as pd
+
+    epochs = pd.read_csv(candidate)
+    if "start_time" not in epochs.columns or len(epochs) == 0:
+        raise ValueError(f"{candidate} must contain at least one start_time value.")
+    return float(epochs["start_time"].iloc[0])
+
+
+def reconstruct_voltage_dmd_session_traces_from_asset(
+    asset: SessionAssets,
+    dmd: int,
+    *,
+    sample_rate_hz: Optional[float] = 10_800.0,
+    default_sample_rate_hz: float = 10_800.0,
+    epoch_start_sec: Optional[float] = None,
+    imaging_epochs_csv: Optional[Union[str, Path]] = None,
+    drop_discarded: bool = True,
+    dtype=np.float32,
+    trace_mode: str = "trial",
+) -> ReconstructedTraceBundle:
+    """Load voltage assets and reconstruct one DMD as an alignment bundle.
+
+    This is the asset-oriented wrapper that downstream QC/extraction notebooks can
+    call after ``VIPSessionRegistry.resolve_assets``.  It keeps all path discovery
+    in the common/io asset framework while delegating trace orientation and
+    concatenation to :func:`reconstruct_voltage_dmd_session_traces`.
+    """
+    with load_voltage_summary_from_asset(asset, keep_open=True) as vs:
+        rate = resolve_voltage_sample_rate_hz(
+            asset=asset,
+            vs=vs,
+            sample_rate_hz=sample_rate_hz,
+            default_hz=default_sample_rate_hz,
+        )
+        start = _resolve_epoch_start_sec(
+            epoch_start_sec=epoch_start_sec,
+            imaging_epochs_csv=imaging_epochs_csv,
+            asset=asset,
+        )
+        return reconstruct_voltage_dmd_session_traces(
+            vs,
+            dmd=dmd,
+            sample_rate_hz=rate,
+            epoch_start_sec=start,
+            drop_discarded=drop_discarded,
+            dtype=dtype,
+            trace_mode=trace_mode,
+        )

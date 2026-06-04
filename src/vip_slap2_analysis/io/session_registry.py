@@ -1,18 +1,21 @@
 """Session registry utilities for VIP SLAP2 analysis datasets.
 
 This module reads the project-level session summary workbook and resolves
-per-session file assets used by downstream behavior, glutamate, calcium, and
-quality-control pipelines.
+per-session file assets used by downstream behavior, glutamate, calcium,
+voltage, and quality-control pipelines.
 
 The registry intentionally keeps discovery lightweight: it normalizes the
 summary tables, applies simple metadata filters, and locates the most recently
-modified matching files under a session directory.
+modified matching files under a session directory. Modality-specific processed
+assets are exposed through ``SessionAssets.modality_assets`` rather than through
+separate asset dataclasses.
 """
 
 from __future__ import annotations
 
 import os
 import glob
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -20,6 +23,25 @@ from typing import Iterable, Optional, Sequence
 import pandas as pd
 
 from vip_slap2_analysis.common.session import SessionAssets
+
+
+VOLTAGE_SUMMARY_RE = re.compile(
+    r"dendriticVoltageSummary[-_](?P<stamp>\d{6}-\d{6})\.mat$",
+    re.IGNORECASE,
+)
+
+
+# Preferred path fragments are used only as tie-breakers. Recursive newest-file
+# discovery is still the final fallback, which keeps the resolver tolerant of old
+# session layouts and partially reorganized sessions.
+PREFERRED_SUMMARY_PARTS = (
+    ("source_extraction", "ExperimentSummary"),
+    ("ExperimentSummary",),
+)
+PREFERRED_VOLTAGE_PARTS = (
+    ("source_extraction", "dendriticVoltageExtraction"),
+    ("dendriticVoltageExtraction",),
+)
 
 
 def _coerce_path(x) -> Optional[Path]:
@@ -41,8 +63,48 @@ def _coerce_path(x) -> Optional[Path]:
     return Path(str(x))
 
 
-def _find_one(base: Path, pattern: str) -> Optional[Path]:
-    """Find the newest file or directory matching ``pattern`` below ``base``.
+def _find_matches(base: Path, pattern: str) -> list[Path]:
+    """Return all recursive matches for ``pattern`` below ``base``."""
+    if base is None or not Path(base).exists():
+        return []
+    return [Path(p) for p in sorted(glob.glob(str(Path(base) / "**" / pattern), recursive=True))]
+
+
+def _path_contains_parts(path: Path, parts: Sequence[str]) -> bool:
+    """Return True when ``path`` contains all ``parts`` in order."""
+    lower_parts = [p.lower() for p in path.parts]
+    start = 0
+    for part in parts:
+        target = part.lower()
+        try:
+            idx = lower_parts.index(target, start)
+        except ValueError:
+            return False
+        start = idx + 1
+    return True
+
+
+def _rank_path(path: Path, preferred_parts: Sequence[Sequence[str]] = ()) -> tuple[int, float]:
+    """Return a sortable rank favoring preferred layout fragments, then mtime."""
+    preference = 0
+    for idx, parts in enumerate(preferred_parts):
+        if _path_contains_parts(path, parts):
+            preference = len(preferred_parts) - idx
+            break
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0.0
+    return preference, mtime
+
+
+def _find_one(
+    base: Path,
+    pattern: str,
+    *,
+    preferred_parts: Sequence[Sequence[str]] = (),
+) -> Optional[Path]:
+    """Find the best file or directory matching ``pattern`` below ``base``.
 
     Parameters
     ----------
@@ -50,17 +112,95 @@ def _find_one(base: Path, pattern: str) -> Optional[Path]:
         Root directory for the recursive search.
     pattern:
         Glob pattern to search for under ``base``.
+    preferred_parts:
+        Optional ordered path-fragment tuples used to prefer canonical processed
+        layouts before falling back to newest modified match.
 
     Returns
     -------
     pathlib.Path or None
-        Most recently modified match, or ``None`` if no match exists.
+        Best matching path, or ``None`` if no match exists.
     """
-    matches = sorted(glob.glob(str(base / "**" / pattern), recursive=True))
+    matches = _find_matches(base, pattern)
     if matches:
-        return Path(max(matches, key=os.path.getmtime))
-    else:
-        return None
+        return max(matches, key=lambda p: _rank_path(p, preferred_parts))
+    return None
+
+
+def _voltage_stamp(path: Path) -> Optional[str]:
+    """Extract the timestamp shared by paired voltage MAT/H5 files."""
+    match = VOLTAGE_SUMMARY_RE.search(path.name)
+    return match.group("stamp") if match else None
+
+
+def _find_voltage_trace_h5(session_dir: Path, summary_mat: Optional[Path]) -> Optional[Path]:
+    """Resolve the paired ``dendriticVoltageTraces`` H5 file for a summary MAT."""
+    if summary_mat is not None:
+        stamp = _voltage_stamp(summary_mat)
+        if stamp is not None:
+            same_dir = summary_mat.with_name(f"dendriticVoltageTraces-{stamp}.h5")
+            if same_dir.exists():
+                return same_dir
+            paired = _find_one(
+                session_dir,
+                f"dendriticVoltageTraces-{stamp}.h5",
+                preferred_parts=PREFERRED_VOLTAGE_PARTS,
+            )
+            if paired is not None:
+                return paired
+
+        # Same-directory fallback catches future filename variants where the
+        # summary exists but the timestamp pattern changes slightly.
+        same_dir_matches = sorted(summary_mat.parent.glob("dendriticVoltageTraces*.h5"))
+        if same_dir_matches:
+            return max(same_dir_matches, key=os.path.getmtime)
+
+    return _find_one(
+        session_dir,
+        "dendriticVoltageTraces*.h5",
+        preferred_parts=PREFERRED_VOLTAGE_PARTS,
+    )
+
+
+def _build_modality_assets(
+    *,
+    summary_mat: Optional[Path],
+    voltage_summary_mat: Optional[Path],
+    voltage_trace_h5: Optional[Path],
+) -> dict[str, dict[str, Optional[Path]]]:
+    """Build generic modality asset mappings for a session."""
+    modality_assets: dict[str, dict[str, Optional[Path]]] = {}
+
+    if summary_mat is not None:
+        # Existing glutamate and soma-calcium code both use SummaryLoCo-derived
+        # ExperimentSummary files. Store both keys explicitly so modality-aware
+        # downstream code can be generic without changing legacy asset.summary_mat.
+        modality_assets["glutamate"] = {
+            "summary_mat": summary_mat,
+            "extraction_dir": summary_mat.parent,
+        }
+        modality_assets["calcium"] = {
+            "summary_mat": summary_mat,
+            "extraction_dir": summary_mat.parent,
+        }
+        modality_assets["slap2"] = {
+            "summary_mat": summary_mat,
+            "extraction_dir": summary_mat.parent,
+        }
+
+    if voltage_summary_mat is not None or voltage_trace_h5 is not None:
+        extraction_dir = None
+        if voltage_summary_mat is not None:
+            extraction_dir = voltage_summary_mat.parent
+        elif voltage_trace_h5 is not None:
+            extraction_dir = voltage_trace_h5.parent
+        modality_assets["voltage"] = {
+            "summary_mat": voltage_summary_mat,
+            "trace_h5": voltage_trace_h5,
+            "extraction_dir": extraction_dir,
+        }
+
+    return modality_assets
 
 
 @dataclass
@@ -238,12 +378,24 @@ class VIPSessionRegistry:
         Returns
         -------
         SessionAssets
-            Object containing canonical session paths and row metadata.
+            Object containing canonical session paths, generic modality assets,
+            and row metadata.
         """
         row = self.get_session_row(session) if isinstance(session, str) else session
         session_dir = Path(row["session_dir"])
 
-        summary_mat = _find_one(session_dir, "SummaryLoCo*.mat")
+        summary_mat = _find_one(
+            session_dir,
+            "SummaryLoCo*.mat",
+            preferred_parts=PREFERRED_SUMMARY_PARTS,
+        )
+        voltage_summary_mat = _find_one(
+            session_dir,
+            "dendriticVoltageSummary*.mat",
+            preferred_parts=PREFERRED_VOLTAGE_PARTS,
+        )
+        voltage_trace_h5 = _find_voltage_trace_h5(session_dir, voltage_summary_mat)
+
         bonsai_csv = _find_one(session_dir, "bonsai_event_log*.csv")
         harp_dir = _find_one(session_dir, "*Behavior.harp")
 
@@ -268,5 +420,10 @@ class VIPSessionRegistry:
             harp_df_csv=harp_df_csv,
             qc_dir=qc_dir,
             derived_dir=derived_dir,
+            modality_assets=_build_modality_assets(
+                summary_mat=summary_mat,
+                voltage_summary_mat=voltage_summary_mat,
+                voltage_trace_h5=voltage_trace_h5,
+            ),
             metadata=row.to_dict(),
         )
