@@ -162,62 +162,501 @@ def _validate_or_fill_mask(mask: Optional[np.ndarray], n_rois: int) -> np.ndarra
 
 
 # -----------------------------------------------------------------------------
-# Optional signal transforms
+# Voltage F0 / dF/F transforms
 # -----------------------------------------------------------------------------
 
 
-def _safe_static_f0(traces: np.ndarray, *, percentile: float = 50.0) -> np.ndarray:
-    """Compute a per-ROI static F0 with guards against zero/invalid baselines."""
-    f0 = np.nanpercentile(traces, float(percentile), axis=1)
-    bad = ~np.isfinite(f0) | (np.abs(f0) < np.finfo(float).eps)
-    if np.any(bad):
-        fallback = np.nanmedian(np.abs(traces), axis=1)
-        fallback_bad = ~np.isfinite(fallback) | (fallback < np.finfo(float).eps)
-        fallback[fallback_bad] = 1.0
-        f0[bad] = fallback[bad]
-    return f0.astype(float)
+def _as_trace_2d(raw_f: np.ndarray) -> Tuple[np.ndarray, bool]:
+    """Return raw fluorescence as ROI-by-time and whether the input was 1D."""
+    arr = np.asarray(raw_f, dtype=np.float32)
+    was_1d = arr.ndim == 1
+    if was_1d:
+        arr = arr[None, :]
+    if arr.ndim != 2:
+        raise ValueError(f"Expected raw_f to be 1D or 2D ROI-by-time, got shape {arr.shape}")
+    return arr, was_1d
+
+
+def _restore_trace_dim(arr: np.ndarray, was_1d: bool) -> np.ndarray:
+    """Restore a transformed trace to the caller's original dimensionality."""
+    if was_1d:
+        return np.asarray(arr[0], dtype=np.float32)
+    return np.asarray(arr, dtype=np.float32)
+
+
+def _safe_f0_values(f0: np.ndarray, raw_f: np.ndarray) -> np.ndarray:
+    """Guard against invalid or near-zero F0 values.
+
+    Fluorescence denominators should be positive and finite.  When a bin/ROI has
+    invalid F0, fall back to the ROI's robust absolute fluorescence scale rather
+    than allowing division by zero or exploding dF/F values.
+    """
+    f0 = np.asarray(f0, dtype=np.float32)
+    raw = np.asarray(raw_f, dtype=np.float32)
+    eps = np.float32(np.finfo(np.float32).eps)
+
+    if f0.ndim == 1:
+        fallback = np.nanmedian(np.abs(raw), axis=1).astype(np.float32)
+        fallback_bad = ~np.isfinite(fallback) | (fallback <= eps)
+        fallback[fallback_bad] = np.float32(1.0)
+        bad = ~np.isfinite(f0) | (np.abs(f0) <= eps)
+        if np.any(bad):
+            f0 = f0.copy()
+            f0[bad] = fallback[bad]
+        return f0
+
+    if f0.ndim == 2:
+        fallback = np.nanmedian(np.abs(raw), axis=1).astype(np.float32)
+        fallback_bad = ~np.isfinite(fallback) | (fallback <= eps)
+        fallback[fallback_bad] = np.float32(1.0)
+        bad = ~np.isfinite(f0) | (np.abs(f0) <= eps)
+        if np.any(bad):
+            f0 = f0.copy()
+            rows, _cols = np.where(bad)
+            f0[bad] = fallback[rows]
+        return f0
+
+    raise ValueError(f"Unexpected F0 shape {f0.shape}")
+
+
+def _compute_static_f0(
+    raw_f: np.ndarray,
+    *,
+    percentile: float = 50.0,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Compute a constant per-ROI F0 from the full session trace."""
+    raw, was_1d = _as_trace_2d(raw_f)
+    f0_roi = np.nanpercentile(raw, float(percentile), axis=1).astype(np.float32)
+    f0_roi = _safe_f0_values(f0_roi, raw)
+    f0 = np.repeat(f0_roi[:, None], raw.shape[1], axis=1).astype(np.float32)
+    meta = {
+        "f0_method": "static_percentile",
+        "f0_percentile": float(percentile),
+        "f0_is_time_varying": False,
+        "f0_per_roi": f0_roi,
+    }
+    return _restore_trace_dim(f0, was_1d), meta
+
+
+def _nanmoving_median_1d(x: np.ndarray, window_bins: int) -> np.ndarray:
+    """Small, dependency-free centered moving median over already downsampled bins."""
+    arr = np.asarray(x, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return arr
+    w = max(1, int(window_bins))
+    if w <= 1:
+        return arr.astype(np.float32)
+    if w % 2 == 0:
+        w += 1
+    half = w // 2
+    out = np.empty_like(arr, dtype=np.float32)
+    for i in range(arr.size):
+        lo = max(0, i - half)
+        hi = min(arr.size, i + half + 1)
+        out[i] = np.nanmedian(arr[lo:hi]).astype(np.float32)
+    return out
+
+
+def _fill_nan_1d(x: np.ndarray, fallback: float) -> np.ndarray:
+    """Linearly fill NaNs in a 1D vector before interpolation/smoothing."""
+    arr = np.asarray(x, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return arr
+    finite = np.isfinite(arr)
+    if np.all(finite):
+        return arr
+    if not np.any(finite):
+        return np.full_like(arr, np.float32(fallback), dtype=np.float32)
+    idx = np.arange(arr.size, dtype=float)
+    out = arr.copy()
+    out[~finite] = np.interp(idx[~finite], idx[finite], arr[finite]).astype(np.float32)
+    return out
+
+
+def _compute_robust_f0(
+    raw_f: np.ndarray,
+    *,
+    sample_rate_hz: float,
+    percentile: float = 50.0,
+    bin_sec: float = 5.0,
+    smooth_sec: float = 180.0,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Compute a slowly varying robust F0 model from the full session trace.
+
+    The model is intentionally conservative for voltage analysis:
+
+    1. Split each ROI's full session trace into coarse bins.
+    2. Estimate a robust fluorescence level in each bin using a percentile.
+    3. Smooth those bin-level estimates with a centered moving median over a
+       long window.
+    4. Interpolate the slow F0 model back to the native sample rate.
+
+    This is designed to track bleaching/session-scale fluorescence drift while
+    avoiding the short-window rolling-baseline behavior that could suppress slow
+    voltage oscillations.
+    """
+    raw, was_1d = _as_trace_2d(raw_f)
+    n_rois, n_samples = raw.shape
+    rate = float(sample_rate_hz)
+    if not np.isfinite(rate) or rate <= 0:
+        raise ValueError(f"sample_rate_hz must be positive, got {sample_rate_hz!r}")
+
+    bin_samples = max(1, int(round(float(bin_sec) * rate)))
+    n_bins = int(np.ceil(n_samples / bin_samples))
+    if n_bins <= 1:
+        return _compute_static_f0(raw, percentile=percentile)
+
+    bin_centers = np.empty(n_bins, dtype=np.float64)
+    bin_f0 = np.full((n_rois, n_bins), np.nan, dtype=np.float32)
+    for b in range(n_bins):
+        start = b * bin_samples
+        stop = min(n_samples, (b + 1) * bin_samples)
+        if stop <= start:
+            continue
+        bin_centers[b] = (start + stop - 1) / 2.0
+        with np.errstate(all="ignore"):
+            bin_f0[:, b] = np.nanpercentile(raw[:, start:stop], float(percentile), axis=1).astype(np.float32)
+
+    smooth_bins = max(1, int(round(float(smooth_sec) / float(bin_sec))))
+    if smooth_bins % 2 == 0:
+        smooth_bins += 1
+
+    f0 = np.empty((n_rois, n_samples), dtype=np.float32)
+    sample_idx = np.arange(n_samples, dtype=np.float64)
+    f0_roi_median = np.nanmedian(np.abs(raw), axis=1).astype(np.float32)
+    bad_fallback = ~np.isfinite(f0_roi_median) | (f0_roi_median <= np.finfo(np.float32).eps)
+    f0_roi_median[bad_fallback] = np.float32(1.0)
+
+    smoothed_bins = np.full_like(bin_f0, np.nan, dtype=np.float32)
+    for r in range(n_rois):
+        filled = _fill_nan_1d(bin_f0[r], fallback=float(f0_roi_median[r]))
+        smoothed = _nanmoving_median_1d(filled, smooth_bins)
+        smoothed = _fill_nan_1d(smoothed, fallback=float(f0_roi_median[r]))
+        smoothed_bins[r] = smoothed
+        f0[r] = np.interp(sample_idx, bin_centers, smoothed).astype(np.float32)
+
+    f0 = _safe_f0_values(f0, raw)
+    meta = {
+        "f0_method": "robust_binned_percentile_moving_median",
+        "f0_percentile": float(percentile),
+        "f0_bin_sec": float(bin_sec),
+        "f0_smooth_sec": float(smooth_sec),
+        "f0_bin_samples": int(bin_samples),
+        "f0_smooth_bins": int(smooth_bins),
+        "f0_n_bins": int(n_bins),
+        "f0_is_time_varying": True,
+        "f0_bin_centers_sample": bin_centers.astype(np.float64),
+        "f0_bin_values": smoothed_bins.astype(np.float32),
+    }
+    return _restore_trace_dim(f0, was_1d), meta
+
+
+def compute_voltage_f0(
+    raw_f: np.ndarray,
+    *,
+    sample_rate_hz: float,
+    method: str = "robust",
+    percentile: float = 50.0,
+    robust_bin_sec: float = 5.0,
+    robust_smooth_sec: float = 180.0,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Compute an F0 model for ASAP voltage fluorescence.
+
+    Parameters
+    ----------
+    raw_f
+        Raw fluorescence, either one ROI as ``(n_samples,)`` or many ROIs as
+        ``(n_rois, n_samples)``.
+    sample_rate_hz
+        Voltage sample/line rate, typically 10.8 kHz for current SLAP2 voltage
+        integration-mode recordings.
+    method
+        ``'static'`` for a constant per-ROI session F0 or ``'robust'`` for a
+        slowly varying binned-percentile/moving-median F0 model.
+    percentile
+        Percentile used to estimate baseline fluorescence.  For inverse ASAP
+        indicators, median or a modest upper percentile is usually safer than a
+        calcium-style low percentile.
+    robust_bin_sec, robust_smooth_sec
+        Robust F0 parameters used only for ``method='robust'``.
+
+    Returns
+    -------
+    f0, metadata
+        F0 has the same shape as ``raw_f``.
+    """
+    m = str(method).lower().replace(" ", "_")
+    if m in {"static", "static_f0", "static_percentile"}:
+        f0, meta = _compute_static_f0(raw_f, percentile=percentile)
+    elif m in {"robust", "robust_f0", "robust_baseline"}:
+        f0, meta = _compute_robust_f0(
+            raw_f,
+            sample_rate_hz=sample_rate_hz,
+            percentile=percentile,
+            bin_sec=robust_bin_sec,
+            smooth_sec=robust_smooth_sec,
+        )
+    else:
+        raise ValueError("method must be 'static' or 'robust'")
+
+    meta.update({
+        "sample_rate_hz": float(sample_rate_hz),
+        "input_shape": tuple(int(x) for x in np.asarray(raw_f).shape),
+    })
+    return f0, meta
+
+
+def compute_voltage_dff(raw_f: np.ndarray, f0: np.ndarray) -> np.ndarray:
+    """Compute ASAP-polarity-corrected dF/F.
+
+    The returned signal is positive for fluorescence decreases:
+
+    ``dff = (F0 - F) / F0``
+
+    This is equivalent to inverted dF/F but is called ``dff`` throughout the
+    voltage pipeline for convenience.
+    """
+    raw = np.asarray(raw_f, dtype=np.float32)
+    f0_arr = np.asarray(f0, dtype=np.float32)
+    f0_arr = _safe_f0_values(f0_arr, raw if raw.ndim == 2 else raw[None, :])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dff = (f0_arr - raw) / f0_arr
+    return np.asarray(dff, dtype=np.float32)
+
+
+def transform_voltage_signal(
+    raw_f: np.ndarray,
+    *,
+    sample_rate_hz: float,
+    method: str = "robust",
+    percentile: float = 50.0,
+    robust_bin_sec: float = 5.0,
+    robust_smooth_sec: float = 180.0,
+) -> Dict[str, Any]:
+    """Return raw fluorescence, F0, and ASAP-polarity-corrected dF/F."""
+    f0, f0_meta = compute_voltage_f0(
+        raw_f,
+        sample_rate_hz=sample_rate_hz,
+        method=method,
+        percentile=percentile,
+        robust_bin_sec=robust_bin_sec,
+        robust_smooth_sec=robust_smooth_sec,
+    )
+    dff = compute_voltage_dff(raw_f, f0)
+    meta = {
+        "trace_signal": f"dff_{method}_f0",
+        "transform": "dff = (F0 - F) / F0",
+        "polarity": "ASAP/inverse fluorescence corrected; positive dff corresponds to fluorescence decrease",
+        **f0_meta,
+    }
+    return {
+        "raw_f": np.asarray(raw_f, dtype=np.float32),
+        "f0": np.asarray(f0, dtype=np.float32),
+        "dff": np.asarray(dff, dtype=np.float32),
+        "metadata": meta,
+    }
+
+
+def _parse_trace_signal(trace_signal: str) -> Tuple[str, Optional[str]]:
+    """Normalize trace_signal names into extraction signal and F0 method."""
+    signal = str(trace_signal).lower().replace(" ", "_")
+    if signal in {"raw", "raw_f", "raw_fluorescence", "f"}:
+        return "raw_f", None
+    if signal in {"dff_static_f0", "inverted_dff_static_f0", "-dff_static_f0", "neg_dff_static_f0"}:
+        return "dff", "static"
+    if signal in {"dff_robust_f0", "inverted_dff_robust_f0", "-dff_robust_f0", "neg_dff_robust_f0"}:
+        return "dff", "robust"
+    raise ValueError(
+        "Unsupported voltage trace_signal. Use 'raw', 'dff_static_f0', or 'dff_robust_f0'."
+    )
 
 
 def _transform_voltage_bundle(
     bundle: ReconstructedTraceBundle,
     *,
     trace_signal: str,
+    sample_rate_hz: float,
     f0_percentile: float = 50.0,
-) -> Tuple[ReconstructedTraceBundle, Dict[str, Any]]:
-    """Apply an optional voltage signal transform to a reconstructed bundle.
+    robust_f0_bin_sec: float = 5.0,
+    robust_f0_smooth_sec: float = 180.0,
+) -> Tuple[ReconstructedTraceBundle, Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Apply an optional voltage transform to a reconstructed bundle.
 
-    Supported transforms are deliberately conservative:
-
-    ``raw`` / ``raw_fluorescence``
-        No transform.  This is the default and best first-pass extraction target.
-
-    ``inverted_dff_static_f0``
-        ``-(F - F0) / F0`` using one static per-ROI F0 estimate.  Because F0 is
-        not time-varying, this transform does not subtract slow oscillatory
-        dynamics the way a rolling mean/percentile baseline can.  It does not,
-        however, correct bleaching or session-scale fluorescence drift.
+    Returns
+    -------
+    transformed_bundle, transform_metadata, transform_payload
+        ``transform_payload`` is ``None`` for raw extraction.  For dF/F methods,
+        it contains ``raw_f``, ``f0``, and ``dff`` arrays for optional session-
+        trace export.
     """
-    signal = str(trace_signal).lower()
-    if signal in {"raw", "raw_fluorescence", "f"}:
-        return bundle, {"trace_signal": trace_signal, "transform": "none"}
-
-    if signal in {"inverted_dff_static_f0", "-dff_static_f0", "neg_dff_static_f0"}:
-        traces = np.asarray(bundle.traces, dtype=np.float32)
-        f0 = _safe_static_f0(traces, percentile=f0_percentile)
-        transformed = -((traces - f0[:, None]) / f0[:, None]).astype(np.float32)
-        out = replace(bundle, traces=transformed)
-        return out, {
+    output_signal, f0_method = _parse_trace_signal(trace_signal)
+    if output_signal == "raw_f":
+        return bundle, {
             "trace_signal": trace_signal,
-            "transform": "-(F - F0) / F0",
-            "f0_mode": "static_per_roi_percentile",
-            "f0_percentile": float(f0_percentile),
+            "output_signal": "raw_f",
+            "transform": "none",
+        }, None
+
+    transformed = transform_voltage_signal(
+        np.asarray(bundle.traces, dtype=np.float32),
+        sample_rate_hz=sample_rate_hz,
+        method=str(f0_method),
+        percentile=f0_percentile,
+        robust_bin_sec=robust_f0_bin_sec,
+        robust_smooth_sec=robust_f0_smooth_sec,
+    )
+    out = replace(bundle, traces=np.asarray(transformed["dff"], dtype=np.float32))
+    meta = dict(transformed["metadata"])
+    meta.update({
+        "trace_signal_requested": trace_signal,
+        "output_signal": "dff",
+    })
+    return out, meta, transformed
+
+
+def _write_session_transform_group(
+    h5: h5py.File,
+    *,
+    dmd_key: str,
+    bundle: ReconstructedTraceBundle,
+    roi_ids: np.ndarray,
+    roi_mask: np.ndarray,
+    transform_meta: Mapping[str, Any],
+    transform_payload: Optional[Mapping[str, Any]],
+    dtype: np.dtype,
+    compression: Optional[str],
+    compression_opts: Optional[int],
+) -> None:
+    """Write full-session raw/F0/dFF traces for one DMD.
+
+    Datasets are ROI-by-time, matching ``ReconstructedTraceBundle.traces``.
+    For raw extraction, only ``raw_f`` is written.  For dF/F extraction,
+    ``raw_f``, ``f0``, and ``dff`` are written.
+    """
+    grp = h5.create_group(dmd_key)
+    grp.attrs["schema"] = "ROI-by-time full-session voltage traces"
+    grp.attrs["signal_transform_json"] = json.dumps(transform_meta, default=_json_default)
+    grp.create_dataset("timebase_sec", data=np.asarray(bundle.timebase_sec, dtype=np.float64))
+    grp.create_dataset("roi_ids", data=np.asarray(roi_ids, dtype="S"))
+    grp.create_dataset("valid_rois_mask", data=np.asarray(roi_mask, dtype=bool))
+    grp.create_dataset("trial_valid_mask", data=np.asarray(bundle.trial_valid_mask, dtype=bool))
+    grp.create_dataset("trial_lengths_samples", data=np.asarray(bundle.trial_lengths_samples, dtype=np.int64))
+
+    if transform_payload is None:
+        arrays = {"raw_f": np.asarray(bundle.traces, dtype=np.float32)}
+    else:
+        arrays = {
+            "raw_f": np.asarray(transform_payload["raw_f"], dtype=np.float32),
+            "f0": np.asarray(transform_payload["f0"], dtype=np.float32),
+            "dff": np.asarray(transform_payload["dff"], dtype=np.float32),
         }
 
-    raise ValueError(
-        "Unsupported voltage trace_signal. Use 'raw' or "
-        "'inverted_dff_static_f0'. Rolling F0 transforms are intentionally not "
-        "implemented here because they can suppress slow voltage dynamics."
+    for name, arr in arrays.items():
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        chunks = (1, max(1, min(arr.shape[1], 8192))) if arr.size else None
+        grp.create_dataset(
+            name,
+            data=arr.astype(dtype, copy=False),
+            dtype=np.dtype(dtype),
+            chunks=chunks,
+            compression=compression,
+            compression_opts=compression_opts,
+            shuffle=(compression is not None),
+        )
+
+
+def load_voltage_roi_transform_h5(
+    session_traces_h5: PathLike,
+    *,
+    dmd: int,
+    roi_index: int,
+) -> Dict[str, Any]:
+    """Load one ROI's saved full-session voltage transform from HDF5.
+
+    Returns any of ``raw_f``, ``f0``, and ``dff`` that are present, plus the
+    voltage timebase and transform metadata.  This is intended for lightweight
+    inspection/plotting after ``process_voltage_extraction`` has run.
+    """
+    path = Path(session_traces_h5)
+    dmd_key = f"DMD{int(dmd)}"
+    out: Dict[str, Any] = {"session_traces_h5": str(path), "dmd": int(dmd), "roi_index": int(roi_index)}
+    with h5py.File(path, "r") as h5:
+        if dmd_key not in h5:
+            raise KeyError(f"{dmd_key!r} not found in {path}")
+        grp = h5[dmd_key]
+        out["timebase_sec"] = grp["timebase_sec"][:]
+        for key in ("raw_f", "f0", "dff"):
+            if key in grp:
+                out[key] = grp[key][int(roi_index), :]
+        out["metadata"] = json.loads(grp.attrs.get("signal_transform_json", "{}"))
+    return out
+
+
+def compute_voltage_roi_transform_from_asset(
+    asset: SessionAssets,
+    *,
+    dmd: int,
+    roi_index: int,
+    sample_rate_hz: Optional[float] = None,
+    default_sample_rate_hz: float = 10_800.0,
+    epoch_start_sec: Optional[float] = None,
+    trace_mode: str = "trial",
+    drop_discarded: bool = True,
+    f0_method: str = "robust",
+    f0_percentile: float = 50.0,
+    robust_f0_bin_sec: float = 5.0,
+    robust_f0_smooth_sec: float = 180.0,
+) -> Dict[str, Any]:
+    """Compute raw/F0/dFF for one ROI directly from a session asset.
+
+    This helper is meant for interactive inspection.  It reconstructs the full
+    DMD session trace using the same code path as batch extraction, selects one
+    ROI, and computes static or robust F0 plus ASAP-polarity-corrected dF/F.
+    """
+    if epoch_start_sec is None:
+        epoch_df = _open_imaging_epochs(asset)
+        epoch_start_sec = float(epoch_df.iloc[0]["start_time"])
+
+    with load_voltage_summary_from_asset(asset, keep_open=True) as vs:
+        rate = resolve_voltage_sample_rate_hz(
+            asset=asset,
+            vs=vs,
+            sample_rate_hz=sample_rate_hz,
+            default_hz=default_sample_rate_hz,
+        )
+        bundle = reconstruct_voltage_dmd_session_traces(
+            vs,
+            dmd=int(dmd),
+            sample_rate_hz=rate,
+            epoch_start_sec=float(epoch_start_sec),
+            drop_discarded=drop_discarded,
+            dtype=np.float32,
+            trace_mode=trace_mode,
+        )
+
+    if roi_index < 0 or roi_index >= bundle.traces.shape[0]:
+        raise IndexError(f"roi_index={roi_index} is out of bounds for {bundle.traces.shape[0]} ROIs")
+
+    raw_f = np.asarray(bundle.traces[int(roi_index), :], dtype=np.float32)
+    transformed = transform_voltage_signal(
+        raw_f,
+        sample_rate_hz=rate,
+        method=f0_method,
+        percentile=f0_percentile,
+        robust_bin_sec=robust_f0_bin_sec,
+        robust_smooth_sec=robust_f0_smooth_sec,
     )
+    return {
+        "timebase_sec": np.asarray(bundle.timebase_sec, dtype=np.float64),
+        "raw_f": transformed["raw_f"],
+        "f0": transformed["f0"],
+        "dff": transformed["dff"],
+        "metadata": transformed["metadata"],
+        "dmd": int(dmd),
+        "roi_index": int(roi_index),
+        "sample_rate_hz": float(rate),
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -621,11 +1060,14 @@ def process_voltage_extraction(
     default_sample_rate_hz: float = 10_800.0,
     trace_signal: str = "raw",
     f0_percentile: float = 50.0,
+    robust_f0_bin_sec: float = 5.0,
+    robust_f0_smooth_sec: float = 180.0,
     trace_mode: str = "trial",
     drop_discarded: bool = True,
     dtype: np.dtype = np.float32,
     write_single_trials: bool = True,
     write_sequence: bool = True,
+    write_session_traces: bool = True,
     compression: Optional[str] = "gzip",
     compression_opts: Optional[int] = 4,
 ) -> Dict[str, Any]:
@@ -652,10 +1094,15 @@ def process_voltage_extraction(
     default_sample_rate_hz
         Current SLAP2 integration-mode default is 10.8 kHz.
     trace_signal
-        ``'raw'`` keeps raw fluorescence.  ``'inverted_dff_static_f0'`` applies a
-        static per-ROI F0 transform without rolling baseline subtraction.
+        ``'raw'`` keeps raw fluorescence. ``'dff_static_f0'`` and
+        ``'dff_robust_f0'`` compute ASAP-polarity-corrected dF/F on the
+        reconstructed full-session ROI trace before event snippets are extracted.
     f0_percentile
-        Percentile used for the optional static F0 transform.
+        Percentile used for static and robust F0 estimation.
+    robust_f0_bin_sec, robust_f0_smooth_sec
+        Parameters for the robust full-session F0 model.  The defaults estimate a
+        binned robust fluorescence level every 5 s and smooth those estimates
+        over 180 s, which is intentionally conservative for slow voltage dynamics.
     trace_mode
         Passed to ``VoltageSummary.get_roi_traces``.  Current voltage outputs are
         trial-based, so this should usually be ``'trial'``.
@@ -666,6 +1113,10 @@ def process_voltage_extraction(
         dry runs.
     write_sequence
         Write change-locked sequence summaries to NPZ.
+    write_session_traces
+        Write full-session ROI-by-time traces to HDF5. For dF/F transforms this
+        file contains ``raw_f``, ``f0``, and ``dff`` for every DMD/ROI, enabling
+        later inspection and plotting without recomputing the transform.
     compression, compression_opts
         HDF5 compression settings for single-trial event datasets.
 
@@ -694,6 +1145,7 @@ def process_voltage_extraction(
     suffix = _trace_suffix(trace_signal, trace_mode)
     mean_npz = voltage_dir / f"voltage_mean_{suffix}.npz"
     single_h5 = voltage_dir / f"voltage_single_trial_{suffix}.h5"
+    session_traces_h5 = voltage_dir / f"voltage_session_traces_{suffix}.h5"
     seq_npz = voltage_dir / f"voltage_sequence_{suffix}.npz"
     qc_json = voltage_qc_dir / f"voltage_extraction_qc_{suffix}.json"
 
@@ -702,11 +1154,14 @@ def process_voltage_extraction(
         expected_outputs.append(single_h5)
     if write_sequence:
         expected_outputs.append(seq_npz)
+    if write_session_traces:
+        expected_outputs.append(session_traces_h5)
     if all(p.exists() for p in expected_outputs) and not overwrite:
         return {
             "status": "exists",
             "mean_npz": str(mean_npz),
             "single_h5": str(single_h5) if write_single_trials else None,
+            "session_traces_h5": str(session_traces_h5) if write_session_traces else None,
             "seq_npz": str(seq_npz) if write_sequence else None,
             "qc_json": str(qc_json),
         }
@@ -781,6 +1236,10 @@ def process_voltage_extraction(
             "use_roi_qc": bool(use_roi_qc),
             "write_single_trials": bool(write_single_trials),
             "write_sequence": bool(write_sequence),
+            "write_session_traces": bool(write_session_traces),
+            "f0_percentile": float(f0_percentile),
+            "robust_f0_bin_sec": float(robust_f0_bin_sec),
+            "robust_f0_smooth_sec": float(robust_f0_smooth_sec),
             "epoch_start_sec": float(epoch_start_sec),
             "epoch_end_sec": float(epoch_end_sec),
             "voltage_summary_layout": getattr(vs, "layout", None),
@@ -816,6 +1275,7 @@ def process_voltage_extraction(
         }
 
         h5: Optional[h5py.File] = None
+        session_h5: Optional[h5py.File] = None
         if write_single_trials:
             single_h5.parent.mkdir(parents=True, exist_ok=True)
             h5 = h5py.File(single_h5, "w")
@@ -823,6 +1283,10 @@ def process_voltage_extraction(
             h5.create_dataset("timebase_sec/image", data=tvecs["image"].astype(np.float64))
             h5.create_dataset("timebase_sec/change", data=tvecs["change"].astype(np.float64))
             h5.create_dataset("timebase_sec/omission", data=tvecs["omission"].astype(np.float64))
+        if write_session_traces:
+            session_traces_h5.parent.mkdir(parents=True, exist_ok=True)
+            session_h5 = h5py.File(session_traces_h5, "w")
+            _metadata_json_attr(session_h5, base_meta)
 
         try:
             for dmd in range(1, int(vs.n_dmds) + 1):
@@ -839,10 +1303,13 @@ def process_voltage_extraction(
                     qc["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no valid traces"}
                     continue
 
-                bundle, transform_meta = _transform_voltage_bundle(
+                bundle, transform_meta, transform_payload = _transform_voltage_bundle(
                     bundle,
                     trace_signal=trace_signal,
+                    sample_rate_hz=rate,
                     f0_percentile=f0_percentile,
+                    robust_f0_bin_sec=robust_f0_bin_sec,
+                    robust_f0_smooth_sec=robust_f0_smooth_sec,
                 )
 
                 n_rois_total = int(bundle.traces.shape[0])
@@ -852,6 +1319,20 @@ def process_voltage_extraction(
                 ids = _roi_ids(dmd, n_rois_total, roi_mask)
 
                 dmd_key = f"DMD{dmd}"
+                if session_h5 is not None:
+                    _write_session_transform_group(
+                        session_h5,
+                        dmd_key=dmd_key,
+                        bundle=bundle,
+                        roi_ids=_roi_ids(dmd, n_rois_total, np.ones(n_rois_total, dtype=bool)),
+                        roi_mask=roi_mask,
+                        transform_meta=transform_meta,
+                        transform_payload=transform_payload,
+                        dtype=np.dtype(dtype),
+                        compression=compression,
+                        compression_opts=compression_opts,
+                    )
+
                 dmd_h5: Optional[h5py.Group] = None
                 if h5 is not None:
                     dmd_h5 = h5.create_group(dmd_key)
@@ -955,6 +1436,8 @@ def process_voltage_extraction(
         finally:
             if h5 is not None:
                 h5.close()
+            if session_h5 is not None:
+                session_h5.close()
 
     mean_npz.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(mean_npz, data=np.array([mean_pkg], dtype=object))
@@ -966,6 +1449,7 @@ def process_voltage_extraction(
         "status": "ok",
         "mean_npz": str(mean_npz),
         "single_h5": str(single_h5) if write_single_trials else None,
+        "session_traces_h5": str(session_traces_h5) if write_session_traces else None,
         "seq_npz": str(seq_npz) if write_sequence else None,
         "qc_json": str(qc_json),
     }
