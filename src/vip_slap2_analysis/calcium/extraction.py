@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from vip_slap2_analysis.common.session import SessionAssets
-from src.vip_slap2_analysis.common.alignment import (
+from vip_slap2_analysis.common.alignment import (
     EventWindows,
     align_traces_to_session_intervals,
     build_change_locked_sequences,

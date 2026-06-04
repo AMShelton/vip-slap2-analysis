@@ -22,7 +22,7 @@ from scipy.signal import medfilt
 from scipy.spatial.distance import pdist
 from sklearn.decomposition import PCA
 
-from src.vip_slap2_analysis.common.alignment import (
+from vip_slap2_analysis.common.alignment import (
     extract_image_intervals,
     filter_ordered_images_to_epochs,
     load_corrected_bonsai_csv,
