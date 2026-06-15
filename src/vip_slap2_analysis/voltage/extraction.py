@@ -536,11 +536,17 @@ def _write_session_transform_group(
     grp = h5.create_group(dmd_key)
     grp.attrs["schema"] = "ROI-by-time full-session voltage traces"
     grp.attrs["signal_transform_json"] = json.dumps(transform_meta, default=_json_default)
+    if getattr(bundle, "metadata", None):
+        grp.attrs["reconstruction_metadata_json"] = json.dumps(bundle.metadata, default=_json_default)
+    grp.attrs["session_start_sec"] = float(bundle.session_start_sec)
+    grp.attrs["session_end_sec"] = float(bundle.session_end_sec)
+    grp.attrs["reconstructed_duration_sec"] = float(bundle.reconstructed_duration_sec)
     grp.create_dataset("timebase_sec", data=np.asarray(bundle.timebase_sec, dtype=np.float64))
     grp.create_dataset("roi_ids", data=np.asarray(roi_ids, dtype="S"))
     grp.create_dataset("valid_rois_mask", data=np.asarray(roi_mask, dtype=bool))
     grp.create_dataset("trial_valid_mask", data=np.asarray(bundle.trial_valid_mask, dtype=bool))
     grp.create_dataset("trial_lengths_samples", data=np.asarray(bundle.trial_lengths_samples, dtype=np.int64))
+    grp.create_dataset("trial_starts_sec", data=np.asarray(bundle.trial_starts_sec, dtype=np.float64))
 
     if transform_payload is None:
         arrays = {"raw_f": np.asarray(bundle.traces, dtype=np.float32)}
@@ -601,8 +607,11 @@ def compute_voltage_roi_transform_from_asset(
     sample_rate_hz: Optional[float] = None,
     default_sample_rate_hz: float = 10_800.0,
     epoch_start_sec: Optional[float] = None,
+    epoch_end_sec: Optional[float] = None,
     trace_mode: str = "trial",
     drop_discarded: bool = True,
+    timebase_strategy: str = "auto",
+    max_timebase_error_sec: float = 0.5,
     f0_method: str = "robust",
     f0_percentile: float = 50.0,
     robust_f0_bin_sec: float = 5.0,
@@ -614,9 +623,12 @@ def compute_voltage_roi_transform_from_asset(
     DMD session trace using the same code path as batch extraction, selects one
     ROI, and computes static or robust F0 plus ASAP-polarity-corrected dF/F.
     """
-    if epoch_start_sec is None:
+    if epoch_start_sec is None or epoch_end_sec is None:
         epoch_df = _open_imaging_epochs(asset)
-        epoch_start_sec = float(epoch_df.iloc[0]["start_time"])
+        if epoch_start_sec is None:
+            epoch_start_sec = float(epoch_df.iloc[0]["start_time"])
+        if epoch_end_sec is None and "end_time" in epoch_df.columns:
+            epoch_end_sec = float(epoch_df.iloc[-1]["end_time"])
 
     with load_voltage_summary_from_asset(asset, keep_open=True) as vs:
         rate = resolve_voltage_sample_rate_hz(
@@ -630,9 +642,12 @@ def compute_voltage_roi_transform_from_asset(
             dmd=int(dmd),
             sample_rate_hz=rate,
             epoch_start_sec=float(epoch_start_sec),
+            epoch_end_sec=(float(epoch_end_sec) if epoch_end_sec is not None else None),
             drop_discarded=drop_discarded,
             dtype=np.float32,
             trace_mode=trace_mode,
+            timebase_strategy=timebase_strategy,
+            max_timebase_error_sec=max_timebase_error_sec,
         )
 
     if roi_index < 0 or roi_index >= bundle.traces.shape[0]:
@@ -656,6 +671,7 @@ def compute_voltage_roi_transform_from_asset(
         "dmd": int(dmd),
         "roi_index": int(roi_index),
         "sample_rate_hz": float(rate),
+        "reconstruction_metadata": dict(getattr(bundle, "metadata", {}) or {}),
     }
 
 
@@ -1064,6 +1080,8 @@ def process_voltage_extraction(
     robust_f0_smooth_sec: float = 180.0,
     trace_mode: str = "trial",
     drop_discarded: bool = True,
+    timebase_strategy: str = "auto",
+    max_timebase_error_sec: float = 0.5,
     dtype: np.dtype = np.float32,
     write_single_trials: bool = True,
     write_sequence: bool = True,
@@ -1108,6 +1126,14 @@ def process_voltage_extraction(
         trial-based, so this should usually be ``'trial'``.
     drop_discarded
         Remove samples marked by ``discardFrames`` before event extraction.
+    timebase_strategy
+        Voltage behavior-time mapping for trial-based traces. ``"auto"`` scales
+        the reconstructed timebase to the behavior imaging epoch only when the
+        nominal sample-rate duration disagrees with that epoch, preventing
+        progressive event-alignment drift. Use ``"sample_rate"`` to reproduce the
+        historical fixed-rate mapping.
+    max_timebase_error_sec
+        Duration-mismatch threshold used by ``timebase_strategy='auto'``.
     write_single_trials
         Write large event tensors to HDF5.  Set False for metadata/summary-only
         dry runs.
@@ -1233,6 +1259,8 @@ def process_voltage_extraction(
             "trace_mode": str(trace_mode),
             "trace_suffix": suffix,
             "drop_discarded": bool(drop_discarded),
+            "timebase_strategy": str(timebase_strategy),
+            "max_timebase_error_sec": float(max_timebase_error_sec),
             "use_roi_qc": bool(use_roi_qc),
             "write_single_trials": bool(write_single_trials),
             "write_sequence": bool(write_sequence),
@@ -1280,9 +1308,6 @@ def process_voltage_extraction(
             single_h5.parent.mkdir(parents=True, exist_ok=True)
             h5 = h5py.File(single_h5, "w")
             _metadata_json_attr(h5, base_meta)
-            h5.create_dataset("timebase_sec/image", data=tvecs["image"].astype(np.float64))
-            h5.create_dataset("timebase_sec/change", data=tvecs["change"].astype(np.float64))
-            h5.create_dataset("timebase_sec/omission", data=tvecs["omission"].astype(np.float64))
         if write_session_traces:
             session_traces_h5.parent.mkdir(parents=True, exist_ok=True)
             session_h5 = h5py.File(session_traces_h5, "w")
@@ -1295,9 +1320,12 @@ def process_voltage_extraction(
                     dmd=dmd,
                     sample_rate_hz=rate,
                     epoch_start_sec=epoch_start_sec,
+                    epoch_end_sec=epoch_end_sec,
                     drop_discarded=drop_discarded,
                     dtype=dtype,
                     trace_mode=trace_mode,
+                    timebase_strategy=timebase_strategy,
+                    max_timebase_error_sec=max_timebase_error_sec,
                 )
                 if bundle.traces.size == 0:
                     qc["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no valid traces"}
@@ -1311,6 +1339,15 @@ def process_voltage_extraction(
                     robust_f0_bin_sec=robust_f0_bin_sec,
                     robust_f0_smooth_sec=robust_f0_smooth_sec,
                 )
+
+                event_rate = float((getattr(bundle, "metadata", {}) or {}).get("alignment_sample_rate_hz", rate))
+                event_tvecs = _time_vectors(windows, event_rate)
+                mean_pkg["timebase_sec"] = event_tvecs
+                seq_pkg["timebase_sec"] = {"image": event_tvecs["image"]}
+                if h5 is not None and "timebase_sec" not in h5:
+                    h5.create_dataset("timebase_sec/image", data=event_tvecs["image"].astype(np.float64))
+                    h5.create_dataset("timebase_sec/change", data=event_tvecs["change"].astype(np.float64))
+                    h5.create_dataset("timebase_sec/omission", data=event_tvecs["omission"].astype(np.float64))
 
                 n_rois_total = int(bundle.traces.shape[0])
                 roi_mask = _load_voltage_roi_qc_mask(asset, dmd) if use_roi_qc else None
@@ -1339,6 +1376,8 @@ def process_voltage_extraction(
                     dmd_h5.attrs["n_rois_total"] = n_rois_total
                     dmd_h5.attrs["n_rois_kept"] = n_rois_kept
                     dmd_h5.attrs["signal_transform_json"] = json.dumps(transform_meta, default=_json_default)
+                    if getattr(bundle, "metadata", None):
+                        dmd_h5.attrs["reconstruction_metadata_json"] = json.dumps(bundle.metadata, default=_json_default)
                     dmd_h5.create_dataset("roi_ids", data=np.asarray(ids, dtype="S"))
                     dmd_h5.create_dataset("valid_rois_mask", data=roi_mask.astype(bool))
 
@@ -1349,7 +1388,7 @@ def process_voltage_extraction(
                 image_summary, image_onsets_used, image_h5_name_map = _extract_image_identity_streaming(
                     bundle,
                     image_times_f,
-                    sample_rate_hz=rate,
+                    sample_rate_hz=event_rate,
                     pre_time=windows.image[0],
                     post_time=windows.image[1],
                     roi_mask=roi_mask,
@@ -1361,7 +1400,7 @@ def process_voltage_extraction(
                 change_summary, change_onsets_used = _extract_interval_list_streaming(
                     bundle,
                     change_times_f,
-                    sample_rate_hz=rate,
+                    sample_rate_hz=event_rate,
                     pre_time=windows.change[0],
                     post_time=windows.change[1],
                     roi_mask=roi_mask,
@@ -1375,7 +1414,7 @@ def process_voltage_extraction(
                 omission_summary, omission_onsets_used = _extract_interval_list_streaming(
                     bundle,
                     omission_times_f,
-                    sample_rate_hz=rate,
+                    sample_rate_hz=event_rate,
                     pre_time=windows.omission[0],
                     post_time=windows.omission[1],
                     roi_mask=roi_mask,
@@ -1398,7 +1437,7 @@ def process_voltage_extraction(
                     seq_pkg[dmd_key]["image_identity"] = _summarize_change_locked_sequences_streaming(
                         seq_events,
                         bundle,
-                        sample_rate_hz=rate,
+                        sample_rate_hz=event_rate,
                         pre_time=windows.image[0],
                         post_time=windows.image[1],
                         roi_mask=roi_mask,
@@ -1419,6 +1458,9 @@ def process_voltage_extraction(
                     "trial_lengths_samples": bundle.trial_lengths_samples.tolist(),
                     "reconstructed_duration_sec": float(bundle.reconstructed_duration_sec),
                     "duration_vs_epoch_error_sec": float(bundle.reconstructed_duration_sec - epoch_duration_sec),
+                    "reconstruction_metadata": dict(getattr(bundle, "metadata", {}) or {}),
+                    "alignment_sample_rate_hz": float(event_rate),
+                    "timebase_strategy_used": str((getattr(bundle, "metadata", {}) or {}).get("timebase_strategy_used", "unknown")),
                     "n_image_ids_extracted": int(len(image_count_by_id)),
                     "image_count_by_id": image_count_by_id,
                     "zero_count_image_ids": zero_count_ids,

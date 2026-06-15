@@ -461,6 +461,111 @@ class VoltageSummary:
             self._h5_attrs = out
         return self._h5_attrs
 
+    def _dmd_cell_item(self, cell_name: str, dmd0: int) -> Optional[Union[h5py.Dataset, h5py.Group]]:
+        """Dereference a DMD-indexed MATLAB cell array stored under ``summary/dmd``."""
+        summary = self._mat.f["summary"]
+        if "dmd" not in summary or cell_name not in summary["dmd"]:
+            return None
+        cell = summary["dmd"][cell_name]
+        if not self._is_ref_dataset(cell):
+            return cell
+
+        # MATLAB cell arrays can appear transposed depending on save path.  Try
+        # both common orientations before giving up.
+        for i, j in ((dmd0, 0), (0, dmd0)):
+            try:
+                ref = cell[i, j]
+                if ref is None:
+                    continue
+                try:
+                    if int(ref) == 0:  # type: ignore[arg-type]
+                        continue
+                except Exception:
+                    pass
+                return self._mat.deref(ref)
+            except Exception:
+                continue
+        return None
+
+    def get_dmd_metadata(self, dmd: int) -> Dict[str, Any]:
+        """Return decoded per-DMD acquisition metadata when present.
+
+        Newer ``extractDendrites_new.m`` summaries store SLAP2 acquisition
+        metadata under ``summary/dmd/metadata{dmd}``.  This includes the true
+        line-scan rate (``lineRateHz``), which is preferred over historical
+        hard-coded defaults for voltage time alignment.
+        """
+        dmd0 = self._validate_dmd(dmd)
+        node = self._dmd_cell_item("metadata", dmd0)
+        if node is None or not isinstance(node, h5py.Group):
+            return {}
+        return self._read_group_scalars(node)
+
+    def get_line_rate_hz(self, dmd: Optional[int] = None) -> float:
+        """Return the per-DMD or representative SLAP2 line rate in Hz.
+
+        If ``dmd`` is omitted, the median of available finite per-DMD line rates
+        is returned.  ``NaN`` is returned when the metadata is unavailable.
+        """
+        rates: List[float] = []
+        dmds = [int(dmd)] if dmd is not None else list(range(1, int(self.n_dmds) + 1))
+        for d in dmds:
+            md = self.get_dmd_metadata(d)
+            for key in ("lineRateHz", "line_rate_hz", "sample_rate_hz", "fs_hz"):
+                if key not in md:
+                    continue
+                try:
+                    val = float(np.asarray(md[key]).squeeze())
+                except Exception:
+                    continue
+                if np.isfinite(val) and val > 0:
+                    rates.append(val)
+                    break
+        return float(np.median(rates)) if rates else float("nan")
+
+    def _read_numeric_summary_group(self, group_name: str, *, dmd: Optional[int] = None) -> Dict[str, np.ndarray]:
+        """Read numeric datasets from a named ``summary`` subgroup.
+
+        Object/reference datasets, such as filenames, are intentionally skipped.
+        For DMD-column fields shaped ``(n_trials, n_dmds)``, passing ``dmd``
+        selects the requested 1-indexed DMD column.
+        """
+        summary = self._mat.f["summary"]
+        if group_name not in summary or not isinstance(summary[group_name], h5py.Group):
+            return {}
+        group = summary[group_name]
+        dmd0 = None if dmd is None else self._validate_dmd(dmd)
+        out: Dict[str, np.ndarray] = {}
+        for key, node in group.items():
+            if not isinstance(node, h5py.Dataset):
+                continue
+            if node.dtype == h5py.ref_dtype or getattr(node.dtype, "kind", None) == "O":
+                continue
+            arr = np.asarray(node[()])
+            if dmd0 is not None and arr.ndim == 2 and arr.shape[1] == self.n_dmds:
+                arr = arr[:, dmd0]
+            arr = np.asarray(arr).squeeze()
+            out[key] = arr
+        return out
+
+    def get_trial_line_ranges(self, dmd: Optional[int] = None) -> Dict[str, np.ndarray]:
+        """Return numeric ``summary/trialLineRanges`` arrays when present.
+
+        The returned arrays use MATLAB's 1-indexed line numbering as stored in the
+        source summary.  Downstream code should subtract one before converting
+        line indices to Python sample offsets.
+        """
+        return self._read_numeric_summary_group("trialLineRanges", dmd=dmd)
+
+    def get_trial_timing_table(self, dmd: Optional[int] = None) -> Dict[str, np.ndarray]:
+        """Return numeric ``summary/trialTable`` arrays when present.
+
+        Filename/object columns are omitted.  MATLAB datenum columns, when
+        present, are left in MATLAB datenum units so callers can decide how to
+        align them to behavior time.
+        """
+        return self._read_numeric_summary_group("trialTable", dmd=dmd)
+
     def _read_group_scalars(self, group: h5py.Group) -> Dict[str, Any]:
         """Read scalar-like datasets from a metadata group into a dictionary."""
         out: Dict[str, Any] = {}

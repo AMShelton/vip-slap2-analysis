@@ -68,6 +68,7 @@ class ReconstructedTraceBundle:
     session_start_sec: float
     session_end_sec: float
     reconstructed_duration_sec: float
+    metadata: Optional[Dict[str, Any]] = None
 
 
 # -----------------------------------------------------------------------------

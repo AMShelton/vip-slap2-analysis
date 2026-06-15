@@ -13,7 +13,7 @@ shared event-alignment machinery.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
@@ -223,15 +223,111 @@ def _load_valid_voltage_trials(
     return trial_data, valid_lengths
 
 
+def _build_voltage_alignment_timebase(
+    *,
+    total_samples: int,
+    sample_rate_hz: float,
+    epoch_start_sec: float,
+    epoch_end_sec: Optional[float],
+    strategy: str = "auto",
+    max_timebase_error_sec: float = 0.5,
+) -> Tuple[np.ndarray, float, Dict[str, Any]]:
+    """Build the behavior-time vector used for voltage event alignment.
+
+    ``sample_rate`` preserves the physical/metadata sample spacing.
+    ``epoch_scaled`` maps the reconstructed sample stream exactly onto the
+    behavior/imaging epoch.  ``auto`` uses ``epoch_scaled`` only when the nominal
+    reconstructed duration and behavior epoch duration disagree by more than
+    ``max_timebase_error_sec``.  This protects trial-based acquisitions from
+    progressive stimulus-alignment drift while preserving the historical fixed-rate
+    behavior for sessions whose metadata and behavior epoch already agree.
+    """
+    total_samples = int(total_samples)
+    rate = float(sample_rate_hz)
+    start = float(epoch_start_sec)
+    if total_samples <= 0:
+        return np.empty((0,), dtype=float), rate, {
+            "timebase_strategy_requested": str(strategy),
+            "timebase_strategy_used": "empty",
+            "nominal_sample_rate_hz": rate,
+            "alignment_sample_rate_hz": rate,
+            "nominal_duration_sec": 0.0,
+            "epoch_duration_sec": None,
+            "duration_error_sec": None,
+        }
+
+    if not np.isfinite(rate) or rate <= 0:
+        raise ValueError(f"sample_rate_hz must be positive and finite, got {sample_rate_hz}.")
+
+    requested = str(strategy or "auto").lower().replace("-", "_")
+    aliases = {
+        "nominal": "sample_rate",
+        "fixed_rate": "sample_rate",
+        "metadata": "sample_rate",
+        "scale_to_epoch": "epoch_scaled",
+        "scaled_epoch": "epoch_scaled",
+        "behavior_epoch": "epoch_scaled",
+    }
+    requested = aliases.get(requested, requested)
+    if requested not in {"auto", "sample_rate", "epoch_scaled"}:
+        raise ValueError(
+            "timebase_strategy must be one of 'auto', 'sample_rate', or "
+            f"'epoch_scaled', got {strategy!r}."
+        )
+
+    nominal_duration = float(total_samples / rate)
+    epoch_duration: Optional[float] = None
+    if epoch_end_sec is not None:
+        epoch_duration = float(epoch_end_sec) - start
+        if not np.isfinite(epoch_duration) or epoch_duration <= 0:
+            epoch_duration = None
+
+    used = requested
+    if requested == "auto":
+        used = "sample_rate"
+        if epoch_duration is not None:
+            if abs(nominal_duration - epoch_duration) > float(max_timebase_error_sec):
+                used = "epoch_scaled"
+
+    if used == "epoch_scaled":
+        if epoch_duration is None:
+            used = "sample_rate"
+            alignment_rate = rate
+            timebase = start + np.arange(total_samples, dtype=float) / alignment_rate
+        else:
+            alignment_rate = float(total_samples / epoch_duration)
+            timebase = start + np.arange(total_samples, dtype=float) / alignment_rate
+    else:
+        alignment_rate = rate
+        timebase = start + np.arange(total_samples, dtype=float) / alignment_rate
+
+    info: Dict[str, Any] = {
+        "timebase_strategy_requested": str(strategy),
+        "timebase_strategy_used": used,
+        "nominal_sample_rate_hz": rate,
+        "alignment_sample_rate_hz": float(alignment_rate),
+        "nominal_duration_sec": nominal_duration,
+        "epoch_duration_sec": epoch_duration,
+        "duration_error_sec": (
+            float(nominal_duration - epoch_duration) if epoch_duration is not None else None
+        ),
+        "max_timebase_error_sec": float(max_timebase_error_sec),
+    }
+    return timebase, float(alignment_rate), info
+
+
 def reconstruct_voltage_dmd_session_traces(
     vs,
     dmd: int,
     *,
     sample_rate_hz: float,
     epoch_start_sec: float,
+    epoch_end_sec: Optional[float] = None,
     drop_discarded: bool = True,
     dtype=np.float32,
     trace_mode: str = "trial",
+    timebase_strategy: str = "auto",
+    max_timebase_error_sec: float = 0.5,
 ) -> ReconstructedTraceBundle:
     """Reconstruct one DMD's voltage traces as a session-wide alignment bundle.
 
@@ -248,6 +344,11 @@ def reconstruct_voltage_dmd_session_traces(
         Corrected behavior/HARP time corresponding to sample 0 of the first trial
         in the reconstructed voltage stream.  In the current pipeline this should
         be the first ``imaging_epochs.csv`` ``start_time``.
+    epoch_end_sec
+        Optional corrected behavior/HARP time corresponding to the end of the
+        imaging epoch.  When provided, ``timebase_strategy='auto'`` can scale the
+        voltage timebase to this duration if the nominal sample-rate duration
+        would otherwise drift relative to behavior time.
     drop_discarded
         Remove samples marked by ``discardFrames`` before reconstruction.
     dtype
@@ -255,6 +356,13 @@ def reconstruct_voltage_dmd_session_traces(
     trace_mode
         Trace mode passed to ``VoltageSummary.get_roi_traces``.  Current voltage
         outputs are trial-based, so the default is ``"trial"``.
+    timebase_strategy
+        ``"sample_rate"`` preserves nominal sample spacing. ``"epoch_scaled"``
+        maps the reconstructed trace onto ``epoch_start_sec`` → ``epoch_end_sec``.
+        ``"auto"`` uses epoch scaling only when the nominal duration and behavior
+        epoch differ by more than ``max_timebase_error_sec``.
+    max_timebase_error_sec
+        Duration mismatch threshold used by ``timebase_strategy='auto'``.
 
     Returns
     -------
@@ -295,6 +403,7 @@ def reconstruct_voltage_dmd_session_traces(
             session_start_sec=float(epoch_start_sec),
             session_end_sec=float(epoch_start_sec),
             reconstructed_duration_sec=0.0,
+            metadata={"timebase_strategy_used": "empty"},
         )
 
     default_len = int(round(float(np.median(valid_lengths))))
@@ -307,10 +416,22 @@ def reconstruct_voltage_dmd_session_traces(
     trial_valid_mask = np.zeros((n_trials,), dtype=bool)
     trial_starts_sec = np.zeros((n_trials,), dtype=float)
 
+    timebase_sec, alignment_rate_hz, timebase_meta = _build_voltage_alignment_timebase(
+        total_samples=total_samples,
+        sample_rate_hz=sample_rate_hz,
+        epoch_start_sec=epoch_start_sec,
+        epoch_end_sec=epoch_end_sec,
+        strategy=timebase_strategy,
+        max_timebase_error_sec=max_timebase_error_sec,
+    )
+
     pos = 0
     for trial in range(1, n_trials + 1):
         length = int(trial_lengths[trial - 1])
-        trial_starts_sec[trial - 1] = float(epoch_start_sec + pos / sample_rate_hz)
+        if total_samples and pos < timebase_sec.size:
+            trial_starts_sec[trial - 1] = float(timebase_sec[pos])
+        else:
+            trial_starts_sec[trial - 1] = float(epoch_start_sec + pos / alignment_rate_hz)
 
         if trial in trial_data:
             x = trial_data[trial]
@@ -321,11 +442,21 @@ def reconstruct_voltage_dmd_session_traces(
 
         pos += length
 
-    timebase_sec = (
-        float(epoch_start_sec)
-        + np.arange(total_samples, dtype=float) / sample_rate_hz
-    )
-    session_end_sec = float(timebase_sec[-1]) if total_samples else float(epoch_start_sec)
+    if timebase_meta["timebase_strategy_used"] == "epoch_scaled" and epoch_end_sec is not None:
+        session_end_sec = float(epoch_end_sec)
+        reconstructed_duration_sec = float(float(epoch_end_sec) - float(epoch_start_sec))
+    else:
+        session_end_sec = float(timebase_sec[-1]) if total_samples else float(epoch_start_sec)
+        reconstructed_duration_sec = float(total_samples / alignment_rate_hz)
+
+    metadata: Dict[str, Any] = dict(timebase_meta)
+    metadata.update({
+        "trace_mode": str(trace_mode),
+        "drop_discarded": bool(drop_discarded),
+        "n_trials_total": int(n_trials),
+        "n_trials_valid": int(np.sum(trial_valid_mask)),
+        "n_samples_total": int(total_samples),
+    })
 
     return ReconstructedTraceBundle(
         traces=traces,
@@ -335,7 +466,8 @@ def reconstruct_voltage_dmd_session_traces(
         trial_starts_sec=trial_starts_sec,
         session_start_sec=float(epoch_start_sec),
         session_end_sec=session_end_sec,
-        reconstructed_duration_sec=float(total_samples / sample_rate_hz),
+        reconstructed_duration_sec=reconstructed_duration_sec,
+        metadata=metadata,
     )
 
 
@@ -403,20 +535,22 @@ def resolve_voltage_sample_rate_hz(
         "voltage_sample_rate_hz",
         "sample_rate_hz",
         "line_rate_hz",
+        "lineRateHz",
         "slap2_line_rate_hz",
         "fs_hz",
         "fs_Hz",
     )
 
-    if asset is not None and getattr(asset, "metadata", None):
-        for key in candidate_keys:
-            if key in asset.metadata and asset.metadata[key] is not None:
-                try:
-                    rate = float(asset.metadata[key])
-                except (TypeError, ValueError):
-                    continue
-                if np.isfinite(rate) and rate > 0:
-                    return rate
+    # Prefer per-DMD SLAP2 metadata when it is available.  Older notebooks often
+    # carried a 10.8 kHz default in asset metadata, but recent extraction outputs
+    # store the actual line-scan rate under summary/dmd/metadata/lineRateHz.
+    if vs is not None and hasattr(vs, "get_line_rate_hz"):
+        try:
+            rate = float(vs.get_line_rate_hz())
+        except Exception:
+            rate = float("nan")
+        if np.isfinite(rate) and rate > 0:
+            return rate
 
     if vs is not None:
         for mapping in (getattr(vs, "h5_attrs", {}), getattr(vs, "metadata", {})):
@@ -431,21 +565,32 @@ def resolve_voltage_sample_rate_hz(
                     if np.isfinite(rate) and rate > 0:
                         return rate
 
+    if asset is not None and getattr(asset, "metadata", None):
+        for key in candidate_keys:
+            if key in asset.metadata and asset.metadata[key] is not None:
+                try:
+                    rate = float(asset.metadata[key])
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(rate) and rate > 0:
+                    return rate
+
     rate = float(default_hz)
     if not np.isfinite(rate) or rate <= 0:
         raise ValueError(f"default_hz must be positive and finite, got {default_hz}.")
     return rate
 
 
-def _resolve_epoch_start_sec(
+def _resolve_imaging_epoch_bounds(
     *,
     epoch_start_sec: Optional[float],
+    epoch_end_sec: Optional[float],
     imaging_epochs_csv: Optional[Union[str, Path]],
     asset: Optional[SessionAssets],
-) -> float:
-    """Resolve the corrected-time start of voltage sample 0."""
-    if epoch_start_sec is not None:
-        return float(epoch_start_sec)
+) -> Tuple[float, Optional[float]]:
+    """Resolve corrected-time imaging-epoch bounds for voltage sample mapping."""
+    if epoch_start_sec is not None and epoch_end_sec is not None:
+        return float(epoch_start_sec), float(epoch_end_sec)
 
     candidate: Optional[Path] = None
     if imaging_epochs_csv is not None:
@@ -456,6 +601,8 @@ def _resolve_epoch_start_sec(
             candidate = p
 
     if candidate is None:
+        if epoch_start_sec is not None:
+            return float(epoch_start_sec), (float(epoch_end_sec) if epoch_end_sec is not None else None)
         raise ValueError(
             "epoch_start_sec was not provided and imaging_epochs.csv could not be "
             "resolved from asset.qc_dir / 'behavior'."
@@ -466,20 +613,47 @@ def _resolve_epoch_start_sec(
     epochs = pd.read_csv(candidate)
     if "start_time" not in epochs.columns or len(epochs) == 0:
         raise ValueError(f"{candidate} must contain at least one start_time value.")
-    return float(epochs["start_time"].iloc[0])
+    start = float(epoch_start_sec) if epoch_start_sec is not None else float(epochs["start_time"].iloc[0])
+    end: Optional[float]
+    if epoch_end_sec is not None:
+        end = float(epoch_end_sec)
+    elif "end_time" in epochs.columns and len(epochs) > 0:
+        end = float(epochs["end_time"].iloc[-1])
+    else:
+        end = None
+    return start, end
+
+
+def _resolve_epoch_start_sec(
+    *,
+    epoch_start_sec: Optional[float],
+    imaging_epochs_csv: Optional[Union[str, Path]],
+    asset: Optional[SessionAssets],
+) -> float:
+    """Backward-compatible helper returning only the first imaging-epoch start."""
+    start, _ = _resolve_imaging_epoch_bounds(
+        epoch_start_sec=epoch_start_sec,
+        epoch_end_sec=None,
+        imaging_epochs_csv=imaging_epochs_csv,
+        asset=asset,
+    )
+    return start
 
 
 def reconstruct_voltage_dmd_session_traces_from_asset(
     asset: SessionAssets,
     dmd: int,
     *,
-    sample_rate_hz: Optional[float] = 10_800.0,
+    sample_rate_hz: Optional[float] = None,
     default_sample_rate_hz: float = 10_800.0,
     epoch_start_sec: Optional[float] = None,
+    epoch_end_sec: Optional[float] = None,
     imaging_epochs_csv: Optional[Union[str, Path]] = None,
     drop_discarded: bool = True,
     dtype=np.float32,
     trace_mode: str = "trial",
+    timebase_strategy: str = "auto",
+    max_timebase_error_sec: float = 0.5,
 ) -> ReconstructedTraceBundle:
     """Load voltage assets and reconstruct one DMD as an alignment bundle.
 
@@ -495,8 +669,9 @@ def reconstruct_voltage_dmd_session_traces_from_asset(
             sample_rate_hz=sample_rate_hz,
             default_hz=default_sample_rate_hz,
         )
-        start = _resolve_epoch_start_sec(
+        start, end = _resolve_imaging_epoch_bounds(
             epoch_start_sec=epoch_start_sec,
+            epoch_end_sec=epoch_end_sec,
             imaging_epochs_csv=imaging_epochs_csv,
             asset=asset,
         )
@@ -505,7 +680,10 @@ def reconstruct_voltage_dmd_session_traces_from_asset(
             dmd=dmd,
             sample_rate_hz=rate,
             epoch_start_sec=start,
+            epoch_end_sec=end,
             drop_discarded=drop_discarded,
             dtype=dtype,
             trace_mode=trace_mode,
+            timebase_strategy=timebase_strategy,
+            max_timebase_error_sec=max_timebase_error_sec,
         )
