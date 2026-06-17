@@ -141,6 +141,11 @@ def process_behavior_session(
     min_epoch_duration: float = 6.0,
     trial_gap_start: float = 0.02,
     expected_trial_epoch_min: Optional[int] = None,
+    epoch_detection_method: str = "pulse_train",
+    pulse_train_min_pulses: int = 10,
+    pulse_train_gap_factor: float = 10.0,
+    pulse_train_min_gap_s: float = 0.5,
+    pulse_train_max_gap_s: Optional[float] = None,
     use_piecewise_warp: bool = True,
 ) -> BehaviorProcessingResult:
     """Run the full behavior preprocessing workflow for a session asset.
@@ -242,20 +247,45 @@ def process_behavior_session(
             paths.corrected_bonsai_csv = corrected_path
 
     acq_type = metadata.get("epochs_mode", "continuous")
-    epochs, gap_used = detect_epochs_adaptive(
+    epochs, gap_used, epoch_detection = detect_epochs_adaptive(
         harp_df,
         acq_time,
         acq_type=acq_type,
         min_duration=min_epoch_duration,
         gap_start=trial_gap_start,
         target_min=expected_trial_epoch_min,
+        method=metadata.get("epoch_detection_method", epoch_detection_method),
+        pulse_min_pulses=int(metadata.get("pulse_train_min_pulses", pulse_train_min_pulses)),
+        pulse_gap_factor=float(metadata.get("pulse_train_gap_factor", pulse_train_gap_factor)),
+        pulse_min_gap_s=float(metadata.get("pulse_train_min_gap_s", pulse_train_min_gap_s)),
+        pulse_max_gap_s=metadata.get("pulse_train_max_gap_s", pulse_train_max_gap_s),
+        return_diagnostics=True,
     )
     epochs = shift_epochs_to_photodiode_time(epochs, harp_df, photodiode_df)
     epoch_df = epochs_to_dataframe(epochs)
     save_epochs_csv(epoch_df, paths.qc_dir / "imaging_epochs.csv")
 
+    # Store the raw HARP-time pulse-train diagnostics separately from the shifted
+    # photodiode-time epoch CSV.  These gaps are modality-independent QC outputs
+    # used by glutamate, calcium, and voltage processing.
+    with open(paths.qc_dir / "di3_pulse_train_detection.json", "w") as f:
+        json.dump(epoch_detection, f, indent=2)
+
+    if epoch_detection.get("large_gaps_s"):
+        gap_df = pd.DataFrame({
+            "gap_idx": np.arange(1, len(epoch_detection["large_gaps_s"]) + 1, dtype=int),
+            "gap_start_time_s": epoch_detection.get("large_gap_times_s", []),
+            "gap_duration_s": epoch_detection.get("large_gaps_s", []),
+        })
+        gap_df.to_csv(paths.qc_dir / "di3_pulse_train_gaps.csv", index=False)
+
     event_coverage = audit_event_coverage(corrected_df, epoch_df)
-    epochs_summary = summarize_epochs(epoch_df, mode=acq_type, gap_threshold_used=gap_used)
+    epochs_summary = summarize_epochs(
+        epoch_df,
+        mode=acq_type,
+        gap_threshold_used=gap_used,
+        detection_diagnostics=epoch_detection,
+    )
 
     ready = (
         bonsai_validation["passed"]
