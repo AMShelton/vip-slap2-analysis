@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import pandas as pd
 
 from vip_slap2_analysis.common.alignment import ReconstructedTraceBundle
+from vip_slap2_analysis.common.epoch_alignment import build_epoch_aware_timebase, load_epoch_dataframe
 from vip_slap2_analysis.common.session import SessionAssets
 from vip_slap2_analysis.voltage.summary import VoltageSummary
 
@@ -323,6 +325,8 @@ def reconstruct_voltage_dmd_session_traces(
     sample_rate_hz: float,
     epoch_start_sec: float,
     epoch_end_sec: Optional[float] = None,
+    epoch_df: Optional[pd.DataFrame] = None,
+    trial_epoch: Optional[np.ndarray] = None,
     drop_discarded: bool = True,
     dtype=np.float32,
     trace_mode: str = "trial",
@@ -416,14 +420,33 @@ def reconstruct_voltage_dmd_session_traces(
     trial_valid_mask = np.zeros((n_trials,), dtype=bool)
     trial_starts_sec = np.zeros((n_trials,), dtype=float)
 
-    timebase_sec, alignment_rate_hz, timebase_meta = _build_voltage_alignment_timebase(
-        total_samples=total_samples,
-        sample_rate_hz=sample_rate_hz,
-        epoch_start_sec=epoch_start_sec,
-        epoch_end_sec=epoch_end_sec,
-        strategy=timebase_strategy,
-        max_timebase_error_sec=max_timebase_error_sec,
-    )
+    if trial_epoch is None and hasattr(vs, "trial_epoch"):
+        try:
+            trial_epoch = np.asarray(vs.trial_epoch, dtype=int)
+        except Exception:
+            trial_epoch = None
+
+    if epoch_df is not None and len(epoch_df) > 0:
+        epoch_tb = build_epoch_aware_timebase(
+            trial_lengths,
+            sample_rate_hz=sample_rate_hz,
+            epoch_df=epoch_df,
+            trial_epoch=trial_epoch,
+            scale_each_epoch=True,
+        )
+        timebase_sec = epoch_tb.timebase_sec
+        alignment_rate_hz = sample_rate_hz
+        timebase_meta = dict(epoch_tb.metadata)
+        timebase_meta["timebase_strategy_used"] = "epoch_aware" if len(epoch_df) > 1 else "epoch_scaled_single"
+    else:
+        timebase_sec, alignment_rate_hz, timebase_meta = _build_voltage_alignment_timebase(
+            total_samples=total_samples,
+            sample_rate_hz=sample_rate_hz,
+            epoch_start_sec=epoch_start_sec,
+            epoch_end_sec=epoch_end_sec,
+            strategy=timebase_strategy,
+            max_timebase_error_sec=max_timebase_error_sec,
+        )
 
     pos = 0
     for trial in range(1, n_trials + 1):
@@ -675,12 +698,17 @@ def reconstruct_voltage_dmd_session_traces_from_asset(
             imaging_epochs_csv=imaging_epochs_csv,
             asset=asset,
         )
+        epoch_df = None
+        candidate = Path(imaging_epochs_csv) if imaging_epochs_csv is not None else (Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv" if asset.qc_dir is not None else None)
+        if candidate is not None and Path(candidate).exists():
+            epoch_df = pd.read_csv(candidate)
         return reconstruct_voltage_dmd_session_traces(
             vs,
             dmd=dmd,
             sample_rate_hz=rate,
             epoch_start_sec=start,
             epoch_end_sec=end,
+            epoch_df=epoch_df,
             drop_discarded=drop_discarded,
             dtype=dtype,
             trace_mode=trace_mode,

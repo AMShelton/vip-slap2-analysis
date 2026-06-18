@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 
 from vip_slap2_analysis.common.session import SessionAssets
+from vip_slap2_analysis.common.epoch_alignment import build_epoch_aware_timebase
 from vip_slap2_analysis.common.alignment import (
     EventWindows,
     align_traces_to_session_intervals,
@@ -298,6 +300,7 @@ def _reconstruct_ca_session_traces(
     im_rate_hz: float,
     epoch_start_sec: float,
     epoch_end_sec: Optional[float] = None,
+    epoch_df: Optional[pd.DataFrame] = None,
     motion_correct: bool = True,
     use_glu: bool = True,
     max_session_minutes=None,
@@ -452,8 +455,24 @@ def _reconstruct_ca_session_traces(
     timebase_sec = nominal_timebase_sec.copy()
     effective_im_rate_hz = float(im_rate_hz)
     duration_vs_epoch_error_sec = np.nan
+    epoch_metadata: Dict[str, Any] = {"epoch_aware": False}
 
-    if epoch_end_sec is not None and np.isfinite(epoch_end_sec) and total_samples > 1:
+    if epoch_df is not None and len(epoch_df) > 0 and total_samples > 0:
+        epoch_tb = build_epoch_aware_timebase(
+            trial_lengths,
+            sample_rate_hz=float(im_rate_hz),
+            epoch_df=epoch_df,
+            scale_each_epoch=True,
+        )
+        timebase_sec = epoch_tb.timebase_sec
+        trial_starts_sec = epoch_tb.trial_starts_sec
+        timebase_mode = "epoch_aware" if len(epoch_df) > 1 else "epoch_scaled_single"
+        epoch_metadata = epoch_tb.metadata
+        if epoch_tb.metadata.get("effective_sample_rate_hz_by_epoch"):
+            vals = list(epoch_tb.metadata["effective_sample_rate_hz_by_epoch"].values())
+            effective_im_rate_hz = float(np.nanmedian(np.asarray(vals, dtype=float)))
+        duration_vs_epoch_error_sec = float(np.nansum(list(epoch_tb.metadata.get("duration_error_sec_by_epoch", {"0": np.nan}).values())))
+    elif epoch_end_sec is not None and np.isfinite(epoch_end_sec) and total_samples > 1:
         epoch_span_sec = float(epoch_end_sec - epoch_start_sec)
         if epoch_span_sec > 0:
             timebase_sec = np.linspace(
@@ -482,6 +501,7 @@ def _reconstruct_ca_session_traces(
         "timebase_mode": timebase_mode,
         "effective_im_rate_hz": effective_im_rate_hz,
         "duration_vs_epoch_error_sec": duration_vs_epoch_error_sec,
+        "epoch_metadata": epoch_metadata,
     }
 
 
@@ -638,6 +658,9 @@ def process_calcium_extraction(
         "motion_correct": bool(motion_correct),
         "epoch_start_sec": epoch_start_sec,
         "epoch_end_sec": epoch_end_sec,
+        "n_imaging_epochs": int(len(epoch_df)),
+        "epoch_starts_sec": epoch_df["start_time"].astype(float).tolist(),
+        "epoch_ends_sec": epoch_df["end_time"].astype(float).tolist(),
     }
 
     mean_pkg: Dict[str, Any] = {"metadata": base_meta, "timebase_sec": tvecs, "DMD1": {}, "DMD2": {}}
@@ -682,6 +705,7 @@ def process_calcium_extraction(
             im_rate_hz=im_rate_hz,
             epoch_start_sec=epoch_start_sec,
             epoch_end_sec=epoch_end_sec,
+            epoch_df=epoch_df,
             motion_correct=motion_correct,
             use_glu=use_glu,
             max_session_minutes=max_session_minutes,

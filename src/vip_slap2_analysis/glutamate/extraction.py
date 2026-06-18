@@ -293,6 +293,9 @@ def process_glutamate_extraction(
         "use_synapse_qc": bool(use_synapse_qc),
         "epoch_start_sec": epoch_start_sec,
         "epoch_end_sec": epoch_end_sec,
+        "n_imaging_epochs": int(len(epoch_df)),
+        "epoch_starts_sec": epoch_df["start_time"].astype(float).tolist(),
+        "epoch_ends_sec": epoch_df["end_time"].astype(float).tolist(),
         "trace_signal": str(trace_signal),
         "trace_mode": None if trace_mode is None else str(trace_mode),
         "trace_suffix": trace_suffix,
@@ -336,6 +339,7 @@ def process_glutamate_extraction(
             epoch_start_sec=epoch_start_sec,
             signal=trace_signal,
             mode=trace_mode,
+            epoch_df=epoch_df,
         )
         if bundle.traces.size == 0:
             qc["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no valid traces"}

@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from vip_slap2_analysis.glutamate.summary import GlutamateSummary
+from vip_slap2_analysis.common.epoch_alignment import build_epoch_aware_timebase, normalize_epoch_dataframe
 
 
 Interval = Tuple[float, float]
@@ -415,6 +416,9 @@ def reconstruct_dmd_session_traces(
     epoch_start_sec: float,
     signal: str = "dF",
     mode: str = "ls",
+    epoch_df: Optional[pd.DataFrame] = None,
+    trial_epoch: Optional[Sequence[int]] = None,
+    scale_epochs: bool = True,
 ) -> ReconstructedTraceBundle:
     """
     Reconstruct a session-wide trace by concatenating all trials in order.
@@ -480,16 +484,37 @@ def reconstruct_dmd_session_traces(
             trial_valid_mask[trial - 1] = True
         pos += L
 
-    timebase_sec = epoch_start_sec + np.arange(total_samples, dtype=float) / float(im_rate_hz)
+    metadata: Dict[str, Any] = {
+        "epoch_aware": False,
+        "n_trials_total": int(n_trials),
+        "n_trials_valid": int(np.sum(trial_valid_mask)),
+        "n_samples_total": int(total_samples),
+    }
+
+    if epoch_df is not None and len(epoch_df) > 0:
+        epoch_tb = build_epoch_aware_timebase(
+            trial_lengths,
+            sample_rate_hz=float(im_rate_hz),
+            epoch_df=epoch_df,
+            trial_epoch=trial_epoch,
+            scale_each_epoch=scale_epochs,
+        )
+        timebase_sec = epoch_tb.timebase_sec
+        trial_starts_sec = epoch_tb.trial_starts_sec
+        metadata.update(epoch_tb.metadata)
+    else:
+        timebase_sec = epoch_start_sec + np.arange(total_samples, dtype=float) / float(im_rate_hz)
+
     return ReconstructedTraceBundle(
         traces=traces,
         timebase_sec=timebase_sec,
         trial_valid_mask=trial_valid_mask,
         trial_lengths_samples=trial_lengths,
         trial_starts_sec=trial_starts_sec,
-        session_start_sec=float(epoch_start_sec),
+        session_start_sec=float(timebase_sec[0]) if total_samples else float(epoch_start_sec),
         session_end_sec=float(timebase_sec[-1]) if total_samples else float(epoch_start_sec),
-        reconstructed_duration_sec=float(total_samples / im_rate_hz),
+        reconstructed_duration_sec=float(timebase_sec[-1] - timebase_sec[0]) if total_samples > 1 else 0.0,
+        metadata=metadata,
     )
 
 

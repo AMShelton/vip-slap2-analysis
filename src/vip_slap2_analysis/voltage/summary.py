@@ -83,6 +83,8 @@ class VoltageSummary:
         self.n_rois: List[int] = []
         self.n_total_rois: int = 0
         self.roi_global_offsets: List[int] = []
+        self.trial_epoch: Optional[np.ndarray] = None
+        self.n_epochs: int = 0
 
         self._summary_layout: str = "unknown"
         self._trace_axis: Optional[str] = None
@@ -225,6 +227,28 @@ class VoltageSummary:
         self.valid_trials = [
             list(1 + np.flatnonzero(self.keep_trials[dmd0])) for dmd0 in range(self.n_dmds)
         ]
+
+        if "trialEpoch" in summary:
+            try:
+                te = np.asarray(summary["trialEpoch"][()]).astype(int).squeeze()
+                self.trial_epoch = np.ravel(te).astype(int)
+                if self.trial_epoch.size:
+                    self.n_epochs = int(np.nanmax(self.trial_epoch))
+            except Exception:
+                self.trial_epoch = None
+        elif "trialTable" in summary and isinstance(summary["trialTable"], h5py.Group) and "epoch" in summary["trialTable"]:
+            try:
+                te = np.asarray(summary["trialTable"]["epoch"][()]).astype(int).squeeze()
+                self.trial_epoch = np.ravel(te).astype(int)
+                if self.trial_epoch.size:
+                    self.n_epochs = int(np.nanmax(self.trial_epoch))
+            except Exception:
+                self.trial_epoch = None
+        if "nEpochs" in summary:
+            try:
+                self.n_epochs = int(self._scalar(summary["nEpochs"], self.n_epochs))
+            except Exception:
+                pass
 
         self.n_samples = self._infer_representative_sample_count()
 
