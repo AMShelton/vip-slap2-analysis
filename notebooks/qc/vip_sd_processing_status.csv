@@ -1,77 +1,58 @@
-subject_id,session_id,stage,status,error,ready_for_physiology_extraction,failure_stage,failure_reasons,trace_signal
-826031,826031_2026-01-30_15-04-02,behavior,success,,True,,,
-826031,826031_2026-01-30_15-04-02,voltage_qc,ok,,,,,
-826031,826031_2026-01-30_15-04-02,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826031,826031_2026-01-30_15-04-02,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826031,826031_2026-02-01_11-01-50,behavior,success,,True,,,
-826031,826031_2026-02-01_11-01-50,voltage_qc,ok,,,,,
-826031,826031_2026-02-01_11-01-50,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826031,826031_2026-02-01_11-01-50,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826031,826031_2026-02-02_10-23-53,behavior,success,,True,,,
-826031,826031_2026-02-02_10-23-53,voltage_qc,ok,,,,,
-826031,826031_2026-02-02_10-23-53,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826031,826031_2026-02-02_10-23-53,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826031,826031_2026-02-03_14-21-45,behavior,success,,True,,,
-826031,826031_2026-02-03_14-21-45,voltage_qc,ok,,,,,
-826031,826031_2026-02-03_14-21-45,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826031,826031_2026-02-03_14-21-45,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826031,826031_2026-02-04_12-15-34,behavior,success,,True,,,
-826031,826031_2026-02-04_12-15-34,voltage_qc,ok,,,,,
-826031,826031_2026-02-04_12-15-34,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826031,826031_2026-02-04_12-15-34,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826031,826031_2026-02-05_09-28-56,behavior,success,,True,,,
-826031,826031_2026-02-05_09-28-56,voltage_qc,ok,,,,,
-826031,826031_2026-02-05_09-28-56,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826031,826031_2026-02-05_09-28-56,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826031,826031_2026-02-06_10-21-20,behavior,success,,True,,,
-826031,826031_2026-02-06_10-21-20,voltage_qc,ok,,,,,
-826031,826031_2026-02-06_10-21-20,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826031,826031_2026-02-06_10-21-20,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826031,826031_2026-02-10_10-48-51,behavior,success,,True,,,
-826031,826031_2026-02-10_10-48-51,voltage_qc,ok,,,,,
-826031,826031_2026-02-10_10-48-51,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826031,826031_2026-02-10_10-48-51,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826031,826031_2026-02-11_12-42-21,behavior,success,,True,,,
-826031,826031_2026-02-11_12-42-21,voltage_qc,ok,,,,,
-826031,826031_2026-02-11_12-42-21,voltage_extraction_dff_static_f0,error,"ValueError: Chunk shape must not be greater than data shape in any dimension. (1, 1, 8100) is not compatible with (293, 0, 8100)",,,,dff_static_f0
-826031,826031_2026-02-11_12-42-21,voltage_extraction_dff_robust_f0,error,"ValueError: Chunk shape must not be greater than data shape in any dimension. (1, 1, 8100) is not compatible with (293, 0, 8100)",,,,dff_robust_f0
-826031,826031_2026-02-12_07-43-37,behavior,success,,True,,,
-826031,826031_2026-02-12_07-43-37,voltage_qc,ok,,,,,
-826031,826031_2026-02-12_07-43-37,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826031,826031_2026-02-12_07-43-37,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826032,826032_2026-01-29_12-59-37,behavior,success,,True,,,
-826032,826032_2026-01-29_12-59-37,voltage_qc,ok,,,,,
-826032,826032_2026-01-29_12-59-37,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826032,826032_2026-01-29_12-59-37,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826032,826032_2026-01-30_16-31-08,behavior,success,,True,,,
-826032,826032_2026-01-30_16-31-08,voltage_qc,ok,,,,,
-826032,826032_2026-01-30_16-31-08,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826032,826032_2026-01-30_16-31-08,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826032,826032_2026-02-02_08-24-52,behavior,success,,True,,,
-826032,826032_2026-02-02_08-24-52,voltage_qc,ok,,,,,
-826032,826032_2026-02-02_08-24-52,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826032,826032_2026-02-02_08-24-52,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826032,826032_2026-02-03_16-02-38,behavior,success,,True,,,
-826032,826032_2026-02-03_16-02-38,voltage_qc,ok,,,,,
-826032,826032_2026-02-03_16-02-38,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826032,826032_2026-02-03_16-02-38,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826032,826032_2026-02-04_13-49-07,behavior,success,,True,,,
-826032,826032_2026-02-04_13-49-07,voltage_qc,ok,,,,,
-826032,826032_2026-02-04_13-49-07,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826032,826032_2026-02-04_13-49-07,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826032,826032_2026-02-05_13-18-03,behavior,success,,True,,,
-826032,826032_2026-02-05_13-18-03,voltage_qc,ok,,,,,
-826032,826032_2026-02-05_13-18-03,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826032,826032_2026-02-05_13-18-03,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826032,826032_2026-02-06_11-45-33,behavior,success,,True,,,
-826032,826032_2026-02-06_11-45-33,voltage_qc,ok,,,,,
-826032,826032_2026-02-06_11-45-33,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826032,826032_2026-02-06_11-45-33,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826032,826032_2026-02-10_13-02-11,behavior,success,,True,,,
-826032,826032_2026-02-10_13-02-11,voltage_qc,ok,,,,,
-826032,826032_2026-02-10_13-02-11,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826032,826032_2026-02-10_13-02-11,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
-826032,826032_2026-02-11_14-46-30,behavior,success,,True,,,
-826032,826032_2026-02-11_14-46-30,voltage_qc,ok,,,,,
-826032,826032_2026-02-11_14-46-30,voltage_extraction_dff_static_f0,ok,,,,,dff_static_f0
-826032,826032_2026-02-11_14-46-30,voltage_extraction_dff_robust_f0,ok,,,,,dff_robust_f0
+subject_id,session_id,stage,status,error,trace_signal
+826031,826031_2026-01-30_15-04-02,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 2.15 GiB for an array with shape (288540720,) and data type float64",
+826031,826031_2026-01-30_15-04-02,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.07 GiB for an array with shape (15, 19236048) and data type float32",dff_static_f0
+826031,826031_2026-01-30_15-04-02,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.07 GiB for an array with shape (15, 19236048) and data type float32",dff_robust_f0
+826031,826031_2026-02-01_11-01-50,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 2.72 GiB for an array with shape (365485824,) and data type float64",
+826031,826031_2026-02-01_11-01-50,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.36 GiB for an array with shape (19, 19236096) and data type float32",dff_static_f0
+826031,826031_2026-02-01_11-01-50,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.36 GiB for an array with shape (19, 19236096) and data type float32",dff_robust_f0
+826031,826031_2026-02-02_10-23-53,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 2.72 GiB for an array with shape (365485995,) and data type float64",
+826031,826031_2026-02-02_10-23-53,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.36 GiB for an array with shape (19, 19236105) and data type float32",dff_static_f0
+826031,826031_2026-02-02_10-23-53,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.36 GiB for an array with shape (19, 19236105) and data type float32",dff_robust_f0
+826031,826031_2026-02-03_14-21-45,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 3.44 GiB for an array with shape (461664768,) and data type float64",
+826031,826031_2026-02-03_14-21-45,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.72 GiB for an array with shape (24, 19236032) and data type float32",dff_static_f0
+826031,826031_2026-02-03_14-21-45,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.72 GiB for an array with shape (24, 19236032) and data type float32",dff_robust_f0
+826031,826031_2026-02-04_12-15-34,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 3.30 GiB for an array with shape (442429104,) and data type float64",
+826031,826031_2026-02-04_12-15-34,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.65 GiB for an array with shape (23, 19236048) and data type float32",dff_static_f0
+826031,826031_2026-02-04_12-15-34,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.65 GiB for an array with shape (23, 19236048) and data type float32",dff_robust_f0
+826031,826031_2026-02-05_09-28-56,voltage_qc,ok,,
+826031,826031_2026-02-05_09-28-56,voltage_extraction_dff_static_f0,ok,,dff_static_f0
+826031,826031_2026-02-05_09-28-56,voltage_extraction_dff_robust_f0,ok,,dff_robust_f0
+826031,826031_2026-02-06_10-21-20,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 3.44 GiB for an array with shape (461664000,) and data type float64",
+826031,826031_2026-02-06_10-21-20,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.72 GiB for an array with shape (24, 19236000) and data type float32",dff_static_f0
+826031,826031_2026-02-06_10-21-20,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.72 GiB for an array with shape (24, 19236000) and data type float32",dff_robust_f0
+826031,826031_2026-02-10_10-48-51,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 2.44 GiB for an array with shape (327012697,) and data type float64",
+826031,826031_2026-02-10_10-48-51,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.22 GiB for an array with shape (17, 19236041) and data type float32",dff_static_f0
+826031,826031_2026-02-10_10-48-51,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.22 GiB for an array with shape (19236041, 17) and data type float32",dff_robust_f0
+826031,826031_2026-02-11_12-42-21,voltage_qc,ok,,
+826031,826031_2026-02-11_12-42-21,voltage_extraction_dff_static_f0,ok,,dff_static_f0
+826031,826031_2026-02-11_12-42-21,voltage_extraction_dff_robust_f0,ok,,dff_robust_f0
+826031,826031_2026-02-12_07-43-37,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.88 GiB for an array with shape (252386775,) and data type float64",
+826031,826031_2026-02-12_07-43-37,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 963. MiB for an array with shape (15, 16825785) and data type float32",dff_static_f0
+826031,826031_2026-02-12_07-43-37,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 963. MiB for an array with shape (15, 16825785) and data type float32",dff_robust_f0
+826032,826032_2026-01-29_12-59-37,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.43 GiB for an array with shape (192360270,) and data type float64",
+826032,826032_2026-01-29_12-59-37,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 734. MiB for an array with shape (19236027, 10) and data type float32",dff_static_f0
+826032,826032_2026-01-29_12-59-37,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 734. MiB for an array with shape (19236027, 10) and data type float32",dff_robust_f0
+826032,826032_2026-01-30_16-31-08,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 2.72 GiB for an array with shape (365483810,) and data type float64",
+826032,826032_2026-01-30_16-31-08,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.36 GiB for an array with shape (19, 19235990) and data type float32",dff_static_f0
+826032,826032_2026-01-30_16-31-08,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.36 GiB for an array with shape (19, 19235990) and data type float32",dff_robust_f0
+826032,826032_2026-02-02_08-24-52,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 2.44 GiB for an array with shape (327015672,) and data type float64",
+826032,826032_2026-02-02_08-24-52,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.22 GiB for an array with shape (17, 19236216) and data type float32",dff_static_f0
+826032,826032_2026-02-02_08-24-52,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.22 GiB for an array with shape (17, 19236216) and data type float32",dff_robust_f0
+826032,826032_2026-02-03_16-02-38,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 3.01 GiB for an array with shape (403958835,) and data type float64",
+826032,826032_2026-02-03_16-02-38,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.50 GiB for an array with shape (19236135, 21) and data type float32",dff_static_f0
+826032,826032_2026-02-03_16-02-38,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.50 GiB for an array with shape (19236135, 21) and data type float32",dff_robust_f0
+826032,826032_2026-02-04_13-49-07,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 3.15 GiB for an array with shape (423192704,) and data type float64",
+826032,826032_2026-02-04_13-49-07,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.58 GiB for an array with shape (22, 19236032) and data type float32",dff_static_f0
+826032,826032_2026-02-04_13-49-07,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.58 GiB for an array with shape (22, 19236032) and data type float32",dff_robust_f0
+826032,826032_2026-02-05_13-18-03,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 2.29 GiB for an array with shape (307776128,) and data type float64",
+826032,826032_2026-02-05_13-18-03,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.15 GiB for an array with shape (16, 19236008) and data type float32",dff_static_f0
+826032,826032_2026-02-05_13-18-03,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.15 GiB for an array with shape (16, 19236008) and data type float32",dff_robust_f0
+826032,826032_2026-02-06_11-45-33,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 3.73 GiB for an array with shape (500139120,) and data type float64",
+826032,826032_2026-02-06_11-45-33,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.86 GiB for an array with shape (26, 19236120) and data type float32",dff_static_f0
+826032,826032_2026-02-06_11-45-33,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.86 GiB for an array with shape (26, 19236120) and data type float32",dff_robust_f0
+826032,826032_2026-02-10_13-02-11,voltage_qc,ok,,
+826032,826032_2026-02-10_13-02-11,voltage_extraction_dff_static_f0,ok,,dff_static_f0
+826032,826032_2026-02-10_13-02-11,voltage_extraction_dff_robust_f0,ok,,dff_robust_f0
+826032,826032_2026-02-11_14-46-30,voltage_qc,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 2.29 GiB for an array with shape (307775840,) and data type float64",
+826032,826032_2026-02-11_14-46-30,voltage_extraction_dff_static_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.15 GiB for an array with shape (16, 19235990) and data type float32",dff_static_f0
+826032,826032_2026-02-11_14-46-30,voltage_extraction_dff_robust_f0,error,"numpy.core._exceptions._ArrayMemoryError: Unable to allocate 1.15 GiB for an array with shape (16, 19235990) and data type float32",dff_robust_f0
