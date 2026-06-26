@@ -31,6 +31,7 @@ from vip_slap2_analysis.voltage.postprocess import (
     _discard_mask_for_trace,
     _expected_n_rois,
     _valid_trials_for_dmd,
+    _trace_time_len_for_trial,
     load_voltage_summary_from_asset,
     resolve_voltage_sample_rate_hz,
 )
@@ -96,7 +97,9 @@ def _json_default(obj: Any) -> Any:
 
 
 def _finite_values(x: np.ndarray) -> np.ndarray:
-    arr = np.asarray(x, dtype=float).reshape(-1)
+    # Preserve float32 where possible.  The old dtype=float path converted full
+    # voltage sessions to float64, creating multi-GiB temporaries.
+    arr = np.asarray(x, dtype=np.float32).reshape(-1)
     return arr[np.isfinite(arr)]
 
 
@@ -229,6 +232,7 @@ def collect_dmd_voltage_segments(
     dtype=np.float32,
     trace_mode: str = "trial",
     max_trials: Optional[int] = None,
+    max_points_per_trial_for_metrics: Optional[int] = 1_000_000,
 ) -> Tuple[List[List[np.ndarray]], Dict[str, Any], pd.DataFrame]:
     """Collect valid-trial voltage trace segments for one DMD.
 
@@ -258,15 +262,31 @@ def collect_dmd_voltage_segments(
     segment_lengths: List[int] = []
 
     for trial in valid_trials:
+        try:
+            n_samples_raw = int(_trace_time_len_for_trial(vs, dmd=dmd, trial=trial, trace_mode=trace_mode))
+        except Exception:
+            n_samples_raw = -1
+
+        metric_stride = 1
+        if (
+            max_points_per_trial_for_metrics is not None
+            and n_samples_raw > int(max_points_per_trial_for_metrics)
+            and int(max_points_per_trial_for_metrics) > 0
+        ):
+            metric_stride = int(np.ceil(n_samples_raw / int(max_points_per_trial_for_metrics)))
+        read_slice = slice(None, None, metric_stride)
+
         x = vs.get_roi_traces(
             dmd=dmd,
             trial=trial,
+            t_slice=read_slice,
             drop_discarded=False,
             dtype=dtype,
             trace_mode=trace_mode,
         )
         x = _as_time_by_roi(x, expected_n_rois=n_rois, dmd=dmd, trial=trial)
-        n_samples_raw = int(x.shape[0])
+        if n_samples_raw < 0:
+            n_samples_raw = int(x.shape[0]) if metric_stride == 1 else int(x.shape[0] * metric_stride)
         discard_fraction = 0.0
         n_discarded = 0
 
@@ -274,9 +294,16 @@ def collect_dmd_voltage_segments(
             discard = _discard_mask_for_trace(vs, dmd=dmd, trial=trial, n_samples=n_samples_raw)
             n_discarded = int(np.sum(discard))
             discard_fraction = float(n_discarded / n_samples_raw) if n_samples_raw else np.nan
-            x = x[~discard, :]
+            discard_sample = discard[read_slice]
+            if discard_sample.size != x.shape[0]:
+                aligned = np.zeros((x.shape[0],), dtype=bool)
+                n_copy = min(int(discard_sample.size), int(x.shape[0]))
+                aligned[:n_copy] = discard_sample[:n_copy]
+                discard_sample = aligned
+            x = x[~discard_sample, :]
 
-        n_samples = int(x.shape[0])
+        n_samples = int(n_samples_raw - n_discarded)
+        n_samples_loaded = int(x.shape[0])
         segment_lengths.append(n_samples)
 
         trial_rows.append(
@@ -286,6 +313,9 @@ def collect_dmd_voltage_segments(
                 "valid_trial": True,
                 "n_samples_raw": n_samples_raw,
                 "n_samples": n_samples,
+                "n_samples_loaded_for_metrics": n_samples_loaded,
+                "metrics_stride": int(metric_stride),
+                "metrics_are_downsampled": bool(metric_stride > 1),
                 "n_rois": int(x.shape[1]),
                 "n_discarded_samples": n_discarded,
                 "discard_fraction": discard_fraction,
@@ -313,6 +343,7 @@ def collect_dmd_voltage_segments(
         "min_valid_trial_length": int(np.min(segment_lengths)) if segment_lengths else 0,
         "max_valid_trial_length": int(np.max(segment_lengths)) if segment_lengths else 0,
         "total_valid_samples_per_roi": int(np.sum(segment_lengths)) if segment_lengths else 0,
+        "max_points_per_trial_for_metrics": (int(max_points_per_trial_for_metrics) if max_points_per_trial_for_metrics is not None else None),
     }
     return roi_segments, dmd_info, pd.DataFrame(trial_rows)
 
@@ -679,6 +710,7 @@ def run_voltage_qc(
     score_weights: Optional[Dict[str, float]] = None,
     score_params: Optional[Dict[str, float]] = None,
     max_trials_for_metrics: Optional[int] = None,
+    max_points_per_trial_for_metrics: Optional[int] = 1_000_000,
     max_points_per_segment_for_snr: Optional[int] = 60_000,
     overwrite: bool = False,
     make_plots: bool = True,
@@ -704,6 +736,10 @@ def run_voltage_qc(
         Remove samples marked by ``discardFrames`` before computing metrics.
     max_trials_for_metrics
         Optional development/debug limit. Leave ``None`` for full-session QC.
+    max_points_per_trial_for_metrics
+        Optional cap on samples loaded per trial for first-pass metrics.  Long
+        voltage sessions are decimated by stride for QC metrics to avoid
+        materializing multi-GiB arrays.
     max_points_per_segment_for_snr
         Optional cap for the residual-SNR calculation only. Other metrics use all
         loaded samples. Set to ``None`` to use complete segments.
@@ -784,6 +820,7 @@ def run_voltage_qc(
                 dtype=dtype,
                 trace_mode=trace_mode,
                 max_trials=max_trials_for_metrics,
+                max_points_per_trial_for_metrics=max_points_per_trial_for_metrics,
             )
             dmd_summary[label] = dmd_info
             if not trial_df.empty:

@@ -13,6 +13,8 @@ shared event-alignment machinery.
 from __future__ import annotations
 
 from pathlib import Path
+import tempfile
+import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -184,6 +186,53 @@ def concat_rois_across_trials(
     ]
     return roi_traces, trial_slices
 
+
+
+def _normalize_trace_mode_for_lengths(vs, trace_mode: str) -> str:
+    """Resolve ``auto`` to the concrete split-H5 trace mode without loading traces."""
+    mode = str(trace_mode or "auto").lower()
+    if mode != "auto":
+        return mode
+    try:
+        modes = vs.available_trace_modes()
+        return "trial" if "trial" in modes else "continuous"
+    except Exception:
+        return mode
+
+
+def _trace_time_len_for_trial(vs, *, dmd: int, trial: int, trace_mode: str) -> int:
+    """Return trace length along time without materializing the trace when possible."""
+    mode = _normalize_trace_mode_for_lengths(vs, trace_mode)
+    if getattr(vs, "layout", None) == "split_h5" or getattr(vs, "_summary_layout", None) == "split_h5":
+        ds = vs.get_trace_dataset(dmd=dmd, trial=trial, trace_mode=mode)
+        n_expected = int(vs.n_total_rois) if mode == "trial" else int(vs.n_rois[int(dmd) - 1])
+        return int(vs._infer_time_len_from_split_dataset(ds, n_expected))
+
+    # Fallback for older summary layouts.  These are usually much smaller, and
+    # this path preserves backward compatibility where no lazy dataset handle is
+    # available.
+    x = vs.get_roi_traces(dmd=dmd, trial=trial, dtype=None, trace_mode=trace_mode)
+    x = _as_time_by_roi(x, expected_n_rois=_expected_n_rois(vs, dmd), dmd=dmd, trial=trial)
+    return int(x.shape[0])
+
+
+def _allocate_roi_time_array(
+    *,
+    shape: Tuple[int, int],
+    dtype,
+    fill_value: float = np.nan,
+    memmap_threshold_bytes: int = 512 * 1024 ** 2,
+    prefix: str = "vip_slap2_voltage_traces_",
+) -> np.ndarray:
+    """Allocate an ROI-by-time array, spilling large arrays to disk-backed memmap."""
+    dtype = np.dtype(dtype)
+    nbytes = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+    if nbytes >= int(memmap_threshold_bytes):
+        path = Path(tempfile.gettempdir()) / f"{prefix}{uuid.uuid4().hex}.npy"
+        arr = np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=tuple(shape))
+        arr[:] = fill_value
+        return arr
+    return np.full(tuple(shape), fill_value, dtype=dtype)
 
 def _load_valid_voltage_trials(
     vs,
@@ -389,15 +438,21 @@ def reconstruct_voltage_dmd_session_traces(
 
     n_trials = int(vs.n_trials)
     n_rois = _expected_n_rois(vs, dmd)
-    trial_data, valid_lengths = _load_valid_voltage_trials(
-        vs,
-        dmd=dmd,
-        drop_discarded=drop_discarded,
-        dtype=dtype,
-        trace_mode=trace_mode,
-    )
+    valid_trials = set(_valid_trials_for_dmd(vs, dmd))
+    valid_lengths_by_trial: Dict[int, int] = {}
+    valid_lengths: List[int] = []
 
-    if not trial_data:
+    for trial in sorted(valid_trials):
+        n_raw = _trace_time_len_for_trial(vs, dmd=dmd, trial=trial, trace_mode=trace_mode)
+        if drop_discarded:
+            discard = _discard_mask_for_trace(vs, dmd=dmd, trial=trial, n_samples=n_raw)
+            n_kept = int(np.sum(~discard))
+        else:
+            n_kept = int(n_raw)
+        valid_lengths_by_trial[int(trial)] = n_kept
+        valid_lengths.append(n_kept)
+
+    if not valid_lengths:
         return ReconstructedTraceBundle(
             traces=np.empty((n_rois, 0), dtype=dtype),
             timebase_sec=np.empty((0,), dtype=float),
@@ -412,11 +467,11 @@ def reconstruct_voltage_dmd_session_traces(
 
     default_len = int(round(float(np.median(valid_lengths))))
     trial_lengths = np.full((n_trials,), default_len, dtype=int)
-    for trial, x in trial_data.items():
-        trial_lengths[trial - 1] = int(x.shape[0])
+    for trial, length in valid_lengths_by_trial.items():
+        trial_lengths[trial - 1] = int(length)
 
     total_samples = int(np.sum(trial_lengths))
-    traces = np.full((n_rois, total_samples), np.nan, dtype=dtype)
+    traces = _allocate_roi_time_array(shape=(n_rois, total_samples), dtype=dtype)
     trial_valid_mask = np.zeros((n_trials,), dtype=bool)
     trial_starts_sec = np.zeros((n_trials,), dtype=float)
 
@@ -456,11 +511,42 @@ def reconstruct_voltage_dmd_session_traces(
         else:
             trial_starts_sec[trial - 1] = float(epoch_start_sec + pos / alignment_rate_hz)
 
-        if trial in trial_data:
-            x = trial_data[trial]
-            n_time = min(length, int(x.shape[0]))
-            n_roi = min(n_rois, int(x.shape[1]))
-            traces[:n_roi, pos:pos + n_time] = x[:n_time, :n_roi].T
+        if trial in valid_lengths_by_trial:
+            n_raw = _trace_time_len_for_trial(vs, dmd=dmd, trial=trial, trace_mode=trace_mode)
+            if drop_discarded:
+                discard = _discard_mask_for_trace(vs, dmd=dmd, trial=trial, n_samples=n_raw)
+            else:
+                discard = None
+
+            dst_cursor = 0
+            chunk_samples = 262_144
+            for src_start in range(0, int(n_raw), chunk_samples):
+                src_stop = min(int(n_raw), src_start + chunk_samples)
+                x = vs.get_roi_traces(
+                    dmd=dmd,
+                    trial=trial,
+                    t_slice=slice(src_start, src_stop),
+                    drop_discarded=False,
+                    dtype=dtype,
+                    trace_mode=trace_mode,
+                )
+                x = _as_time_by_roi(x, expected_n_rois=n_rois, dmd=dmd, trial=trial)
+                if discard is not None:
+                    keep = ~discard[src_start:src_stop]
+                    if keep.size != x.shape[0]:
+                        aligned_keep = np.zeros((x.shape[0],), dtype=bool)
+                        n_copy = min(int(keep.size), int(x.shape[0]))
+                        aligned_keep[:n_copy] = keep[:n_copy]
+                        keep = aligned_keep
+                    x = x[keep, :]
+                if x.size == 0:
+                    continue
+                n_time = min(int(x.shape[0]), length - dst_cursor)
+                if n_time <= 0:
+                    break
+                n_roi = min(n_rois, int(x.shape[1]))
+                traces[:n_roi, pos + dst_cursor:pos + dst_cursor + n_time] = x[:n_time, :n_roi].T
+                dst_cursor += n_time
             trial_valid_mask[trial - 1] = True
 
         pos += length
@@ -479,6 +565,8 @@ def reconstruct_voltage_dmd_session_traces(
         "n_trials_total": int(n_trials),
         "n_trials_valid": int(np.sum(trial_valid_mask)),
         "n_samples_total": int(total_samples),
+        "traces_storage": "memmap" if isinstance(traces, np.memmap) else "memory",
+        "traces_memmap_path": str(getattr(traces, "filename", "")) if isinstance(traces, np.memmap) else None,
     })
 
     return ReconstructedTraceBundle(

@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+import tempfile
+import uuid
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
 
 import h5py
@@ -183,6 +185,194 @@ def _restore_trace_dim(arr: np.ndarray, was_1d: bool) -> np.ndarray:
         return np.asarray(arr[0], dtype=np.float32)
     return np.asarray(arr, dtype=np.float32)
 
+
+
+def _array_nbytes(shape: Sequence[int], dtype: np.dtype = np.float32) -> int:
+    """Return byte size for an array shape/dtype without allocating it."""
+    return int(np.prod(tuple(int(x) for x in shape), dtype=np.int64)) * np.dtype(dtype).itemsize
+
+
+def _allocate_transform_array(
+    shape: Sequence[int],
+    *,
+    dtype: np.dtype = np.float32,
+    memmap_threshold_bytes: int = 512 * 1024 ** 2,
+    prefix: str = "vip_slap2_voltage_transform_",
+) -> np.ndarray:
+    """Allocate a transform array, using a disk-backed memmap for large sessions."""
+    shape = tuple(int(x) for x in shape)
+    dtype = np.dtype(dtype)
+    if _array_nbytes(shape, dtype) >= int(memmap_threshold_bytes):
+        path = Path(tempfile.gettempdir()) / f"{prefix}{uuid.uuid4().hex}.npy"
+        return np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
+    return np.empty(shape, dtype=dtype)
+
+
+def _fit_static_f0_model(raw: np.ndarray, *, percentile: float) -> Dict[str, Any]:
+    """Fit a per-ROI constant F0 model without expanding it over time."""
+    raw2, _was_1d = _as_trace_2d(raw)
+    n_rois = int(raw2.shape[0])
+    f0_roi = np.empty((n_rois,), dtype=np.float32)
+    eps = np.float32(np.finfo(np.float32).eps)
+    for r in range(n_rois):
+        x = np.asarray(raw2[r, :], dtype=np.float32)
+        with np.errstate(all="ignore"):
+            f0_val = np.nanpercentile(x, float(percentile)).astype(np.float32)
+            fallback = np.nanmedian(np.abs(x)).astype(np.float32)
+        if not np.isfinite(fallback) or fallback <= eps:
+            fallback = np.float32(1.0)
+        if not np.isfinite(f0_val) or abs(float(f0_val)) <= float(eps):
+            f0_val = fallback
+        f0_roi[r] = np.float32(f0_val)
+    return {
+        "f0_method": "static_percentile",
+        "f0_percentile": float(percentile),
+        "f0_is_time_varying": False,
+        "f0_per_roi": f0_roi,
+    }
+
+
+def _fit_robust_f0_model(
+    raw: np.ndarray,
+    *,
+    sample_rate_hz: float,
+    percentile: float,
+    bin_sec: float,
+    smooth_sec: float,
+) -> Dict[str, Any]:
+    """Fit the robust binned F0 model without materializing full-resolution F0."""
+    raw2, _was_1d = _as_trace_2d(raw)
+    n_rois, n_samples = map(int, raw2.shape)
+    rate = float(sample_rate_hz)
+    if not np.isfinite(rate) or rate <= 0:
+        raise ValueError(f"sample_rate_hz must be positive, got {sample_rate_hz!r}")
+
+    bin_samples = max(1, int(round(float(bin_sec) * rate)))
+    n_bins = int(np.ceil(n_samples / bin_samples))
+    if n_bins <= 1:
+        return _fit_static_f0_model(raw2, percentile=percentile)
+
+    bin_centers = np.empty(n_bins, dtype=np.float64)
+    bin_f0 = np.full((n_rois, n_bins), np.nan, dtype=np.float32)
+    for b in range(n_bins):
+        start = b * bin_samples
+        stop = min(n_samples, (b + 1) * bin_samples)
+        if stop <= start:
+            continue
+        bin_centers[b] = (start + stop - 1) / 2.0
+        x = np.asarray(raw2[:, start:stop], dtype=np.float32)
+        with np.errstate(all="ignore"):
+            bin_f0[:, b] = np.nanpercentile(x, float(percentile), axis=1).astype(np.float32)
+
+    smooth_bins = max(1, int(round(float(smooth_sec) / float(bin_sec))))
+    if smooth_bins % 2 == 0:
+        smooth_bins += 1
+
+    f0_roi_median = np.nanmedian(np.abs(bin_f0), axis=1).astype(np.float32)
+    bad_fallback = ~np.isfinite(f0_roi_median) | (f0_roi_median <= np.finfo(np.float32).eps)
+    f0_roi_median[bad_fallback] = np.float32(1.0)
+
+    smoothed_bins = np.full_like(bin_f0, np.nan, dtype=np.float32)
+    for r in range(n_rois):
+        filled = _fill_nan_1d(bin_f0[r], fallback=float(f0_roi_median[r]))
+        smoothed = _nanmoving_median_1d(filled, smooth_bins)
+        smoothed_bins[r] = _fill_nan_1d(smoothed, fallback=float(f0_roi_median[r]))
+
+    return {
+        "f0_method": "robust_binned_percentile_moving_median",
+        "f0_percentile": float(percentile),
+        "f0_bin_sec": float(bin_sec),
+        "f0_smooth_sec": float(smooth_sec),
+        "f0_bin_samples": int(bin_samples),
+        "f0_smooth_bins": int(smooth_bins),
+        "f0_n_bins": int(n_bins),
+        "f0_is_time_varying": True,
+        "f0_bin_centers_sample": bin_centers.astype(np.float64),
+        "f0_bin_values": smoothed_bins.astype(np.float32),
+    }
+
+
+def _fit_f0_model_chunked(
+    raw: np.ndarray,
+    *,
+    sample_rate_hz: float,
+    method: str,
+    percentile: float,
+    robust_bin_sec: float,
+    robust_smooth_sec: float,
+) -> Dict[str, Any]:
+    """Fit a compact F0 model for static or robust voltage dF/F."""
+    m = str(method).lower().replace(" ", "_")
+    if m in {"static", "static_f0", "static_percentile"}:
+        meta = _fit_static_f0_model(raw, percentile=percentile)
+    elif m in {"robust", "robust_f0", "robust_baseline"}:
+        meta = _fit_robust_f0_model(
+            raw,
+            sample_rate_hz=sample_rate_hz,
+            percentile=percentile,
+            bin_sec=robust_bin_sec,
+            smooth_sec=robust_smooth_sec,
+        )
+    else:
+        raise ValueError("method must be 'static' or 'robust'")
+    meta.update({
+        "sample_rate_hz": float(sample_rate_hz),
+        "input_shape": tuple(int(x) for x in np.asarray(raw).shape),
+        "f0_storage": "compact_model",
+    })
+    return meta
+
+
+def _f0_chunk_from_model(model: Mapping[str, Any], *, start: int, stop: int, n_samples: int) -> np.ndarray:
+    """Materialize one ROI-by-time F0 chunk from a compact model."""
+    method = str(model.get("f0_method", ""))
+    start = int(start)
+    stop = int(stop)
+    if method == "static_percentile":
+        f0_roi = np.asarray(model["f0_per_roi"], dtype=np.float32).reshape(-1)
+        return np.repeat(f0_roi[:, None], max(0, stop - start), axis=1).astype(np.float32, copy=False)
+
+    if method == "robust_binned_percentile_moving_median":
+        centers = np.asarray(model["f0_bin_centers_sample"], dtype=np.float64).reshape(-1)
+        values = np.asarray(model["f0_bin_values"], dtype=np.float32)
+        sample_idx = np.arange(start, stop, dtype=np.float64)
+        out = np.empty((values.shape[0], sample_idx.size), dtype=np.float32)
+        for r in range(values.shape[0]):
+            out[r, :] = np.interp(sample_idx, centers, values[r]).astype(np.float32)
+        return out
+
+    raise ValueError(f"Unsupported compact F0 model method: {method!r}")
+
+
+def _compute_dff_from_f0_model_chunked(
+    raw: np.ndarray,
+    f0_model: Mapping[str, Any],
+    *,
+    chunk_samples: int = 262_144,
+) -> np.ndarray:
+    """Compute ASAP-polarity-corrected dF/F in chunks."""
+    raw2, was_1d = _as_trace_2d(raw)
+    n_rois, n_samples = map(int, raw2.shape)
+    out = _allocate_transform_array((n_rois, n_samples), dtype=np.float32)
+    for start in range(0, n_samples, int(chunk_samples)):
+        stop = min(n_samples, start + int(chunk_samples))
+        raw_chunk = np.asarray(raw2[:, start:stop], dtype=np.float32)
+        f0_chunk = _f0_chunk_from_model(f0_model, start=start, stop=stop, n_samples=n_samples)
+        f0_chunk = _safe_f0_values(f0_chunk, raw_chunk)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out[:, start:stop] = (f0_chunk - raw_chunk) / f0_chunk
+    return _restore_trace_dim(out, was_1d)
+
+
+def _metadata_without_large_arrays(meta: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return JSON-friendly metadata without embedding large F0 model arrays."""
+    out = dict(meta)
+    for key in ("f0_per_roi", "f0_bin_centers_sample", "f0_bin_values"):
+        if key in out:
+            arr = np.asarray(out[key])
+            out[f"{key}_shape"] = tuple(int(x) for x in arr.shape)
+            out.pop(key, None)
+    return out
 
 def _safe_f0_values(f0: np.ndarray, raw_f: np.ndarray) -> np.ndarray:
     """Guard against invalid or near-zero F0 values.
@@ -482,12 +672,9 @@ def _transform_voltage_bundle(
 ) -> Tuple[ReconstructedTraceBundle, Dict[str, Any], Optional[Dict[str, Any]]]:
     """Apply an optional voltage transform to a reconstructed bundle.
 
-    Returns
-    -------
-    transformed_bundle, transform_metadata, transform_payload
-        ``transform_payload`` is ``None`` for raw extraction.  For dF/F methods,
-        it contains ``raw_f``, ``f0``, and ``dff`` arrays for optional session-
-        trace export.
+    dF/F transforms are computed from a compact F0 model and materialized in
+    chunks.  This avoids keeping full-session ``raw_f``, ``f0``, and ``dff``
+    arrays in RAM simultaneously for long voltage recordings.
     """
     output_signal, f0_method = _parse_trace_signal(trace_signal)
     if output_signal == "raw_f":
@@ -497,21 +684,91 @@ def _transform_voltage_bundle(
             "transform": "none",
         }, None
 
-    transformed = transform_voltage_signal(
-        np.asarray(bundle.traces, dtype=np.float32),
+    f0_model = _fit_f0_model_chunked(
+        bundle.traces,
         sample_rate_hz=sample_rate_hz,
         method=str(f0_method),
         percentile=f0_percentile,
         robust_bin_sec=robust_f0_bin_sec,
         robust_smooth_sec=robust_f0_smooth_sec,
     )
-    out = replace(bundle, traces=np.asarray(transformed["dff"], dtype=np.float32))
-    meta = dict(transformed["metadata"])
-    meta.update({
+    dff = _compute_dff_from_f0_model_chunked(bundle.traces, f0_model)
+    out = replace(bundle, traces=np.asarray(dff, dtype=np.float32))
+    meta = {
+        "trace_signal": f"dff_{f0_method}_f0",
         "trace_signal_requested": trace_signal,
         "output_signal": "dff",
-    })
-    return out, meta, transformed
+        "transform": "dff = (F0 - F) / F0",
+        "polarity": "ASAP/inverse fluorescence corrected; positive dff corresponds to fluorescence decrease",
+        "chunked_transform": True,
+        **_metadata_without_large_arrays(f0_model),
+    }
+    payload = {
+        "raw_f": bundle.traces,
+        "dff": out.traces,
+        "f0_model": f0_model,
+    }
+    return out, meta, payload
+
+
+def _write_h5_2d_chunked(
+    group: h5py.Group,
+    name: str,
+    arr: np.ndarray,
+    *,
+    dtype: np.dtype,
+    compression: Optional[str],
+    compression_opts: Optional[int],
+    chunk_samples: int = 8192,
+) -> h5py.Dataset:
+    """Write an ROI-by-time array to HDF5 without materializing a second copy."""
+    arr2, _was_1d = _as_trace_2d(arr)
+    chunks = (1, max(1, min(int(arr2.shape[1]), int(chunk_samples)))) if arr2.size else None
+    ds = group.create_dataset(
+        name,
+        shape=arr2.shape,
+        dtype=np.dtype(dtype),
+        chunks=chunks,
+        compression=compression,
+        compression_opts=compression_opts,
+        shuffle=(compression is not None),
+    )
+    for start in range(0, int(arr2.shape[1]), int(chunk_samples)):
+        stop = min(int(arr2.shape[1]), start + int(chunk_samples))
+        ds[:, start:stop] = np.asarray(arr2[:, start:stop], dtype=dtype)
+    return ds
+
+
+def _write_h5_f0_from_model(
+    group: h5py.Group,
+    name: str,
+    model: Mapping[str, Any],
+    *,
+    n_samples: int,
+    dtype: np.dtype,
+    compression: Optional[str],
+    compression_opts: Optional[int],
+    chunk_samples: int = 8192,
+) -> h5py.Dataset:
+    """Write full-resolution F0 to HDF5 from a compact model in chunks."""
+    if "f0_per_roi" in model:
+        n_rois = int(np.asarray(model["f0_per_roi"]).reshape(-1).size)
+    else:
+        n_rois = int(np.asarray(model["f0_bin_values"]).shape[0])
+    chunks = (1, max(1, min(int(n_samples), int(chunk_samples)))) if n_samples else None
+    ds = group.create_dataset(
+        name,
+        shape=(n_rois, int(n_samples)),
+        dtype=np.dtype(dtype),
+        chunks=chunks,
+        compression=compression,
+        compression_opts=compression_opts,
+        shuffle=(compression is not None),
+    )
+    for start in range(0, int(n_samples), int(chunk_samples)):
+        stop = min(int(n_samples), start + int(chunk_samples))
+        ds[:, start:stop] = _f0_chunk_from_model(model, start=start, stop=stop, n_samples=n_samples).astype(dtype, copy=False)
+    return ds
 
 
 def _write_session_transform_group(
@@ -529,13 +786,19 @@ def _write_session_transform_group(
 ) -> None:
     """Write full-session raw/F0/dFF traces for one DMD.
 
-    Datasets are ROI-by-time, matching ``ReconstructedTraceBundle.traces``.
-    For raw extraction, only ``raw_f`` is written.  For dF/F extraction,
-    ``raw_f``, ``f0``, and ``dff`` are written.
+    Datasets are written chunk-by-chunk so long voltage sessions do not require a
+    second full-size in-memory array during HDF5 export.
     """
     grp = h5.create_group(dmd_key)
     grp.attrs["schema"] = "ROI-by-time full-session voltage traces"
     grp.attrs["signal_transform_json"] = json.dumps(transform_meta, default=_json_default)
+    if transform_payload is not None and "f0_model" in transform_payload:
+        grp.attrs["f0_model_json"] = json.dumps(_metadata_without_large_arrays(transform_payload["f0_model"]), default=_json_default)
+        model_grp = grp.create_group("f0_model")
+        model = transform_payload["f0_model"]
+        for key in ("f0_per_roi", "f0_bin_centers_sample", "f0_bin_values"):
+            if key in model:
+                model_grp.create_dataset(key, data=np.asarray(model[key]))
     if getattr(bundle, "metadata", None):
         grp.attrs["reconstruction_metadata_json"] = json.dumps(bundle.metadata, default=_json_default)
     grp.attrs["session_start_sec"] = float(bundle.session_start_sec)
@@ -549,27 +812,51 @@ def _write_session_transform_group(
     grp.create_dataset("trial_starts_sec", data=np.asarray(bundle.trial_starts_sec, dtype=np.float64))
 
     if transform_payload is None:
-        arrays = {"raw_f": np.asarray(bundle.traces, dtype=np.float32)}
-    else:
-        arrays = {
-            "raw_f": np.asarray(transform_payload["raw_f"], dtype=np.float32),
-            "f0": np.asarray(transform_payload["f0"], dtype=np.float32),
-            "dff": np.asarray(transform_payload["dff"], dtype=np.float32),
-        }
-
-    for name, arr in arrays.items():
-        if arr.ndim == 1:
-            arr = arr[None, :]
-        chunks = (1, max(1, min(arr.shape[1], 8192))) if arr.size else None
-        grp.create_dataset(
-            name,
-            data=arr.astype(dtype, copy=False),
-            dtype=np.dtype(dtype),
-            chunks=chunks,
+        _write_h5_2d_chunked(
+            grp,
+            "raw_f",
+            bundle.traces,
+            dtype=dtype,
             compression=compression,
             compression_opts=compression_opts,
-            shuffle=(compression is not None),
         )
+        return
+
+    _write_h5_2d_chunked(
+        grp,
+        "raw_f",
+        np.asarray(transform_payload["raw_f"]),
+        dtype=dtype,
+        compression=compression,
+        compression_opts=compression_opts,
+    )
+    if "f0_model" in transform_payload:
+        _write_h5_f0_from_model(
+            grp,
+            "f0",
+            transform_payload["f0_model"],
+            n_samples=int(np.asarray(transform_payload["raw_f"]).shape[1]),
+            dtype=dtype,
+            compression=compression,
+            compression_opts=compression_opts,
+        )
+    elif "f0" in transform_payload:
+        _write_h5_2d_chunked(
+            grp,
+            "f0",
+            np.asarray(transform_payload["f0"]),
+            dtype=dtype,
+            compression=compression,
+            compression_opts=compression_opts,
+        )
+    _write_h5_2d_chunked(
+        grp,
+        "dff",
+        np.asarray(transform_payload["dff"]),
+        dtype=dtype,
+        compression=compression,
+        compression_opts=compression_opts,
+    )
 
 
 def load_voltage_roi_transform_h5(
