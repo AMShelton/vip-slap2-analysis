@@ -177,16 +177,30 @@ def detect_imaging_epochs(signal, time, gap_threshold=0.05, min_duration=5.0, mo
 
 
 def _get_di3_and_time(harp_df: pd.DataFrame, acq_time=None) -> Tuple[np.ndarray, np.ndarray]:
-    """Resolve DI3 and time vectors from a HARP dataframe."""
+    """Resolve DI3 and a zero-referenced HARP time vector.
+
+    ``harp_df["time"]`` stores the absolute HARP clock in many extracted CSVs.
+    Corrected Bonsai timestamps produced by ``correct_event_log`` are relative to
+    the HARP photodiode recording start, so epoch detection must operate on the
+    zero-referenced acquisition time supplied by ``load_harp_df`` whenever it is
+    available.  Using the absolute HARP clock here silently puts epoch bounds in
+    a different timebase than corrected events and yields zero event coverage.
+    """
     if "DI3" not in harp_df.columns:
         raise ValueError("harp_df must contain a DI3 column")
     signal = harp_df["DI3"].to_numpy()
-    if "time" in harp_df.columns:
-        time = harp_df["time"].to_numpy(dtype=float)
-    elif acq_time is not None:
-        time = np.asarray(acq_time, dtype=float)
+
+    if acq_time is not None:
+        time = np.asarray(acq_time, dtype=float).reshape(-1)
+    elif "time" in harp_df.columns:
+        raw_time = harp_df["time"].to_numpy(dtype=float).reshape(-1)
+        time = raw_time - float(raw_time[0]) if raw_time.size else raw_time
     else:
-        time = harp_df.index.to_numpy(dtype=float)
+        raw_time = harp_df.index.to_numpy(dtype=float).reshape(-1)
+        time = raw_time - float(raw_time[0]) if raw_time.size else raw_time
+
+    if time.size != signal.size:
+        raise ValueError(f"DI3/time length mismatch: {signal.size} vs {time.size}")
     return signal, time
 
 
@@ -238,12 +252,24 @@ def shift_epochs_to_photodiode_time(
     harp_df: pd.DataFrame,
     photodiode_df: pd.DataFrame,
 ) -> List[List[float]]:
-    """Shift detected HARP epochs into the photodiode time coordinate system."""
+    """Shift detected HARP-relative epochs into photodiode-relative seconds.
+
+    ``correct_event_log`` detects HARP photodiode edges from
+    ``photodiode_df.index - photodiode_df.index[0]``.  The epoch CSV must use the
+    same relative coordinate system.  Therefore, after epoch detection on
+    zero-referenced HARP digital-input time, add the small offset between the
+    HARP digital input start and the photodiode analog input start.
+    """
     if len(epochs) == 0:
         return []
-    harp_start = float(harp_df["time"].iloc[0]) if "time" in harp_df.columns else float(harp_df.index[0])
+
+    if "time" in harp_df.columns:
+        harp_start = float(harp_df["time"].iloc[0])
+    else:
+        harp_start = float(harp_df.index[0])
     pd_start = float(photodiode_df.index[0])
-    offset = pd_start - harp_start
+    offset = harp_start - pd_start
+
     out = [list(e) for e in epochs]
     for e in out:
         e[2] = float(e[2]) + offset

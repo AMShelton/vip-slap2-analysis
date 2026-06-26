@@ -17,7 +17,7 @@ import pandas as pd
 
 DEFAULT_EVENT_TIME_COLUMN = "corrected_timestamps"
 DEFAULT_EVENT_VALUE_COLUMN = "Value"
-DEFAULT_SPECIAL_EVENTS = ("ChangeFlash", "Omission")
+DEFAULT_SPECIAL_EVENTS = ("ChangeFlash", "Change", "Omission")
 
 
 def load_bonsai_event_log(csv_path: str | Path) -> pd.DataFrame:
@@ -134,6 +134,14 @@ def extract_stimulus_events_from_bonsai(
         for event_name in special_events
     }
 
+    change_times = sorted(
+        [
+            float(t)
+            for name in ("ChangeFlash", "Change")
+            for t in special_event_times.get(name, [])
+        ]
+    )
+
     return {
         "time_source_column": time_col,
         "value_source_column": value_col,
@@ -143,7 +151,7 @@ def extract_stimulus_events_from_bonsai(
         "ordered_image_times_s": ordered_image_times,
         "unique_image_values": unique_image_values,
         "image_times_by_value_s": image_times_by_value,
-        "change_times_s": special_event_times.get("Change", []),
+        "change_times_s": change_times,
         "omission_times_s": special_event_times.get("Omission", []),
         "special_event_times_s": special_event_times,
     }

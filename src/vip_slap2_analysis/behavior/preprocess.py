@@ -267,7 +267,7 @@ def process_behavior_session(
     pulse_diag = {}
     if epoch_detection_method.lower() == "pulse_train":
         sig = harp_df["DI3"].to_numpy()
-        t = harp_df["time"].to_numpy(dtype=float) if "time" in harp_df.columns else np.asarray(acq_time, dtype=float)
+        t = np.asarray(acq_time, dtype=float)
         _epochs_raw, pulse_diag = detect_pulse_train_epochs(
             sig,
             t,
