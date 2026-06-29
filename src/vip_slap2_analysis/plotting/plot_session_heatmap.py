@@ -18,7 +18,6 @@ import pandas as pd
 from matplotlib.gridspec import GridSpec
 from scipy.cluster.hierarchy import leaves_list, linkage
 from scipy.ndimage import gaussian_filter1d
-from scipy.signal import medfilt
 from scipy.spatial.distance import pdist
 from sklearn.decomposition import PCA
 
@@ -29,6 +28,7 @@ from vip_slap2_analysis.common.alignment import (
     load_imaging_epochs_csv,
 )
 from vip_slap2_analysis.glutamate.summary import GlutamateSummary
+from vip_slap2_analysis.behavior.encoder import compute_encoder_velocity
 
 
 IM_COLORS = [
@@ -207,11 +207,21 @@ def load_running_speed(
     absolute_speed: bool = True,
     ticks_per_revolution: Optional[float] = None,
     smooth_speed_sigma: Optional[float] = 3.0,
-    time_zero: str = "first_sample",   # NEW
-    time_offset_sec: float = 0.0,      # NEW
+    time_zero: str = "first_sample",
+    time_offset_sec: float = 0.0,
+    unwrap_position="auto",
+    counter_period: Optional[float] = None,
+    counter_bits: Optional[int] = None,
+    max_abs_speed: Optional[float] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Load encoder data and convert to running speed.
+
+    This is a thin plotting wrapper around
+    :func:`vip_slap2_analysis.behavior.encoder.compute_encoder_velocity`.
+    HARP encoder files are usually signed int16 modular counters; the underlying
+    helper unwraps those counters before differentiating so int16 rollover does
+    not appear as enormous running-speed impulses.
 
     Parameters
     ----------
@@ -222,6 +232,13 @@ def load_running_speed(
         - "none": keep raw encoder timestamps
     time_offset_sec :
         Additional offset applied after zeroing.
+    unwrap_position, counter_period, counter_bits :
+        Passed through to ``compute_encoder_velocity``. The default ``"auto"``
+        unwraps integer encoder columns using their dtype width, e.g. int16 ->
+        a 65536-count period.
+    max_abs_speed :
+        Optional artifact guard in the requested speed units. Values larger than
+        this are set to NaN before final smoothing.
     """
     if encoder_path is None:
         if getattr(asset, "photodiode_pkl", None) is None:
@@ -232,76 +249,47 @@ def load_running_speed(
     if not encoder_path.exists():
         raise FileNotFoundError(f"Encoder file not found: {encoder_path}")
 
-    df = pd.read_pickle(encoder_path)
-    if encoder_col not in df.columns:
-        raise KeyError(f"Encoder column '{encoder_col}' not found in {encoder_path}")
-
-    raw_time = df.index.to_numpy(dtype=float)
-    pos = df[encoder_col].to_numpy(dtype=float)
-
-    if raw_time.size == 0:
-        return {"time_sec": np.array([]), "speed": np.array([]), "path": str(encoder_path)}
-
-    if time_zero == "first_sample":
-        time_sec = raw_time - raw_time[0]
-    elif time_zero == "session_start":
-        time_sec = raw_time - float(session_start_sec)
-    elif time_zero == "none":
-        time_sec = raw_time.copy()
+    if speed_units == "cm/s":
+        max_abs_linear_velocity_cm_s = max_abs_speed
+    elif speed_units == "m/s":
+        max_abs_linear_velocity_cm_s = None if max_abs_speed is None else float(max_abs_speed) * 100.0
     else:
-        raise ValueError("time_zero must be one of: 'first_sample', 'session_start', 'none'")
+        raise ValueError("speed_units must be 'cm/s' or 'm/s'")
 
-    time_sec = time_sec + float(time_offset_sec)
+    vel = compute_encoder_velocity(
+        encoder_path=encoder_path,
+        encoder_col=encoder_col,
+        wheel_radius_cm=wheel_radius_cm,
+        encoder_units=encoder_units,
+        ticks_per_revolution=ticks_per_revolution,
+        session_start_sec=session_start_sec,
+        time_zero=time_zero,
+        time_offset_sec=time_offset_sec,
+        median_filter_kernel=median_filter_kernel,
+        smooth_sigma_samples=smooth_speed_sigma,
+        absolute_velocity=absolute_speed,
+        unwrap_position=unwrap_position,
+        counter_period=counter_period,
+        counter_bits=counter_bits,
+        max_abs_linear_velocity_cm_s=max_abs_linear_velocity_cm_s,
+    )
 
-    kernel = int(median_filter_kernel)
-    if kernel > 1:
-        if kernel % 2 == 0:
-            kernel += 1
-        pos = medfilt(pos, kernel_size=kernel)
-
-    dt = np.gradient(time_sec)
-    dt[~np.isfinite(dt)] = np.nan
-    dt[dt <= 0] = np.nan
-
-    dpos = np.gradient(pos)
-
-    if encoder_units == "degrees":
-        dist_cm = np.deg2rad(dpos) * float(wheel_radius_cm)
-    elif encoder_units == "radians":
-        dist_cm = dpos * float(wheel_radius_cm)
-    elif encoder_units == "cm":
-        dist_cm = dpos
-    elif encoder_units == "m":
-        dist_cm = dpos * 100.0
-    elif encoder_units == "ticks":
-        if ticks_per_revolution is None:
-            raise ValueError("ticks_per_revolution must be provided when encoder_units='ticks'")
-        cm_per_tick = (2.0 * np.pi * float(wheel_radius_cm)) / float(ticks_per_revolution)
-        dist_cm = dpos * cm_per_tick
-    else:
-        raise ValueError("encoder_units must be one of: 'ticks', 'degrees', 'radians', 'cm', 'm'")
-
-    speed = dist_cm / dt
-
-    if absolute_speed:
-        speed = np.abs(speed)
-
-    speed = np.nan_to_num(speed, nan=0.0, posinf=0.0, neginf=0.0)
-
-    if smooth_speed_sigma is not None and smooth_speed_sigma > 0:
-        speed = gaussian_filter1d(speed, sigma=float(smooth_speed_sigma))
-
+    time_sec = np.asarray(vel["time_sec"], dtype=float)
+    speed = np.asarray(vel["linear_velocity_cm_s"], dtype=float)
     if speed_units == "m/s":
         speed = speed / 100.0
-    elif speed_units != "cm/s":
-        raise ValueError("speed_units must be 'cm/s' or 'm/s'")
 
     if xlim_sec is not None:
         mask = (time_sec >= xlim_sec[0]) & (time_sec <= xlim_sec[1])
         time_sec = time_sec[mask]
         speed = speed[mask]
 
-    return {"time_sec": time_sec, "speed": speed, "path": str(encoder_path)}
+    return {
+        "time_sec": time_sec,
+        "speed": speed,
+        "path": str(encoder_path),
+        "encoder_velocity": vel,
+    }
 
 
 
