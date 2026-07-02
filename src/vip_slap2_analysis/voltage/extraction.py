@@ -10,9 +10,9 @@ voltage-specific constraints explicit:
 * large single-trial event tensors are written to chunked HDF5 rather than
   compressed NPZ; and
 * the default extracted signal is raw fluorescence so baseline/F0 choices do not
-  accidentally remove slow voltage dynamics.  A conservative static-F0 inverted
-  dF/F transform is available, but rolling-baseline transforms are intentionally
-  not baked into this extraction step.
+  accidentally remove slow voltage dynamics.  Conservative static-F0 and robust
+  F0 dF/F transforms are available, with sensor-aware polarity handling for
+  quenched indicators such as ASAP7 and brightening indicators such as ASAP8.
 """
 from __future__ import annotations
 
@@ -348,9 +348,11 @@ def _compute_dff_from_f0_model_chunked(
     raw: np.ndarray,
     f0_model: Mapping[str, Any],
     *,
+    dff_sign: int = -1,
     chunk_samples: int = 262_144,
 ) -> np.ndarray:
-    """Compute ASAP-polarity-corrected dF/F in chunks."""
+    """Compute voltage-indicator-polarity-corrected dF/F in chunks."""
+    sign = _validate_dff_sign(dff_sign)
     raw2, was_1d = _as_trace_2d(raw)
     n_rois, n_samples = map(int, raw2.shape)
     out = _allocate_transform_array((n_rois, n_samples), dtype=np.float32)
@@ -360,7 +362,7 @@ def _compute_dff_from_f0_model_chunked(
         f0_chunk = _f0_chunk_from_model(f0_model, start=start, stop=stop, n_samples=n_samples)
         f0_chunk = _safe_f0_values(f0_chunk, raw_chunk)
         with np.errstate(divide="ignore", invalid="ignore"):
-            out[:, start:stop] = (f0_chunk - raw_chunk) / f0_chunk
+            out[:, start:stop] = sign * (raw_chunk - f0_chunk) / f0_chunk
     return _restore_trace_dim(out, was_1d)
 
 
@@ -374,6 +376,173 @@ def _metadata_without_large_arrays(meta: Mapping[str, Any]) -> Dict[str, Any]:
             out.pop(key, None)
     return out
 
+
+def _normalize_indicator_text(indicator: Optional[Any]) -> str:
+    """Return a lowercase indicator string suitable for simple matching."""
+    if indicator is None:
+        return ""
+    try:
+        if isinstance(indicator, (np.floating, float)) and not np.isfinite(indicator):
+            return ""
+    except TypeError:
+        pass
+    text = str(indicator).strip().lower()
+    if text in {"", "nan", "none", "null", "na", "n/a"}:
+        return ""
+    return text
+
+
+def _validate_dff_sign(dff_sign: int) -> int:
+    """Validate the sign used to map fluorescence dF/F onto voltage dF/F."""
+    sign = int(dff_sign)
+    if sign not in {-1, 1}:
+        raise ValueError(f"dff_sign must be -1 or 1, got {dff_sign!r}")
+    return sign
+
+
+def resolve_voltage_dff_polarity(
+    indicator: Optional[Any] = None,
+    *,
+    dff_polarity: str = "auto",
+) -> Dict[str, Any]:
+    """Resolve voltage-indicator polarity for dF/F calculation.
+
+    The voltage pipeline stores ``dff`` so that positive values correspond to
+    positive membrane-voltage deflections.  Some indicators, including ASAP7,
+    are quenched by depolarization and therefore need inverted fluorescence
+    dF/F.  Others, including ASAP8, brighten with depolarization and therefore
+    use standard fluorescence dF/F.
+
+    Parameters
+    ----------
+    indicator
+        Sensor name such as ``"ASAP7y"`` or ``"ASAP8"``.  Only used when
+        ``dff_polarity='auto'``.
+    dff_polarity
+        ``'auto'`` infers polarity from ``indicator``.  Explicit aliases are
+        accepted for reproducibility: ``'depolarization_decreases_fluorescence'``
+        or ``'inverted'`` use ``(F0 - F) / F0``; ``'depolarization_increases_fluorescence'``
+        or ``'standard'`` use ``(F - F0) / F0``.
+
+    Returns
+    -------
+    dict
+        JSON-friendly polarity metadata, including ``dff_sign`` where ``+1``
+        means standard fluorescence dF/F and ``-1`` means inverted fluorescence
+        dF/F.  Unknown indicators retain the historical ASAP7-compatible
+        inverted default.
+    """
+    indicator_text = _normalize_indicator_text(indicator)
+    requested = str(dff_polarity or "auto").strip().lower().replace(" ", "_").replace("-", "_")
+
+    increases_aliases = {
+        "increase",
+        "increases",
+        "brightens",
+        "standard",
+        "positive",
+        "non_inverted",
+        "not_inverted",
+        "depolarization_increases_fluorescence",
+        "depolarization_brightens",
+        "f_minus_f0_over_f0",
+    }
+    decreases_aliases = {
+        "decrease",
+        "decreases",
+        "quenched",
+        "inverted",
+        "inverse",
+        "negative",
+        "depolarization_decreases_fluorescence",
+        "depolarization_quenches",
+        "f0_minus_f_over_f0",
+    }
+
+    source = "explicit"
+    if requested in increases_aliases:
+        sign = 1
+        response = "depolarization_increases_fluorescence"
+        formula = "dff = (F - F0) / F0"
+    elif requested in decreases_aliases:
+        sign = -1
+        response = "depolarization_decreases_fluorescence"
+        formula = "dff = (F0 - F) / F0"
+    elif requested == "auto":
+        source = "indicator"
+        if "asap8" in indicator_text:
+            sign = 1
+            response = "depolarization_increases_fluorescence"
+            formula = "dff = (F - F0) / F0"
+        elif "asap7" in indicator_text:
+            sign = -1
+            response = "depolarization_decreases_fluorescence"
+            formula = "dff = (F0 - F) / F0"
+        else:
+            # Preserve backward compatibility for old extractions where the
+            # indicator was implicit and the voltage dFF convention was ASAP7.
+            source = "legacy_default"
+            sign = -1
+            response = "depolarization_decreases_fluorescence"
+            formula = "dff = (F0 - F) / F0"
+    else:
+        raise ValueError(
+            "dff_polarity must be 'auto', an explicit increase/standard alias, "
+            "or an explicit decrease/inverted alias."
+        )
+
+    return {
+        "indicator": indicator_text or None,
+        "dff_polarity_requested": requested,
+        "dff_polarity_source": source,
+        "fluorescence_response_to_depolarization": response,
+        "dff_sign": int(sign),
+        "transform": formula,
+        "polarity": (
+            "Voltage-indicator-polarity corrected; positive dff corresponds to "
+            "positive membrane-voltage deflection."
+        ),
+    }
+
+
+def _metadata_indicator_for_dmd(asset: SessionAssets, dmd: int) -> Optional[str]:
+    """Return the best available indicator metadata for one DMD."""
+    meta = getattr(asset, "metadata", {}) or {}
+    d = int(dmd)
+    candidate_keys = (
+        f"dmd{d}_indicator",
+        f"dmd_{d}_indicator",
+        f"indicator_dmd{d}",
+        f"indicator_dmd_{d}",
+        f"indicator{d}",
+        f"indicator_{d}",
+        "voltage_indicator",
+        "indicator",
+        "indicator1",
+        "indicator2",
+    )
+    for key in candidate_keys:
+        if key in meta:
+            text = _normalize_indicator_text(meta.get(key))
+            if text:
+                return str(meta.get(key))
+    return None
+
+
+def _resolve_voltage_dff_polarity_for_dmd(
+    asset: SessionAssets,
+    dmd: int,
+    *,
+    voltage_indicator: Optional[str] = None,
+    dff_polarity: str = "auto",
+) -> Dict[str, Any]:
+    """Resolve dF/F polarity for a DMD using explicit then asset metadata."""
+    indicator = voltage_indicator if _normalize_indicator_text(voltage_indicator) else _metadata_indicator_for_dmd(asset, dmd)
+    out = resolve_voltage_dff_polarity(indicator, dff_polarity=dff_polarity)
+    out["dmd"] = int(dmd)
+    return out
+
+
 def _safe_f0_values(f0: np.ndarray, raw_f: np.ndarray) -> np.ndarray:
     """Guard against invalid or near-zero F0 values.
 
@@ -386,13 +555,26 @@ def _safe_f0_values(f0: np.ndarray, raw_f: np.ndarray) -> np.ndarray:
     eps = np.float32(np.finfo(np.float32).eps)
 
     if f0.ndim == 1:
+        if raw.ndim == 2 and raw.shape[0] == 1 and f0.size == raw.shape[1]:
+            fallback_scalar = np.nanmedian(np.abs(raw[0])).astype(np.float32)
+            if not np.isfinite(fallback_scalar) or fallback_scalar <= eps:
+                fallback_scalar = np.float32(1.0)
+            bad = ~np.isfinite(f0) | (np.abs(f0) <= eps)
+            if np.any(bad):
+                f0 = f0.copy()
+                f0[bad] = fallback_scalar
+            return f0
+
         fallback = np.nanmedian(np.abs(raw), axis=1).astype(np.float32)
         fallback_bad = ~np.isfinite(fallback) | (fallback <= eps)
         fallback[fallback_bad] = np.float32(1.0)
         bad = ~np.isfinite(f0) | (np.abs(f0) <= eps)
         if np.any(bad):
             f0 = f0.copy()
-            f0[bad] = fallback[bad]
+            if fallback.size == f0.size:
+                f0[bad] = fallback[bad]
+            else:
+                f0[bad] = np.nanmedian(fallback).astype(np.float32)
         return f0
 
     if f0.ndim == 2:
@@ -596,21 +778,27 @@ def compute_voltage_f0(
     return f0, meta
 
 
-def compute_voltage_dff(raw_f: np.ndarray, f0: np.ndarray) -> np.ndarray:
-    """Compute ASAP-polarity-corrected dF/F.
+def compute_voltage_dff(
+    raw_f: np.ndarray,
+    f0: np.ndarray,
+    *,
+    indicator: Optional[Any] = None,
+    dff_polarity: str = "auto",
+) -> np.ndarray:
+    """Compute voltage-indicator-polarity-corrected dF/F.
 
-    The returned signal is positive for fluorescence decreases:
-
-    ``dff = (F0 - F) / F0``
-
-    This is equivalent to inverted dF/F but is called ``dff`` throughout the
-    voltage pipeline for convenience.
+    The returned signal is positive for positive membrane-voltage deflections,
+    not necessarily for positive fluorescence changes.  ASAP7-like quenched
+    sensors use inverted dF/F, ``(F0 - F) / F0``.  ASAP8-like brightening sensors
+    use standard dF/F, ``(F - F0) / F0``.
     """
+    polarity = resolve_voltage_dff_polarity(indicator, dff_polarity=dff_polarity)
+    sign = int(polarity["dff_sign"])
     raw = np.asarray(raw_f, dtype=np.float32)
     f0_arr = np.asarray(f0, dtype=np.float32)
     f0_arr = _safe_f0_values(f0_arr, raw if raw.ndim == 2 else raw[None, :])
     with np.errstate(divide="ignore", invalid="ignore"):
-        dff = (f0_arr - raw) / f0_arr
+        dff = sign * (raw - f0_arr) / f0_arr
     return np.asarray(dff, dtype=np.float32)
 
 
@@ -622,8 +810,10 @@ def transform_voltage_signal(
     percentile: float = 50.0,
     robust_bin_sec: float = 5.0,
     robust_smooth_sec: float = 180.0,
+    indicator: Optional[Any] = None,
+    dff_polarity: str = "auto",
 ) -> Dict[str, Any]:
-    """Return raw fluorescence, F0, and ASAP-polarity-corrected dF/F."""
+    """Return raw fluorescence, F0, and polarity-corrected voltage dF/F."""
     f0, f0_meta = compute_voltage_f0(
         raw_f,
         sample_rate_hz=sample_rate_hz,
@@ -632,11 +822,11 @@ def transform_voltage_signal(
         robust_bin_sec=robust_bin_sec,
         robust_smooth_sec=robust_smooth_sec,
     )
-    dff = compute_voltage_dff(raw_f, f0)
+    polarity = resolve_voltage_dff_polarity(indicator, dff_polarity=dff_polarity)
+    dff = compute_voltage_dff(raw_f, f0, indicator=indicator, dff_polarity=dff_polarity)
     meta = {
         "trace_signal": f"dff_{method}_f0",
-        "transform": "dff = (F0 - F) / F0",
-        "polarity": "ASAP/inverse fluorescence corrected; positive dff corresponds to fluorescence decrease",
+        **polarity,
         **f0_meta,
     }
     return {
@@ -669,6 +859,8 @@ def _transform_voltage_bundle(
     f0_percentile: float = 50.0,
     robust_f0_bin_sec: float = 5.0,
     robust_f0_smooth_sec: float = 180.0,
+    indicator: Optional[Any] = None,
+    dff_polarity: str = "auto",
 ) -> Tuple[ReconstructedTraceBundle, Dict[str, Any], Optional[Dict[str, Any]]]:
     """Apply an optional voltage transform to a reconstructed bundle.
 
@@ -682,7 +874,10 @@ def _transform_voltage_bundle(
             "trace_signal": trace_signal,
             "output_signal": "raw_f",
             "transform": "none",
+            "indicator": _normalize_indicator_text(indicator) or None,
         }, None
+
+    polarity = resolve_voltage_dff_polarity(indicator, dff_polarity=dff_polarity)
 
     f0_model = _fit_f0_model_chunked(
         bundle.traces,
@@ -692,15 +887,18 @@ def _transform_voltage_bundle(
         robust_bin_sec=robust_f0_bin_sec,
         robust_smooth_sec=robust_f0_smooth_sec,
     )
-    dff = _compute_dff_from_f0_model_chunked(bundle.traces, f0_model)
+    dff = _compute_dff_from_f0_model_chunked(
+        bundle.traces,
+        f0_model,
+        dff_sign=int(polarity["dff_sign"]),
+    )
     out = replace(bundle, traces=np.asarray(dff, dtype=np.float32))
     meta = {
         "trace_signal": f"dff_{f0_method}_f0",
         "trace_signal_requested": trace_signal,
         "output_signal": "dff",
-        "transform": "dff = (F0 - F) / F0",
-        "polarity": "ASAP/inverse fluorescence corrected; positive dff corresponds to fluorescence decrease",
         "chunked_transform": True,
+        **polarity,
         **_metadata_without_large_arrays(f0_model),
     }
     payload = {
@@ -903,12 +1101,14 @@ def compute_voltage_roi_transform_from_asset(
     f0_percentile: float = 50.0,
     robust_f0_bin_sec: float = 5.0,
     robust_f0_smooth_sec: float = 180.0,
+    voltage_indicator: Optional[str] = None,
+    dff_polarity: str = "auto",
 ) -> Dict[str, Any]:
     """Compute raw/F0/dFF for one ROI directly from a session asset.
 
     This helper is meant for interactive inspection.  It reconstructs the full
     DMD session trace using the same code path as batch extraction, selects one
-    ROI, and computes static or robust F0 plus ASAP-polarity-corrected dF/F.
+    ROI, and computes static or robust F0 plus indicator-polarity-corrected dF/F.
     """
     if epoch_start_sec is None or epoch_end_sec is None:
         epoch_df = _open_imaging_epochs(asset)
@@ -942,6 +1142,12 @@ def compute_voltage_roi_transform_from_asset(
         raise IndexError(f"roi_index={roi_index} is out of bounds for {bundle.traces.shape[0]} ROIs")
 
     raw_f = np.asarray(bundle.traces[int(roi_index), :], dtype=np.float32)
+    polarity = _resolve_voltage_dff_polarity_for_dmd(
+        asset,
+        int(dmd),
+        voltage_indicator=voltage_indicator,
+        dff_polarity=dff_polarity,
+    )
     transformed = transform_voltage_signal(
         raw_f,
         sample_rate_hz=rate,
@@ -949,7 +1155,10 @@ def compute_voltage_roi_transform_from_asset(
         percentile=f0_percentile,
         robust_bin_sec=robust_f0_bin_sec,
         robust_smooth_sec=robust_f0_smooth_sec,
+        indicator=polarity.get("indicator"),
+        dff_polarity=dff_polarity,
     )
+    transformed["metadata"].update(polarity)
     return {
         "timebase_sec": np.asarray(bundle.timebase_sec, dtype=np.float64),
         "raw_f": transformed["raw_f"],
@@ -1366,6 +1575,8 @@ def process_voltage_extraction(
     f0_percentile: float = 50.0,
     robust_f0_bin_sec: float = 5.0,
     robust_f0_smooth_sec: float = 180.0,
+    voltage_indicator: Optional[str] = None,
+    dff_polarity: str = "auto",
     trace_mode: str = "trial",
     drop_discarded: bool = True,
     timebase_strategy: str = "auto",
@@ -1401,7 +1612,7 @@ def process_voltage_extraction(
         Current SLAP2 integration-mode default is 10.8 kHz.
     trace_signal
         ``'raw'`` keeps raw fluorescence. ``'dff_static_f0'`` and
-        ``'dff_robust_f0'`` compute ASAP-polarity-corrected dF/F on the
+        ``'dff_robust_f0'`` compute indicator-polarity-corrected dF/F on the
         reconstructed full-session ROI trace before event snippets are extracted.
     f0_percentile
         Percentile used for static and robust F0 estimation.
@@ -1409,6 +1620,15 @@ def process_voltage_extraction(
         Parameters for the robust full-session F0 model.  The defaults estimate a
         binned robust fluorescence level every 5 s and smooth those estimates
         over 180 s, which is intentionally conservative for slow voltage dynamics.
+    voltage_indicator
+        Optional explicit sensor name, such as ``'ASAP7y'`` or ``'ASAP8'``.  If
+        omitted, the session metadata indicator fields are used per DMD.
+    dff_polarity
+        ``'auto'`` infers whether depolarization increases or decreases
+        fluorescence from the indicator name.  ASAP7-like indicators are treated
+        as quenched and use ``(F0 - F) / F0``; ASAP8-like indicators are treated
+        as brightening and use ``(F - F0) / F0``.  Explicit aliases such as
+        ``'inverted'`` or ``'standard'`` can be used to override inference.
     trace_mode
         Passed to ``VoltageSummary.get_roi_traces``.  Current voltage outputs are
         trial-based, so this should usually be ``'trial'``.
@@ -1556,6 +1776,8 @@ def process_voltage_extraction(
             "f0_percentile": float(f0_percentile),
             "robust_f0_bin_sec": float(robust_f0_bin_sec),
             "robust_f0_smooth_sec": float(robust_f0_smooth_sec),
+            "voltage_indicator_override": _normalize_indicator_text(voltage_indicator) or None,
+            "dff_polarity_requested": str(dff_polarity),
             "epoch_start_sec": float(epoch_start_sec),
             "epoch_end_sec": float(epoch_end_sec),
             "voltage_summary_layout": getattr(vs, "layout", None),
@@ -1575,6 +1797,8 @@ def process_voltage_extraction(
             "trace_signal": str(trace_signal),
             "trace_mode": str(trace_mode),
             "trace_suffix": suffix,
+            "voltage_indicator_override": _normalize_indicator_text(voltage_indicator) or None,
+            "dff_polarity_requested": str(dff_polarity),
             "windows_sec": base_meta["windows_sec"],
             "event_counts": {
                 "image_total": int(sum(len(v) for v in image_times.values())),
@@ -1627,6 +1851,13 @@ def process_voltage_extraction(
                     f0_percentile=f0_percentile,
                     robust_f0_bin_sec=robust_f0_bin_sec,
                     robust_f0_smooth_sec=robust_f0_smooth_sec,
+                    indicator=_resolve_voltage_dff_polarity_for_dmd(
+                        asset,
+                        dmd,
+                        voltage_indicator=voltage_indicator,
+                        dff_polarity=dff_polarity,
+                    ).get("indicator"),
+                    dff_polarity=dff_polarity,
                 )
 
                 event_rate = float((getattr(bundle, "metadata", {}) or {}).get("alignment_sample_rate_hz", rate))

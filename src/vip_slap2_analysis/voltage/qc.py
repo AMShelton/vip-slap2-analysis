@@ -11,8 +11,9 @@ The first-pass QC intentionally works on raw extracted fluorescence traces. It
 checks whether the files are readable, whether trace blocks obey the voltage
 pipeline shape convention ``(n_samples, n_rois)``, and whether ROIs have adequate
 finite coverage and robust dynamic range.  It does not compute the canonical
-inverted dF/F0 signal; baseline selection is analysis-critical for voltage data
-and should be handled by a later preprocessing step.
+indicator-polarity-corrected dF/F0 signal; baseline selection is
+analysis-critical for voltage data and should be handled by a later
+preprocessing step.
 """
 from __future__ import annotations
 
