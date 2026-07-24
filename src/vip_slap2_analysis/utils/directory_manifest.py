@@ -10,14 +10,14 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
-from typing import Iterable, Literal, Optional
+from typing import Iterable, Literal, Optional, Union
 
 ManifestKind = Literal["file", "dir"]
 
 
 def generate_directory_manifest(
-    root: str | Path,
-    out_path: str | Path | None = None,
+    root: Union[str, Path],
+    out_path: Optional[Union[str, Path]] = None,
     *,
     include_root: bool = False,
     include_hidden: bool = True,
@@ -87,7 +87,7 @@ def generate_directory_manifest(
 
 def write_manifest_tsv(
     rows: Iterable[tuple[str, ManifestKind]],
-    out_path: str | Path,
+    out_path: Union[str, Path],
     *,
     encoding: str = "utf-8",
 ) -> Path:

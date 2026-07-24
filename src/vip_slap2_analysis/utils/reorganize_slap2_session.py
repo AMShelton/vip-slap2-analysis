@@ -1,612 +1,663 @@
-"""Command-line utilities for reorganizing SLAP2 session folders.
+"""Reorganize raw SLAP2 sessions into canonical raw/processed/backup folders.
 
-This module builds and optionally executes a filesystem reorganization plan that
-separates raw acquisition files, processed SLAP2 outputs, behavior files, and
-unclassified backup content. It is designed to support dry-run review before any
-files are moved, producing a TSV report of every planned or executed operation.
+The default ``nested`` layout treats the supplied session directory as a
+container. For a source directory named::
+
+    826031_2026-01-30_15-04-02
+
+it creates these children *inside that same directory*::
+
+    826031_2026-01-30_15-04-02/
+        826031_2026-01-30_15-04-02/                  # canonical raw data
+        826031_2026-01-30_15-04-02_slap2_.../        # processed data
+        slap2_826031_..._remaining_data_backup/      # unmatched content
+        .reorganization_reports/                     # dry-run/execution reports
+
+Use ``--layout sibling`` to reproduce the historical behavior in which the
+three canonical folders are created beside the supplied session directory.
+
+Supported source-extraction conventions
+---------------------------------------
+* Voltage: ``dendriticVoltageExtraction`` containing paired
+  ``dendriticVoltageSummary-*.mat`` and ``dendriticVoltageTraces-*.h5`` files.
+* Glutamate: ``ExperimentSummary`` (for example ``SummaryLoCo-*.mat``).
+
+Vascular reference images whose names contain variants of
+``localvasculature`` or ``VasMap`` remain in the canonical raw session root.
+
+The script is dry-run by default. Always inspect the TSV report before rerunning
+with ``--execute``.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import os
 import re
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, Optional, Sequence, Set
 
+SESSION_RE = re.compile(
+    r"(?P<mouse>\d{6})_(?P<date>\d{4}-\d{2}-\d{2})_(?P<time>\d{2}-\d{2}-\d{2})"
+)
+SLAP2_DIR_RE = re.compile(
+    r"slap2_(?P<date>\d{4}-\d{2}-\d{2})_(?P<time>\d{2}-\d{2}-\d{2})",
+    re.IGNORECASE,
+)
+VOLTAGE_PAIR_RE = re.compile(
+    r"dendriticVoltage(?:Summary|Traces)-(?P<stamp>\d{6}-\d{6})\.(?:mat|h5)$",
+    re.IGNORECASE,
+)
 
-# -----------------------------------------------------------------------------
-# Data models
-# -----------------------------------------------------------------------------
+TOP_LEVEL_METADATA = {
+    "instrument.json",
+    "subject.json",
+    "session.json",
+    "acquisition.json",
+    "data_description.json",
+    "procedures.json",
+    "project.json",
+}
+REPORT_DIR_NAME = ".reorganization_reports"
+SOURCE_EXTRACTION_DIR_NAMES = {
+    "dendriticvoltageextraction": "dendriticVoltageExtraction",
+    "experimentsummary": "ExperimentSummary",
+}
+
 
 @dataclass
 class MoveRecord:
-    """Single planned or executed filesystem move.
+    """One planned or executed filesystem operation."""
 
-    Attributes record the source, destination, routing rationale, high-level category,
-    and current execution status for one file or directory move.
-    """
     src: Path
     dst: Path
-    reason: str
     category: str
+    reason: str
     status: str = "PLANNED"
 
 
 @dataclass
 class SessionNames:
-    """Canonical directory-name components inferred for a SLAP2 session.
+    """Canonical destination names inferred from a session folder."""
 
-    The inferred names define the destination raw, processed, and backup roots used by
-    the reorganization plan.
-    """
-    mouse_id: str
-    session_stamp: str          # e.g. 826033_2026-02-17_13-13-55
-    slap2_stamp: str            # e.g. 2026-02-17_13-13-55 or from slap2_*
-    raw_root_name: str          # e.g. 826033_2026-02-17_13-13-55
-    processed_root_name: str    # e.g. 826033_2026-02-17_13-13-55_slap2_2026-02-17_13-13-55
-    backup_root_name: str       # e.g. slap2_826033_2026-02-17_13-13-55_remaining_data_backup
-    harp_dir_name: str = "Behavior.harp"
+    subject_id: str
+    session_stamp: str
+    slap2_stamp: str
+    raw_root_name: str
+    processed_root_name: str
+    overflow_root_name: str
 
 
 @dataclass
 class ReorgPlan:
-    """Container for a proposed SLAP2 session reorganization.
+    """Move plan for one SLAP2 session."""
 
-    The plan stores destination roots, planned move records, and non-fatal warnings
-    encountered during path inference or routing.
-    """
     target_session_dir: Path
+    layout: str
+    output_base: Path
     raw_root: Path
     processed_root: Path
-    backup_root: Path
-    records: List[MoveRecord] = field(default_factory=list)
-    warnings: List[str] = field(default_factory=list)
+    overflow_root: Path
+    records: list[MoveRecord] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
-    def add(self, src: Path, dst: Path, reason: str, category: str) -> None:
-        """Append one move record to the reorganization plan.
-
-        Parameters
-        ----------
-        src : pathlib.Path
-            Existing source path to move.
-        dst : pathlib.Path
-            Planned destination path.
-        reason : str
-            Human-readable routing rationale.
-        category : str
-            High-level destination category, such as ``raw``, ``processed``, or ``backup``.
-        """
-        self.records.append(MoveRecord(src=src, dst=dst, reason=reason, category=category))
-
-    def planned_sources(self) -> set[Path]:
-        """Return the set of all source paths currently in the plan."""
-        return {r.src for r in self.records}
-
-
-# -----------------------------------------------------------------------------
-# Parsing / manifest helpers
-# -----------------------------------------------------------------------------
-
-SESSION_RE = re.compile(r"(?P<mouse>\d{6})_(?P<date>\d{4}-\d{2}-\d{2})_(?P<time>\d{2}-\d{2}-\d{2})")
-SLAP2_DIR_RE = re.compile(r"slap2_(?P<date>\d{4}-\d{2}-\d{2})_(?P<time>\d{2}-\d{2}-\d{2})", re.IGNORECASE)
-DMD_FILE_RE = re.compile(r"^E\d+T\d+DMD\d+_.*", re.IGNORECASE)
-
-
-def load_manifest_paths(tsv_path: Path) -> List[str]:
-    """
-    Accepts a simple manifest TSV. If there are multiple columns, the first column
-    containing a path-like value is used row-wise.
-    """
-    rows: List[str] = []
-    with tsv_path.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.reader(f, delimiter="\t")
-        for row in reader:
-            if not row:
-                continue
-            # Pick first non-empty field
-            val = next((x.strip() for x in row if x and x.strip()), None)
-            if val:
-                rows.append(val)
-    return rows
-
-
-def infer_harp_dir_name_from_example_manifest(example_manifest_tsv: Path) -> str:
-    """
-    Look for a *.harp directory in the example manifest and preserve its basename.
-    Falls back to 'Behavior.harp'.
-    """
-    try:
-        paths = load_manifest_paths(example_manifest_tsv)
-    except Exception:
-        return "Behavior.harp"
-
-    harp_candidates = []
-    for p in paths:
-        parts = Path(p).parts
-        for part in parts:
-            if part.lower().endswith(".harp"):
-                harp_candidates.append(part)
-
-    if not harp_candidates:
-        return "Behavior.harp"
-
-    # Prefer a directory that contains "Behavior"
-    for name in harp_candidates:
-        if "behavior" in name.lower():
-            return name
-
-    return harp_candidates[0]
-
-
-def infer_session_names(
-    target_session_dir: Path,
-    example_manifest_tsv: Path,
-    mouse_id: Optional[str] = None,
-) -> SessionNames:
-    """
-    Infer raw / processed / backup directory names.
-
-    raw_root_name:
-        nnnnnn_yyyy-mm-dd_hh-mm-ss
-
-    processed_root_name:
-        nnnnnn_yyyy-mm-dd_hh-mm-ss_slap2_yyyy-mm-dd_hh-mm-ss
-
-    backup_root_name:
-        slap2_nnnnnn_yyyy-mm-dd_hh-mm-ss_remaining_data_backup
-    """
-    target_session_dir = target_session_dir.resolve()
-    base_name = target_session_dir.name
-
-    m = SESSION_RE.search(base_name)
-    if not m:
-        raise ValueError(
-            f"Could not parse target session folder name '{base_name}'. "
-            "Expected something like '826033_2026-02-17_13-13-55'."
+    def add(self, src: Path, dst: Path, category: str, reason: str) -> None:
+        """Append a planned move if source and destination differ."""
+        if _same_path(src, dst):
+            return
+        self.records.append(
+            MoveRecord(src=src, dst=dst, category=category, reason=reason)
         )
 
-    parsed_mouse = m.group("mouse")
-    session_date = m.group("date")
-    session_time = m.group("time")
 
-    if mouse_id is None:
-        mouse_id = parsed_mouse
+# -----------------------------------------------------------------------------
+# Discovery and naming
+# -----------------------------------------------------------------------------
 
-    session_stamp = f"{mouse_id}_{session_date}_{session_time}"
 
-    slap2_dirs = find_slap2_dirs(target_session_dir)
-    if slap2_dirs:
-        slap2_dir = sorted(slap2_dirs, key=lambda p: p.stat().st_mtime if p.exists() else 0)[0]
-        sm = SLAP2_DIR_RE.search(slap2_dir.name)
-        if sm:
-            slap2_stamp = f"{sm.group('date')}_{sm.group('time')}"
-        else:
-            slap2_stamp = f"{session_date}_{session_time}"
-    else:
-        slap2_stamp = f"{session_date}_{session_time}"
+def _same_path(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return a.absolute() == b.absolute()
 
-    harp_dir_name = infer_harp_dir_name_from_example_manifest(example_manifest_tsv)
 
-    raw_root_name = session_stamp
-    processed_root_name = f"{session_stamp}_slap2_{slap2_stamp}"
-    backup_root_name = f"slap2_{session_stamp}_remaining_data_backup"
+def infer_session_names(target_session_dir: Path) -> SessionNames:
+    """Infer canonical raw/processed/overflow names from a session folder."""
+    target_session_dir = target_session_dir.expanduser().resolve()
+    match = SESSION_RE.fullmatch(target_session_dir.name)
+    if match is None:
+        raise ValueError(
+            "Could not parse the session folder name. Expected exactly "
+            "<six-digit-subject>_YYYY-MM-DD_HH-MM-SS, for example "
+            "826031_2026-01-30_15-04-02."
+        )
+
+    subject_id = match.group("mouse")
+    session_stamp = "%s_%s_%s" % (
+        subject_id,
+        match.group("date"),
+        match.group("time"),
+    )
+    slap2_stamp = find_slap2_stamp(target_session_dir)
+    if slap2_stamp is None:
+        # This matches the canonical historical naming convention: the suffix
+        # records the session timestamp, not the later acquisition file time.
+        slap2_stamp = "%s_%s" % (match.group("date"), match.group("time"))
 
     return SessionNames(
-        mouse_id=mouse_id,
+        subject_id=subject_id,
         session_stamp=session_stamp,
         slap2_stamp=slap2_stamp,
-        raw_root_name=raw_root_name,
-        processed_root_name=processed_root_name,
-        backup_root_name=backup_root_name,
-        harp_dir_name=harp_dir_name,
+        raw_root_name=session_stamp,
+        processed_root_name="%s_slap2_%s" % (session_stamp, slap2_stamp),
+        overflow_root_name="slap2_%s_remaining_data_backup" % session_stamp,
     )
 
 
-# -----------------------------------------------------------------------------
-# Filesystem discovery helpers
-# -----------------------------------------------------------------------------
-
-def iter_immediate_children(path: Path) -> Iterable[Path]:
-    """Return immediate children of a path, or an empty list if missing."""
-    if not path.exists():
-        return []
-    return list(path.iterdir())
-
-
-def safe_relpath(path: Path, start: Path) -> str:
-    """Return ``path`` relative to ``start`` when possible, otherwise absolute text."""
-    try:
-        return str(path.relative_to(start))
-    except Exception:
-        return str(path)
-
-
-def find_slap2_dirs(target_session_dir: Path) -> List[Path]:
-    """Find candidate ``slap2_*`` acquisition directories under a session tree."""
-    matches = []
-    imaging_root = target_session_dir / "imaging_data" / "SLAP2_data"
-    if imaging_root.exists():
-        for child in imaging_root.iterdir():
-            if child.is_dir() and child.name.lower().startswith("slap2_"):
-                matches.append(child)
-    else:
-        # broader fallback
-        for p in target_session_dir.rglob("*"):
-            if p.is_dir() and p.name.lower().startswith("slap2_"):
-                matches.append(p)
-    return matches
-
-
-def find_first_existing(paths: Sequence[Path]) -> Optional[Path]:
-    """Return the first existing path from a sequence, or ``None``."""
-    for p in paths:
-        if p.exists():
-            return p
+def find_slap2_stamp(target_session_dir: Path) -> Optional[str]:
+    """Return a timestamp encoded in a legacy inner ``slap2_*`` directory."""
+    candidates = [
+        p
+        for p in target_session_dir.rglob("*")
+        if p.is_dir() and p.name.lower().startswith("slap2_")
+    ]
+    for path in sorted(candidates, key=lambda p: len(p.parts)):
+        match = SLAP2_DIR_RE.search(path.name)
+        if match:
+            return "%s_%s" % (match.group("date"), match.group("time"))
     return None
 
 
+def iter_children(path: Path) -> Iterable[Path]:
+    """Yield immediate children if ``path`` exists."""
+    if path.exists():
+        yield from path.iterdir()
+
+
+def has_core_acquisition_content(path: Path) -> bool:
+    """Return whether a directory resembles an unorganized acquisition root."""
+    return any(
+        (path / name).exists()
+        for name in ("slap2", "behavior", "behavior-videos", "imaging_data")
+    )
+
+
+def appears_already_nested(target_session_dir: Path, names: SessionNames) -> bool:
+    """Detect a completed or partially completed nested layout."""
+    raw_child = target_session_dir / names.raw_root_name
+    processed_child = target_session_dir / names.processed_root_name
+    overflow_child = target_session_dir / names.overflow_root_name
+    return raw_child.exists() or processed_child.exists() or overflow_child.exists()
+
+
+def find_session_dirs(
+    root: Path,
+    subject_ids: Optional[Set[str]] = None,
+) -> list[Path]:
+    """Find unorganized SLAP2 session folders below ``root``."""
+    root = root.expanduser().resolve()
+    sessions: list[Path] = []
+    candidates = [root] + [p for p in root.rglob("*") if p.is_dir()]
+
+    for path in candidates:
+        match = SESSION_RE.fullmatch(path.name)
+        if match is None:
+            continue
+        if subject_ids and match.group("mouse") not in subject_ids:
+            continue
+        if not has_core_acquisition_content(path):
+            continue
+
+        # Do not treat the canonical raw child of an already nested container as
+        # a fresh source during recursive root searches.
+        if path.parent.name == path.name:
+            continue
+        sessions.append(path)
+
+    return sorted(set(sessions))
+
+
 # -----------------------------------------------------------------------------
-# Routing logic
+# Routing helpers
 # -----------------------------------------------------------------------------
 
-def ensure_dir(path: Path, execute: bool) -> None:
-    """Create a directory tree only when execution mode is enabled.
 
-    This supports dry-run planning without creating filesystem side effects.
-    """
-    if execute:
-        path.mkdir(parents=True, exist_ok=True)
+def normalized_name(path: Path) -> str:
+    """Return a lowercase alphanumeric representation of a file/folder name."""
+    return re.sub(r"[^a-z0-9]+", "", path.stem.lower())
 
 
-def classify_top_level_metadata(path: Path) -> Optional[Tuple[str, str]]:
-    """
-    Returns (category, reason) or None.
-    """
-    name = path.name.lower()
-    if name in {"instrument.json", "acquisition.json", "subject.json", "session.json", "data_description.json", "procedures.json"}:
-        return ("raw", "top-level metadata json")
-    if name in {"notes.txt", "readme.txt", "readme.md"}:
-        return ("backup", "unclassified top-level note/readme")
-    return None
-
-
-def route_behavior_tree(path: Path, names: SessionNames, raw_root: Path) -> Path:
-    """
-    Move behavior-related content into raw_root / behavior or behavior-videos.
-    Avoid re-nesting canonical directories that are already top-level.
-    """
-    lower = path.name.lower()
-
-    # Canonical directories should remain canonical
-    if path.is_dir() and path.name == "behavior":
-        return raw_root / "behavior"
-
-    if path.is_dir() and path.name == "behavior-videos":
-        return raw_root / "behavior-videos"
-
-    if path.is_dir() and lower.endswith(".harp"):
-        return raw_root / "behavior" / names.harp_dir_name
-
-    if path.is_dir() and ("video" in lower or "camera" in lower):
-        return raw_root / "behavior-videos" / path.name
-
-    if lower.endswith(".csv") and "bonsai" in lower:
-        return raw_root / "behavior" / path.name
-
-    if lower.endswith(".json") and "stim" in lower:
-        return raw_root / "behavior" / path.name
-
-    if lower.endswith(".mp4") or lower.endswith(".avi"):
-        return raw_root / "behavior-videos" / path.name
-
-    return raw_root / "behavior" / path.name
-
-
-def route_slap2_content(src: Path, slap2_root: Path, processed_root: Path, raw_root: Path) -> Tuple[Path, str, str]:
-    """
-    Route files from a SLAP2 tree into:
-      - raw_root/slap2/...                  for raw acquisition / metadata
-      - processed_root/motion_correction    for alignment outputs
-      - processed_root/source_extraction    for ROI/source extraction outputs
-      - processed_root                      for trialTable.*
-    """
-    rel = src.relative_to(slap2_root)
-    name = src.name
-    name_lower = name.lower()
-    parts_lower = [p.lower() for p in rel.parts]
-
-    raw_slap2_root = raw_root / "slap2"
-
-    # ------------------------------------------------------------------
-    # Raw: explicitly preserved raw acquisition/reference images
-    # ------------------------------------------------------------------
-    if name_lower == "localvasculature.tif":
-        return (
-            raw_slap2_root / rel,
-            "local vasculature image",
-            "raw",
-        )
-
-    # ------------------------------------------------------------------
-    # Processed: motion correction
-    # ------------------------------------------------------------------
-    if name.endswith("_ALIGNMENTDATA.mat"):
-        return (
-            processed_root / "motion_correction" / name,
-            "alignment output",
-            "processed",
-        )
-
-    # ------------------------------------------------------------------
-    # Processed: source extraction
-    # ------------------------------------------------------------------
-    if name == "ANNOTATIONS.mat":
-        return (
-            processed_root / "source_extraction" / name,
-            "annotation file",
-            "processed",
-        )
-
-    if "experimentsummary" in parts_lower:
-        idx = parts_lower.index("experimentsummary")
-        tail = rel.parts[idx + 1 :]
-        return (
-            processed_root / "source_extraction" / "ExperimentSummary" / Path(*tail),
-            "ExperimentSummary output",
-            "processed",
-        )
-
-    if (
-        name_lower.endswith(".mat")
-        and (
-            "summary" in name_lower
-            or "extract" in name_lower
-            or "trace" in name_lower
-            or "roi" in name_lower
-        )
-        and "_alignmentdata.mat" not in name_lower
-    ):
-        return (
-            processed_root / "source_extraction" / name,
-            "source extraction matlab output",
-            "processed",
-        )
-
-    # ------------------------------------------------------------------
-    # Processed: trial table
-    # ------------------------------------------------------------------
-    if name_lower.startswith("trialtable."):
-        return (
-            processed_root / name,
-            "trial table",
-            "processed",
-        )
-
-    # ------------------------------------------------------------------
-    # Everything else in the slap2 tree is raw
-    # ------------------------------------------------------------------
+def is_vascular_reference(path: Path) -> bool:
+    """Recognize local-vasculature and whole-craniotomy VasMap variants."""
+    norm = normalized_name(path)
     return (
-        raw_slap2_root / rel,
-        "raw SLAP2 acquisition / metadata content",
-        "raw",
+        "localvasculature" in norm
+        or norm.startswith("vasmap")
+        or "vasculaturemap" in norm
+        or "vascularmap" in norm
     )
+
+
+def canonical_source_extraction_dir(path: Path) -> Optional[str]:
+    """Return canonical source-extraction directory name when recognized."""
+    return SOURCE_EXTRACTION_DIR_NAMES.get(path.name.lower())
+
+
+def is_voltage_processed_asset(path: Path) -> bool:
+    """Return true for known processed voltage summary/trace outputs."""
+    name = path.name.lower()
+    return name.startswith("dendriticvoltage") and name.endswith((".mat", ".h5"))
+
+
+def is_motion_or_registered_output(path: Path) -> bool:
+    """Return true for known registered/downsampled/alignment outputs."""
+    name = path.name.lower()
+    return (
+        name.endswith("_alignmentdata.mat")
+        or "registered" in name
+        or "downsampled" in name
+        or re.match(r"^e\d+t\d+dmd\d+_.*", name) is not None
+    )
+
+
+def is_trial_table(path: Path) -> bool:
+    return path.name.lower().startswith("trialtable.")
+
+
+def copy_tail_after_named_part(rel: Path, part_name: str) -> Path:
+    """Return the relative path following a case-insensitive named component."""
+    lower_parts = [part.lower() for part in rel.parts]
+    idx = lower_parts.index(part_name.lower())
+    if len(rel.parts) == idx + 1:
+        return Path()
+    return Path(*rel.parts[idx + 1 :])
+
+
+# -----------------------------------------------------------------------------
+# Plan construction and routing
+# -----------------------------------------------------------------------------
+
 
 def build_reorganization_plan(
     target_session_dir: Path,
-    example_manifest_tsv: Path,
-    target_manifest_tsv: Optional[Path] = None,
-    mouse_id: Optional[str] = None,
+    layout: str = "nested",
 ) -> ReorgPlan:
-    """Build a dry-run reorganization plan for one SLAP2 session directory.
+    """Build a conservative reorganization plan for one SLAP2 session."""
+    target_session_dir = target_session_dir.expanduser().resolve()
+    if not target_session_dir.is_dir():
+        raise NotADirectoryError("Session directory does not exist: %s" % target_session_dir)
+    if layout not in {"nested", "sibling"}:
+        raise ValueError("layout must be 'nested' or 'sibling'")
 
-    The function scans the target session tree, classifies known SLAP2, behavior, and
-    metadata content, and stores unmatched items in a backup destination.
-    """
-    names = infer_session_names(target_session_dir, example_manifest_tsv, mouse_id=mouse_id)
+    names = infer_session_names(target_session_dir)
+    if layout == "nested" and appears_already_nested(target_session_dir, names):
+        raise ValueError(
+            "This directory already contains one or more canonical destination "
+            "folders and appears to be organized or partially organized: %s" % target_session_dir
+        )
 
-    # New roots live under the parent directory of the current raw session folder
-    session_parent = target_session_dir.parent
-    raw_root = session_parent / names.raw_root_name
-    processed_root = session_parent / names.processed_root_name
-    backup_root = session_parent / names.backup_root_name
-
+    output_base = target_session_dir if layout == "nested" else target_session_dir.parent
     plan = ReorgPlan(
         target_session_dir=target_session_dir,
-        raw_root=raw_root,
-        processed_root=processed_root,
-        backup_root=backup_root,
+        layout=layout,
+        output_base=output_base,
+        raw_root=output_base / names.raw_root_name,
+        processed_root=output_base / names.processed_root_name,
+        overflow_root=output_base / names.overflow_root_name,
     )
 
-    if raw_root.exists() and raw_root.resolve() != target_session_dir.resolve():
-        plan.warnings.append(f"Raw root already exists: {raw_root}")
-    if processed_root.exists():
-        plan.warnings.append(f"Processed root already exists: {processed_root}")
-    if backup_root.exists():
-        plan.warnings.append(f"Backup root already exists: {backup_root}")
+    for root in (plan.raw_root, plan.processed_root, plan.overflow_root):
+        if root.exists() and not _same_path(root, target_session_dir):
+            plan.warnings.append("Destination already exists: %s" % root)
 
-    # Top-level organization from current target session dir
-    for child in iter_immediate_children(target_session_dir):
-        if child.name in {processed_root.name, backup_root.name}:
+    destination_names = {
+        plan.raw_root.name,
+        plan.processed_root.name,
+        plan.overflow_root.name,
+        REPORT_DIR_NAME,
+    }
+    for child in iter_children(target_session_dir):
+        if child.name in destination_names:
             continue
+        route_top_level_child(child, plan)
 
-        if child.name == "ANNOTATIONS.mat":
-            dst = processed_root / "source_extraction" / child.name
-            plan.add(child, dst, "top-level annotation file", "processed")
-            continue
-
-        if child.name == "ExperimentSummary" and child.is_dir():
-            dst = processed_root / "source_extraction" / "ExperimentSummary"
-            plan.add(child, dst, "top-level ExperimentSummary directory", "processed")
-            continue
-
-        # Keep current target session dir as the eventual raw root name;
-        # if it's already the correct name, content remains under it or moves within it.
-        meta = classify_top_level_metadata(child)
-        if meta is not None:
-            category, reason = meta
-            if category == "raw":
-                dst = raw_root / child.name
-            else:
-                dst = backup_root / child.name
-            if child.resolve() != dst.resolve():
-                plan.add(child, dst, reason, category)
-            continue
-
-        child_lower = child.name.lower()
-
-        # Behavior content
-        if (
-            "behavior" in child_lower
-            or child_lower.endswith(".harp")
-            or "video" in child_lower
-            or "camera" in child_lower
-        ):
-            # If these are already the canonical top-level raw folders, leave them alone.
-            if child.is_dir() and child.name in {"behavior", "behavior-videos"}:
-                continue
-
-            dst = route_behavior_tree(child, names, raw_root)
-
-            # Do not allow moves where destination is inside source
-            try:
-                dst.relative_to(child)
-                plan.warnings.append(
-                    f"Skipping nested move for behavior content already effectively in place: {child} -> {dst}"
-                )
-                continue
-            except Exception:
-                pass
-
-            if child.resolve() != dst.resolve():
-                plan.add(child, dst, "behavior-related content", "raw")
-            continue
-
-        # Top-level SLAP2 content
-        if child.name.lower() == "slap2":
-            for p in child.rglob("*"):
-                if p.is_dir():
-                    continue
-
-                dst, reason, category = route_slap2_content(
-                    src=p,
-                    slap2_root=child,
-                    processed_root=processed_root,
-                    raw_root=raw_root,
-                )
-
-                if p.resolve() != dst.resolve():
-                    plan.add(p, dst, reason, category)
-
-            continue
-
-        # Known loose processed files at top level
-        if DMD_FILE_RE.match(child.name):
-            dst = processed_root / "motion_correction" / child.name
-            plan.add(child, dst, "top-level DMD processed file", "processed")
-            continue
-
-        if child.name == "ANNOTATIONS.mat":
-            dst = processed_root / "source_extraction" / child.name
-            plan.add(child, dst, "top-level annotation file", "processed")
-            continue
-
-        if child.name.lower().startswith("trialtable."):
-            dst = processed_root / child.name
-            plan.add(child, dst, "top-level trial table", "processed")
-            continue
-
-        # Anything else gets backed up
-        dst = backup_root / child.name
-        if child.resolve() != dst.resolve():
-            plan.add(child, dst, "unmatched top-level content", "backup")
-
-    # Optional: compare against target manifest only for warning/reporting
-    if target_manifest_tsv and target_manifest_tsv.exists():
-        try:
-            target_manifest_rows = load_manifest_paths(target_manifest_tsv)
-            if not target_manifest_rows:
-                plan.warnings.append("Target manifest TSV was provided but appears empty.")
-        except Exception as e:
-            plan.warnings.append(f"Could not parse target manifest TSV: {e}")
-
+    validate_voltage_pairs(plan)
     return plan
 
 
+def route_top_level_child(child: Path, plan: ReorgPlan) -> None:
+    """Route one top-level child into raw, processed, or overflow."""
+    lower = child.name.lower()
+
+    if lower in {"behavior", "behavior-videos"}:
+        plan.add(child, plan.raw_root / child.name, "raw", "canonical behavior folder")
+        return
+
+    if lower.endswith(".harp") or lower == "softwareevents":
+        plan.add(
+            child,
+            plan.raw_root / "behavior" / child.name,
+            "raw",
+            "behavior acquisition content",
+        )
+        return
+
+    if "camera" in lower or lower.endswith((".avi", ".mp4")):
+        plan.add(
+            child,
+            plan.raw_root / "behavior-videos" / child.name,
+            "raw",
+            "behavior video content",
+        )
+        return
+
+    if is_vascular_reference(child):
+        plan.add(
+            child,
+            plan.raw_root / child.name,
+            "raw",
+            "local vasculature/VasMap reference retained with raw session",
+        )
+        return
+
+    if lower == "slap2":
+        route_slap2_tree(child, child, plan)
+        return
+
+    if lower == "imaging_data":
+        route_imaging_data_tree(child, plan)
+        return
+
+    if lower in TOP_LEVEL_METADATA:
+        plan.add(child, plan.raw_root / child.name, "raw", "top-level acquisition metadata")
+        return
+
+    canonical_dir = canonical_source_extraction_dir(child) if child.is_dir() else None
+    if canonical_dir is not None:
+        plan.add(
+            child,
+            plan.processed_root / "source_extraction" / canonical_dir,
+            "processed",
+            "%s source-extraction directory" % canonical_dir,
+        )
+        return
+
+    if is_voltage_processed_asset(child):
+        plan.add(
+            child,
+            plan.processed_root
+            / "source_extraction"
+            / "dendriticVoltageExtraction"
+            / child.name,
+            "processed",
+            "loose voltage source-extraction asset",
+        )
+        return
+
+    if is_trial_table(child):
+        plan.add(child, plan.processed_root / child.name, "processed", "trial table")
+        return
+
+    if child.name.lower() == "annotations.mat":
+        plan.add(
+            child,
+            plan.processed_root / "source_extraction" / child.name,
+            "processed",
+            "source-extraction annotations",
+        )
+        return
+
+    if is_motion_or_registered_output(child):
+        plan.add(
+            child,
+            plan.processed_root / "motion_correction" / child.name,
+            "processed",
+            "loose motion-correction/registered output",
+        )
+        return
+
+    plan.add(
+        child,
+        plan.overflow_root / "remaining_root_items" / child.name,
+        "overflow",
+        "unmatched top-level content",
+    )
+
+
+def route_imaging_data_tree(imaging_data: Path, plan: ReorgPlan) -> None:
+    """Route contents from legacy ``imaging_data`` trees."""
+    slap2_data = imaging_data / "SLAP2_data"
+    if not slap2_data.exists():
+        plan.add(
+            imaging_data,
+            plan.overflow_root / "remaining_root_items" / imaging_data.name,
+            "overflow",
+            "unmatched imaging_data tree",
+        )
+        return
+
+    for child in iter_children(slap2_data):
+        if child.is_dir() and child.name.lower().startswith("slap2_"):
+            route_slap2_tree(child, child, plan)
+        else:
+            plan.add(
+                child,
+                plan.overflow_root / "unmapped_slap2" / child.name,
+                "overflow",
+                "unmapped imaging_data/SLAP2_data content",
+            )
+
+
+def route_slap2_tree(path: Path, slap2_root: Path, plan: ReorgPlan) -> None:
+    """Route every file under a SLAP2 tree while preserving relative paths."""
+    for src in path.rglob("*"):
+        if src.is_dir():
+            continue
+        dst, category, reason = route_slap2_file(src, slap2_root, plan)
+        plan.add(src, dst, category, reason)
+
+
+def route_slap2_file(
+    src: Path,
+    slap2_root: Path,
+    plan: ReorgPlan,
+) -> tuple[Path, str, str]:
+    """Return destination, category, and reason for one file under SLAP2."""
+    rel = src.relative_to(slap2_root)
+    lower_name = src.name.lower()
+    lower_parts = [part.lower() for part in rel.parts]
+
+    if "dendriticvoltageextraction" in lower_parts:
+        tail = copy_tail_after_named_part(rel, "dendriticVoltageExtraction")
+        return (
+            plan.processed_root
+            / "source_extraction"
+            / "dendriticVoltageExtraction"
+            / tail,
+            "processed",
+            "dendriticVoltageExtraction processed voltage asset",
+        )
+
+    if "experimentsummary" in lower_parts:
+        tail = copy_tail_after_named_part(rel, "ExperimentSummary")
+        return (
+            plan.processed_root / "source_extraction" / "ExperimentSummary" / tail,
+            "processed",
+            "ExperimentSummary glutamate source-extraction asset",
+        )
+
+    if is_voltage_processed_asset(src):
+        return (
+            plan.processed_root
+            / "source_extraction"
+            / "dendriticVoltageExtraction"
+            / src.name,
+            "processed",
+            "loose dendritic voltage processed asset",
+        )
+
+    if is_trial_table(src):
+        return plan.processed_root / src.name, "processed", "trial table"
+
+    if lower_name == "annotations.mat":
+        return (
+            plan.processed_root / "source_extraction" / src.name,
+            "processed",
+            "source-extraction annotations",
+        )
+
+    if lower_name.endswith("_alignmentdata.mat") or is_motion_or_registered_output(src):
+        return (
+            plan.processed_root / "motion_correction" / src.name,
+            "processed",
+            "motion-correction/registered output",
+        )
+
+    if is_vascular_reference(src):
+        return (
+            plan.raw_root / "slap2" / rel,
+            "raw",
+            "vascular reference retained with raw SLAP2 content",
+        )
+
+    # Launcher logs, MATLAB diaries, and experiment notes are acquisition records
+    # even when their extensions are not part of the usual image/data set.
+    if any(part in {"launcher_metadata", "notes"} for part in lower_parts):
+        return (
+            plan.raw_root / "slap2" / rel,
+            "raw",
+            "SLAP2 launcher metadata or acquisition notes",
+        )
+
+    raw_suffixes = {
+        ".dat",
+        ".meta",
+        ".json",
+        ".ini",
+        ".xml",
+        ".tif",
+        ".tiff",
+        ".yml",
+        ".yaml",
+        ".csv",
+        ".log",
+        ".txt",
+    }
+    if src.suffix.lower() in raw_suffixes or lower_name in {"desc_.mat", "desc.mat"}:
+        return (
+            plan.raw_root / "slap2" / rel,
+            "raw",
+            "raw SLAP2 acquisition/reference/metadata content",
+        )
+
+    return (
+        plan.overflow_root / "unmapped_slap2" / rel,
+        "overflow",
+        "unmatched SLAP2 content",
+    )
+
+
+def validate_voltage_pairs(plan: ReorgPlan) -> None:
+    """Warn when a voltage extraction appears to have an unpaired MAT/H5 file."""
+    by_stamp: dict[str, set[str]] = {}
+    for rec in plan.records:
+        if "dendriticVoltageExtraction" not in str(rec.dst):
+            continue
+        if rec.src.is_dir():
+            files = [p for p in rec.src.rglob("*") if p.is_file()]
+        else:
+            files = [rec.src]
+        for src in files:
+            match = VOLTAGE_PAIR_RE.search(src.name)
+            if match:
+                by_stamp.setdefault(match.group("stamp"), set()).add(src.suffix.lower())
+
+    for stamp, suffixes in sorted(by_stamp.items()):
+        if suffixes != {".mat", ".h5"}:
+            plan.warnings.append(
+                "Voltage extraction timestamp %s is missing a paired .mat/.h5: found %s"
+                % (stamp, sorted(suffixes))
+            )
+
+
 # -----------------------------------------------------------------------------
-# Validation / execution
+# Validation, execution, and reporting
 # -----------------------------------------------------------------------------
 
-def validate_plan(plan: ReorgPlan) -> List[str]:
-    """Validate a reorganization plan before execution.
 
-    Checks for duplicate sources, duplicate destinations, and moves that would place a
-    destination inside its own source.
-    """
-    errors: List[str] = []
+def validate_plan(plan: ReorgPlan) -> list[str]:
+    """Validate duplicate, overlapping, and dangerous moves."""
+    errors: list[str] = []
+    sources = [rec.src for rec in plan.records]
+    destinations = [rec.dst for rec in plan.records]
 
-    # No duplicate sources
-    srcs = [r.src for r in plan.records]
-    if len(srcs) != len(set(srcs)):
+    if len(sources) != len(set(sources)):
         errors.append("Duplicate source paths found in plan.")
 
-    # No duplicate destinations
-    dsts = [r.dst for r in plan.records]
-    if len(dsts) != len(set(dsts)):
-        dupes = find_duplicates(dsts)
-        errors.append(f"Duplicate destination paths found: {dupes[:10]}")
+    duplicate_destinations = sorted(
+        {str(path) for path in destinations if destinations.count(path) > 1}
+    )
+    if duplicate_destinations:
+        errors.append(
+            "Duplicate destinations found, first examples: %s"
+            % duplicate_destinations[:10]
+        )
 
-    # Destinations should not nest inside their own sources
     for rec in plan.records:
         try:
             rec.dst.relative_to(rec.src)
-            errors.append(f"Destination is inside source for move: {rec.src} -> {rec.dst}")
         except ValueError:
             pass
+        else:
+            errors.append("Destination is inside source: %s -> %s" % (rec.src, rec.dst))
+
+    # A whole-directory move and a nested file move cannot both execute safely.
+    source_set = set(sources)
+    for source in sources:
+        for parent in source.parents:
+            if parent in source_set:
+                errors.append(
+                    "Overlapping source moves found: %s and nested source %s"
+                    % (parent, source)
+                )
+                break
 
     return errors
 
-def find_duplicates(paths: Sequence[Path]) -> List[str]:
-    """Return duplicated path strings from a path sequence."""
-    seen: Dict[Path, int] = {}
-    dupes: List[str] = []
-    for p in paths:
-        seen[p] = seen.get(p, 0) + 1
-    for p, n in seen.items():
-        if n > 1:
-            dupes.append(str(p))
-    return dupes
-
 
 def create_destination_roots(plan: ReorgPlan, execute: bool) -> None:
-    """Create canonical destination root directories when execution is enabled."""
+    """Create standard destination folders in execution mode."""
     roots = [
         plan.raw_root,
-        plan.raw_root / "behavior",
-        plan.raw_root / "behavior-videos",
         plan.raw_root / "slap2",
         plan.processed_root,
         plan.processed_root / "motion_correction",
         plan.processed_root / "source_extraction",
-        plan.processed_root / "source_extraction" / "ExperimentSummary",
-        plan.backup_root,
+        plan.overflow_root,
+        plan.overflow_root / "remaining_root_items",
+        plan.overflow_root / "unmapped_slap2",
     ]
-    for root in roots:
-        ensure_dir(root, execute=execute)
+    if execute:
+        for root in roots:
+            root.mkdir(parents=True, exist_ok=True)
+
+
+def execute_plan(plan: ReorgPlan, execute: bool) -> None:
+    """Dry-run or execute all planned moves."""
+    create_destination_roots(plan, execute=execute)
+    for rec in sorted(plan.records, key=lambda r: (-len(r.src.parts), str(r.src))):
+        rec.status = move_one(rec.src, rec.dst, execute=execute)
 
 
 def move_one(src: Path, dst: Path, execute: bool) -> str:
-    """Move one filesystem object, respecting dry-run and overwrite protections."""
+    """Move one file/directory with overwrite protection."""
     if not src.exists():
         return "MISSING_SOURCE"
-
     if dst.exists():
-        # Avoid silent overwrite
         return "DEST_EXISTS"
-
     if execute:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dst))
@@ -614,67 +665,61 @@ def move_one(src: Path, dst: Path, execute: bool) -> str:
     return "DRY_RUN"
 
 
-def execute_plan(plan: ReorgPlan, execute: bool) -> None:
-    """Execute or dry-run all moves in a validated reorganization plan."""
-    create_destination_roots(plan, execute=execute)
-
-    # Sort deep files before parents to reduce folder-move conflicts
-    def sort_key(rec: MoveRecord) -> Tuple[int, int, str]:
-        """Sort deeper paths before shallower paths to reduce move conflicts."""
-        depth = len(rec.src.parts)
-        is_dir = 0 if rec.src.is_file() else 1
-        return (-depth, is_dir, str(rec.src))
-
-    for rec in sorted(plan.records, key=sort_key):
-        rec.status = move_one(rec.src, rec.dst, execute=execute)
-
-
-def cleanup_empty_dirs(root: Path, stop_at: Path, execute: bool) -> None:
-    """
-    Remove empty directories under root up to but not including stop_at.
-    """
-    if not root.exists():
+def cleanup_empty_dirs(root: Path, execute: bool) -> None:
+    """Remove empty source folders under ``root`` after execution."""
+    if not execute or not root.exists():
         return
-    all_dirs = sorted([p for p in root.rglob("*") if p.is_dir()], key=lambda p: len(p.parts), reverse=True)
-    for d in all_dirs:
-        if d == stop_at:
+    protected = {REPORT_DIR_NAME}
+    directories = [p for p in root.rglob("*") if p.is_dir()]
+    for path in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+        if path.name in protected:
             continue
         try:
-            next(d.iterdir())
+            next(path.iterdir())
         except StopIteration:
-            if execute:
-                d.rmdir()
+            path.rmdir()
 
 
-def write_report(plan: ReorgPlan, report_path: Path) -> None:
-    """Write a tab-separated report of planned or executed moves."""
+def write_report(plan: ReorgPlan, report_path: Path) -> Path:
+    """Write a TSV report describing the plan and operation statuses."""
+    report_path = report_path.expanduser().resolve()
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    with report_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f, delimiter="\t")
+    with report_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle, delimiter="\t")
         writer.writerow(["src", "dst", "category", "reason", "status"])
         for rec in plan.records:
-            writer.writerow([str(rec.src), str(rec.dst), rec.category, rec.reason, rec.status])
+            writer.writerow(
+                [str(rec.src), str(rec.dst), rec.category, rec.reason, rec.status]
+            )
+    return report_path
 
 
 def summarize_plan(plan: ReorgPlan) -> str:
-    """Format a compact human-readable summary of a reorganization plan."""
-    n_raw = sum(r.category == "raw" for r in plan.records)
-    n_processed = sum(r.category == "processed" for r in plan.records)
-    n_backup = sum(r.category == "backup" for r in plan.records)
-    total = len(plan.records)
+    """Return a compact text summary of a plan."""
+    counts: dict[str, int] = {}
+    statuses: dict[str, int] = {}
+    for rec in plan.records:
+        counts[rec.category] = counts.get(rec.category, 0) + 1
+        statuses[rec.status] = statuses.get(rec.status, 0) + 1
+
     lines = [
-        f"Target session: {plan.target_session_dir}",
-        f"Raw root:       {plan.raw_root}",
-        f"Processed root: {plan.processed_root}",
-        f"Backup root:    {plan.backup_root}",
-        f"Planned moves:  {total}",
-        f"  raw:          {n_raw}",
-        f"  processed:    {n_processed}",
-        f"  backup:       {n_backup}",
+        "Target session: %s" % plan.target_session_dir,
+        "Layout:         %s" % plan.layout,
+        "Output base:    %s" % plan.output_base,
+        "Raw root:       %s" % plan.raw_root,
+        "Processed root: %s" % plan.processed_root,
+        "Overflow root:  %s" % plan.overflow_root,
+        "Planned moves:  %d" % len(plan.records),
     ]
+    for key in ("raw", "processed", "overflow"):
+        lines.append("  %s: %d" % (key, counts.get(key, 0)))
+    if statuses:
+        lines.append("Statuses:")
+        for key, count in sorted(statuses.items()):
+            lines.append("  %s: %d" % (key, count))
     if plan.warnings:
         lines.append("Warnings:")
-        lines.extend([f"  - {w}" for w in plan.warnings])
+        lines.extend("  - %s" % warning for warning in plan.warnings)
     return "\n".join(lines)
 
 
@@ -682,108 +727,133 @@ def summarize_plan(plan: ReorgPlan) -> str:
 # CLI
 # -----------------------------------------------------------------------------
 
+
 def build_argparser() -> argparse.ArgumentParser:
-    """Build the command-line parser for the session reorganization utility."""
-    p = argparse.ArgumentParser(
+    """Build the command-line parser."""
+    parser = argparse.ArgumentParser(
         description=(
-            "Reorganize a SLAP2 session directory into raw / processed / remaining-data "
-            "roots based on a target session path and an example manifest."
+            "Reorganize voltage or glutamate SLAP2 sessions into canonical raw, "
+            "processed, and backup roots. Dry-run is the default."
         )
     )
-    p.add_argument(
-        "target_session_dir",
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--session-dir",
         type=Path,
-        help="Path to the current target raw session directory, e.g. ...\\826033_2026-02-17_13-13-55",
+        help="One raw session folder, e.g. .../826031_2026-01-30_15-04-02",
     )
-    p.add_argument(
-        "example_manifest_tsv",
+    group.add_argument(
+        "--root",
         type=Path,
-        help="TSV manifest from an example session structure.",
+        help="Root to search recursively for raw session folders",
     )
-    p.add_argument(
-        "--target-manifest-tsv",
-        type=Path,
+    parser.add_argument(
+        "--subject-id",
+        action="append",
         default=None,
-        help="Optional TSV manifest of the current target tree for reporting / sanity checks.",
+        help=(
+            "Optional six-digit subject filter for --root. Can be repeated. "
+            "Without this option, all matching subjects are included."
+        ),
     )
-    p.add_argument(
-        "--mouse-id",
-        type=str,
-        default=None,
-        help="Optional explicit mouse ID. Otherwise parsed from target folder name.",
+    parser.add_argument(
+        "--layout",
+        choices=("nested", "sibling"),
+        default="nested",
+        help=(
+            "nested (default): create canonical folders inside the supplied "
+            "session directory. sibling: reproduce the historical layout beside it."
+        ),
     )
-    p.add_argument(
+    parser.add_argument(
         "--execute",
         action="store_true",
-        help="Actually perform moves. Default is dry-run.",
+        help="Actually move files. Without this flag the script only writes a dry-run report.",
     )
-    p.add_argument(
-        "--report-path",
-        type=Path,
-        default=None,
-        help="Optional output TSV report path. Default writes next to target session parent.",
-    )
-    p.add_argument(
+    parser.add_argument(
         "--cleanup-empty-dirs",
         action="store_true",
-        help="After execution, remove empty directories left under the old target session tree.",
+        help="After execution, remove empty source folders left behind.",
     )
-    return p
+    parser.add_argument(
+        "--report-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for TSV reports. Default: "
+            "<session>/.reorganization_reports for nested layout, or the session parent for sibling layout."
+        ),
+    )
+    return parser
+
+
+def validate_subject_ids(subject_ids: Optional[Sequence[str]]) -> Optional[Set[str]]:
+    if not subject_ids:
+        return None
+    invalid = [value for value in subject_ids if re.fullmatch(r"\d{6}", value) is None]
+    if invalid:
+        raise ValueError("Subject IDs must contain exactly six digits: %s" % invalid)
+    return set(subject_ids)
+
+
+def run_one(
+    session_dir: Path,
+    execute: bool,
+    cleanup: bool,
+    report_dir: Optional[Path],
+    layout: str,
+) -> None:
+    """Plan, validate, execute/dry-run, and report one session."""
+    plan = build_reorganization_plan(session_dir, layout=layout)
+    errors = validate_plan(plan)
+    print(summarize_plan(plan))
+    if errors:
+        print("Validation errors:")
+        for error in errors:
+            print("  - %s" % error)
+        raise RuntimeError("Plan validation failed; refusing to continue.")
+
+    execute_plan(plan, execute=execute)
+    if cleanup:
+        cleanup_empty_dirs(session_dir, execute=execute)
+
+    mode = "executed" if execute else "dry_run"
+    if report_dir is not None:
+        base_report_dir = report_dir.expanduser().resolve()
+    elif layout == "nested":
+        base_report_dir = session_dir.expanduser().resolve() / REPORT_DIR_NAME
+    else:
+        base_report_dir = session_dir.expanduser().resolve().parent
+
+    report_path = base_report_dir / (
+        "%s_slap2_reorganization_%s_report.tsv" % (session_dir.name, mode)
+    )
+    write_report(plan, report_path)
+    print(summarize_plan(plan))
+    print("Report written to: %s\n" % report_path)
 
 
 def main() -> None:
-    """Command-line entry point for dry-running or executing a reorganization plan."""
+    """CLI entry point."""
     args = build_argparser().parse_args()
+    subject_ids = validate_subject_ids(args.subject_id)
 
-    target_session_dir: Path = args.target_session_dir
-    example_manifest_tsv: Path = args.example_manifest_tsv
-    target_manifest_tsv: Optional[Path] = args.target_manifest_tsv
-    mouse_id: Optional[str] = args.mouse_id
-    execute: bool = args.execute
+    if args.session_dir is not None:
+        sessions = [args.session_dir.expanduser().resolve()]
+    else:
+        sessions = find_session_dirs(args.root, subject_ids=subject_ids)
 
-    if not target_session_dir.exists():
-        raise FileNotFoundError(f"Target session directory does not exist: {target_session_dir}")
-    if not example_manifest_tsv.exists():
-        raise FileNotFoundError(f"Example manifest TSV does not exist: {example_manifest_tsv}")
-    if target_manifest_tsv is not None and not target_manifest_tsv.exists():
-        raise FileNotFoundError(f"Target manifest TSV does not exist: {target_manifest_tsv}")
+    if not sessions:
+        raise FileNotFoundError("No matching raw SLAP2 session folders found.")
 
-    plan = build_reorganization_plan(
-        target_session_dir=target_session_dir,
-        example_manifest_tsv=example_manifest_tsv,
-        target_manifest_tsv=target_manifest_tsv,
-        mouse_id=mouse_id,
-    )
-
-    print(summarize_plan(plan))
-
-    validation_errors = validate_plan(plan)
-    if validation_errors:
-        print("\nValidation errors:")
-        for err in validation_errors:
-            print(f"  - {err}")
-        raise RuntimeError("Plan validation failed. Refusing to continue.")
-
-    execute_plan(plan, execute=execute)
-
-    if execute and args.cleanup_empty_dirs:
-        cleanup_empty_dirs(target_session_dir, stop_at=target_session_dir.parent, execute=True)
-
-    report_path = args.report_path
-    if report_path is None:
-        mode = "executed" if execute else "dry_run"
-        report_path = target_session_dir.parent / f"{target_session_dir.name}_reorganization_{mode}_report.tsv"
-
-    write_report(plan, report_path=report_path)
-    print(f"\nReport written to: {report_path}")
-
-    status_counts: Dict[str, int] = {}
-    for rec in plan.records:
-        status_counts[rec.status] = status_counts.get(rec.status, 0) + 1
-
-    print("\nMove status summary:")
-    for k in sorted(status_counts):
-        print(f"  {k}: {status_counts[k]}")
+    for session_dir in sessions:
+        run_one(
+            session_dir=session_dir,
+            execute=args.execute,
+            cleanup=args.cleanup_empty_dirs,
+            report_dir=args.report_dir,
+            layout=args.layout,
+        )
 
 
 if __name__ == "__main__":
