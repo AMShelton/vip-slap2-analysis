@@ -195,7 +195,11 @@ def _normalize_trace_mode_for_lengths(vs, trace_mode: str) -> str:
         return mode
     try:
         modes = vs.available_trace_modes()
-        return "trial" if "trial" in modes else "continuous"
+        if "trial" in modes:
+            return "trial"
+        if "continuous" in modes:
+            return "continuous"
+        return "epoch_continuous" if "epoch_continuous" in modes else mode
     except Exception:
         return mode
 
@@ -367,6 +371,28 @@ def _build_voltage_alignment_timebase(
     return timebase, float(alignment_rate), info
 
 
+def _expected_trial_lengths_from_summary(vs, dmd: int, n_trials: int) -> np.ndarray:
+    """Use extractor line-range metadata for missing/empty trial placeholders."""
+    out = np.zeros((int(n_trials),), dtype=int)
+    try:
+        ranges = vs.get_trial_line_ranges(dmd=dmd)
+    except Exception:
+        return out
+    for key in ("nLines", "trialGlobalNLines"):
+        if key not in ranges:
+            continue
+        arr = np.asarray(ranges[key], dtype=float).squeeze()
+        if arr.ndim > 1:
+            arr = np.ravel(arr)
+        n = min(out.size, arr.size)
+        vals = np.rint(arr[:n]).astype(int)
+        vals[~np.isfinite(arr[:n])] = 0
+        out[:n] = np.maximum(vals, 0)
+        if np.any(out > 0):
+            return out
+    return out
+
+
 def reconstruct_voltage_dmd_session_traces(
     vs,
     dmd: int,
@@ -381,6 +407,7 @@ def reconstruct_voltage_dmd_session_traces(
     trace_mode: str = "trial",
     timebase_strategy: str = "auto",
     max_timebase_error_sec: float = 0.5,
+    strict_epoch_match: bool = True,
 ) -> ReconstructedTraceBundle:
     """Reconstruct one DMD's voltage traces as a session-wide alignment bundle.
 
@@ -466,7 +493,8 @@ def reconstruct_voltage_dmd_session_traces(
         )
 
     default_len = int(round(float(np.median(valid_lengths))))
-    trial_lengths = np.full((n_trials,), default_len, dtype=int)
+    trial_lengths = _expected_trial_lengths_from_summary(vs, dmd, n_trials)
+    trial_lengths[trial_lengths <= 0] = default_len
     for trial, length in valid_lengths_by_trial.items():
         trial_lengths[trial - 1] = int(length)
 
@@ -481,15 +509,27 @@ def reconstruct_voltage_dmd_session_traces(
         except Exception:
             trial_epoch = None
 
+    sample_epoch = None
     if epoch_df is not None and len(epoch_df) > 0:
+        if len(epoch_df) > 1 and trial_epoch is None and strict_epoch_match:
+            raise ValueError(
+                "Multi-epoch voltage reconstruction requires extractor trialEpoch metadata. "
+                "Re-run the patched extractDendrites.m before downstream processing."
+            )
+        strategy_norm = str(timebase_strategy or "auto").lower().replace("-", "_")
+        scale_mode = {"sample_rate": "never", "nominal": "never", "epoch_scaled": "always"}.get(strategy_norm, "auto")
         epoch_tb = build_epoch_aware_timebase(
             trial_lengths,
             sample_rate_hz=sample_rate_hz,
             epoch_df=epoch_df,
             trial_epoch=trial_epoch,
-            scale_each_epoch=True,
+            scale_each_epoch=scale_mode,
+            scale_tolerance_sec=max_timebase_error_sec,
+            strict_epoch_match=strict_epoch_match,
         )
         timebase_sec = epoch_tb.timebase_sec
+        sample_epoch = epoch_tb.sample_epoch
+        trial_epoch = epoch_tb.trial_epoch
         alignment_rate_hz = sample_rate_hz
         timebase_meta = dict(epoch_tb.metadata)
         timebase_meta["timebase_strategy_used"] = "epoch_aware" if len(epoch_df) > 1 else "epoch_scaled_single"
@@ -551,11 +591,14 @@ def reconstruct_voltage_dmd_session_traces(
 
         pos += length
 
-    if timebase_meta["timebase_strategy_used"] == "epoch_scaled" and epoch_end_sec is not None:
+    session_end_sec = float(timebase_sec[-1]) if total_samples else float(epoch_start_sec)
+    if epoch_df is not None and len(epoch_df) > 0:
+        session_end_sec = float(epoch_df["end_time"].iloc[-1])
+        reconstructed_duration_sec = float(session_end_sec - float(epoch_df["start_time"].iloc[0]))
+    elif timebase_meta["timebase_strategy_used"] == "epoch_scaled" and epoch_end_sec is not None:
         session_end_sec = float(epoch_end_sec)
         reconstructed_duration_sec = float(float(epoch_end_sec) - float(epoch_start_sec))
     else:
-        session_end_sec = float(timebase_sec[-1]) if total_samples else float(epoch_start_sec)
         reconstructed_duration_sec = float(total_samples / alignment_rate_hz)
 
     metadata: Dict[str, Any] = dict(timebase_meta)
@@ -565,6 +608,9 @@ def reconstruct_voltage_dmd_session_traces(
         "n_trials_total": int(n_trials),
         "n_trials_valid": int(np.sum(trial_valid_mask)),
         "n_samples_total": int(total_samples),
+        "trial_epoch": None if trial_epoch is None else np.asarray(trial_epoch, dtype=int).tolist(),
+        "strict_epoch_match": bool(strict_epoch_match),
+        "invalid_trial_length_source": "summary_line_ranges_then_median_fallback",
         "traces_storage": "memmap" if isinstance(traces, np.memmap) else "memory",
         "traces_memmap_path": str(getattr(traces, "filename", "")) if isinstance(traces, np.memmap) else None,
     })
@@ -579,6 +625,7 @@ def reconstruct_voltage_dmd_session_traces(
         session_end_sec=session_end_sec,
         reconstructed_duration_sec=reconstructed_duration_sec,
         metadata=metadata,
+        sample_epoch=sample_epoch,
     )
 
 
@@ -765,6 +812,7 @@ def reconstruct_voltage_dmd_session_traces_from_asset(
     trace_mode: str = "trial",
     timebase_strategy: str = "auto",
     max_timebase_error_sec: float = 0.5,
+    strict_epoch_match: bool = True,
 ) -> ReconstructedTraceBundle:
     """Load voltage assets and reconstruct one DMD as an alignment bundle.
 
@@ -802,4 +850,5 @@ def reconstruct_voltage_dmd_session_traces_from_asset(
             trace_mode=trace_mode,
             timebase_strategy=timebase_strategy,
             max_timebase_error_sec=max_timebase_error_sec,
+            strict_epoch_match=strict_epoch_match,
         )

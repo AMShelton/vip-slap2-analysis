@@ -25,6 +25,7 @@ from vip_slap2_analysis.common.alignment import (
     extract_image_intervals,
     extract_omission_intervals,
     extract_ordered_change_targets,
+    extract_trace_snippet,
     filter_intervals_to_epochs,
     filter_ordered_images_to_epochs,
     load_corrected_bonsai_csv,
@@ -214,6 +215,8 @@ def process_glutamate_extraction(
     overwrite: bool = False,
     trace_signal: str = "dF",
     trace_mode: Optional[str] = "ls",
+    strict_epoch_match: bool = True,
+    epoch_scale_mode: str = "auto",
 ) -> Dict[str, Any]:
     """
     Extract event-aligned glutamate response packages for one registered session asset.
@@ -263,7 +266,9 @@ def process_glutamate_extraction(
     epoch_df = load_imaging_epochs_csv(Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv")
     epoch_start_sec = float(epoch_df.iloc[0]["start_time"])
     epoch_end_sec = float(epoch_df.iloc[-1]["end_time"])
-    epoch_duration_sec = float(epoch_end_sec - epoch_start_sec)
+    epoch_span_sec = float(epoch_end_sec - epoch_start_sec)
+    epoch_acquired_duration_sec = float((epoch_df["end_time"] - epoch_df["start_time"]).sum())
+    epoch_gap_duration_sec = float(epoch_span_sec - epoch_acquired_duration_sec)
 
     image_times, ordered_images = extract_image_intervals(stim_df)
     change_times = extract_change_intervals(stim_df)
@@ -299,6 +304,12 @@ def process_glutamate_extraction(
         "trace_signal": str(trace_signal),
         "trace_mode": None if trace_mode is None else str(trace_mode),
         "trace_suffix": trace_suffix,
+        "dff_provenance": "SummaryLoCo per-trial dFF: stored when available, otherwise dF/F0 using the per-trial F0 dataset; no baseline operation spans acquisition epochs",
+        "strict_epoch_match": bool(strict_epoch_match),
+        "epoch_scale_mode": str(epoch_scale_mode),
+        "epoch_acquired_duration_sec": epoch_acquired_duration_sec,
+        "epoch_session_span_sec": epoch_span_sec,
+        "epoch_gap_duration_sec": epoch_gap_duration_sec,
     }
 
     mean_pkg: Dict[str, Any] = {"metadata": base_meta, "timebase_sec": tvecs, "DMD1": {}, "DMD2": {}}
@@ -314,6 +325,9 @@ def process_glutamate_extraction(
         "trace_signal": str(trace_signal),
         "trace_mode": None if trace_mode is None else str(trace_mode),
         "trace_suffix": trace_suffix,
+        "dff_provenance": "SummaryLoCo per-trial dFF: stored when available, otherwise dF/F0 using the per-trial F0 dataset; no baseline operation spans acquisition epochs",
+        "strict_epoch_match": bool(strict_epoch_match),
+        "epoch_scale_mode": str(epoch_scale_mode),
         "windows_sec": base_meta["windows_sec"],
         "event_counts": {
             "image_total": int(sum(len(v) for v in image_times.values())),
@@ -325,7 +339,9 @@ def process_glutamate_extraction(
             "n_unique_image_ids_total": int(len(image_times)),
             "n_unique_image_ids_after_epoch_filter": int(len(image_times_f)),
         },
-        "epoch_duration_sec": epoch_duration_sec,
+        "epoch_acquired_duration_sec": epoch_acquired_duration_sec,
+        "epoch_session_span_sec": epoch_span_sec,
+        "epoch_gap_duration_sec": epoch_gap_duration_sec,
         "per_dmd": {},
     }
 
@@ -340,6 +356,8 @@ def process_glutamate_extraction(
             signal=trace_signal,
             mode=trace_mode,
             epoch_df=epoch_df,
+            scale_epochs=epoch_scale_mode,
+            strict_epoch_match=strict_epoch_match,
         )
         if bundle.traces.size == 0:
             qc["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no valid traces"}
@@ -383,14 +401,17 @@ def process_glutamate_extraction(
 
         ordered_snippets: Dict[int, np.ndarray] = {}
         n_img_time = len(tvecs["image"])
-        n_pre_img = int(round(windows.image[0] * im_rate_hz))
         for evt in ordered_images_f:
-            center = int(round((float(evt.onset) - bundle.session_start_sec) * im_rate_hz))
-            start = center - n_pre_img
-            stop = start + n_img_time
-            if start < 0 or stop > bundle.traces.shape[1]:
+            snippet = extract_trace_snippet(
+                bundle,
+                float(evt.onset),
+                sample_rate_hz=im_rate_hz,
+                pre_time=windows.image[0],
+                post_time=windows.image[1],
+            )
+            if snippet is None or snippet.shape[1] != n_img_time:
                 continue
-            ordered_snippets[evt.event_idx] = _apply_synapse_mask_to_array(bundle.traces[:, start:stop], syn_mask)
+            ordered_snippets[evt.event_idx] = _apply_synapse_mask_to_array(snippet, syn_mask)
 
         mean_pkg[f"DMD{dmd}"]["image_identity"] = {img: summarize_event_tensor(arr) for img, arr in aligned_images.items()}
         mean_pkg[f"DMD{dmd}"]["change"] = summarize_event_tensor(aligned_changes)
@@ -422,8 +443,11 @@ def process_glutamate_extraction(
             "n_trials_valid": int(np.sum(bundle.trial_valid_mask)),
             "n_trials_invalid": int(np.sum(~bundle.trial_valid_mask)),
             "trial_lengths_samples": bundle.trial_lengths_samples.tolist(),
-            "reconstructed_duration_sec": float(bundle.reconstructed_duration_sec),
-            "duration_vs_epoch_error_sec": float(bundle.reconstructed_duration_sec - epoch_duration_sec),
+            "reconstructed_session_span_sec": float(bundle.reconstructed_duration_sec),
+            "acquired_duration_sec": float((bundle.metadata or {}).get("acquired_duration_sec", np.sum(bundle.trial_lengths_samples) / im_rate_hz)),
+            "imaging_gap_duration_sec": float((bundle.metadata or {}).get("imaging_gap_duration_sec", epoch_gap_duration_sec)),
+            "duration_error_sec_by_epoch": (bundle.metadata or {}).get("duration_error_sec_by_epoch", {}),
+            "trial_epoch_assignment_method": (bundle.metadata or {}).get("trial_epoch_assignment_method", "unknown"),
             "n_image_ids_extracted": int(len(image_count_by_id)),
             "image_count_by_id": image_count_by_id,
             "zero_count_image_ids": zero_count_ids,

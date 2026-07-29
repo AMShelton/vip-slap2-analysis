@@ -284,6 +284,7 @@ def collect_dmd_voltage_segments(
             drop_discarded=False,
             dtype=dtype,
             trace_mode=trace_mode,
+            epoch_integrity=epoch_integrity,
         )
         x = _as_time_by_roi(x, expected_n_rois=n_rois, dmd=dmd, trial=trial)
         if n_samples_raw < 0:
@@ -311,6 +312,7 @@ def collect_dmd_voltage_segments(
             {
                 "dmd": int(dmd),
                 "trial": int(trial),
+                "epoch": (int(vs.trial_epoch[trial - 1]) if getattr(vs, "trial_epoch", None) is not None and len(vs.trial_epoch) >= trial else None),
                 "valid_trial": True,
                 "n_samples_raw": n_samples_raw,
                 "n_samples": n_samples,
@@ -640,6 +642,7 @@ def _build_metadata(
     dmd_summary: Dict[str, Any],
     drop_discarded: bool,
     trace_mode: str,
+    epoch_integrity: Dict[str, Any],
 ) -> Dict[str, Any]:
     return {
         "schema_version": "0.1.0",
@@ -656,6 +659,7 @@ def _build_metadata(
             "drop_discarded": bool(drop_discarded),
             "voltage_metadata": vs.metadata,
             "h5_attrs": vs.h5_attrs,
+            "epoch_integrity": epoch_integrity,
         },
         "parameters": {
             "thresholds": asdict(thresholds),
@@ -691,6 +695,56 @@ def _build_metadata(
     }
 
 
+def _voltage_epoch_integrity(asset: SessionAssets, vs: VoltageSummary) -> Dict[str, Any]:
+    """Compare behavior imaging epochs with extractor trial/epoch metadata."""
+    epoch_path = Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv" if asset.qc_dir is not None else None
+    out: Dict[str, Any] = {
+        "behavior_epoch_csv": str(epoch_path) if epoch_path is not None else None,
+        "behavior_n_epochs": None,
+        "extractor_n_epochs": int(getattr(vs, "n_epochs", 0) or 0),
+        "trial_epoch_present": getattr(vs, "trial_epoch", None) is not None,
+        "passed": True,
+        "warnings": [],
+    }
+    if epoch_path is None or not epoch_path.exists():
+        out["passed"] = False
+        out["warnings"].append("Missing qc/behavior/imaging_epochs.csv")
+        return out
+    epoch_df = pd.read_csv(epoch_path)
+    out["behavior_n_epochs"] = int(len(epoch_df))
+    if len(epoch_df):
+        durations = epoch_df["end_time"].to_numpy(float) - epoch_df["start_time"].to_numpy(float)
+        span = float(epoch_df["end_time"].iloc[-1] - epoch_df["start_time"].iloc[0])
+        out["behavior_acquired_duration_sec"] = float(np.sum(durations))
+        out["behavior_session_span_sec"] = span
+        out["behavior_gap_duration_sec"] = float(span - np.sum(durations))
+    if out["extractor_n_epochs"] != out["behavior_n_epochs"]:
+        out["passed"] = False
+        out["warnings"].append(
+            f"Extractor reports {out['extractor_n_epochs']} epochs but behavior QC reports {out['behavior_n_epochs']}"
+        )
+    te = getattr(vs, "trial_epoch", None)
+    if te is None:
+        if int(out["behavior_n_epochs"] or 0) > 1:
+            out["passed"] = False
+            out["warnings"].append("Missing extractor trialEpoch metadata for a multi-epoch session")
+    else:
+        te = np.asarray(te, dtype=int).reshape(-1)
+        out["trial_epoch"] = te.tolist()
+        out["trials_per_epoch"] = {str(ep): int(np.sum(te == ep)) for ep in np.unique(te) if ep > 0}
+        if te.size != int(vs.n_trials):
+            out["passed"] = False
+            out["warnings"].append(
+                f"trialEpoch has {te.size} entries but summary reports {int(vs.n_trials)} trials"
+            )
+        expected = set(range(1, int(out["behavior_n_epochs"] or 0) + 1))
+        observed = set(int(x) for x in np.unique(te) if x > 0)
+        if expected != observed:
+            out["passed"] = False
+            out["warnings"].append(f"Observed trial epochs {sorted(observed)} do not match expected {sorted(expected)}")
+    return out
+
+
 # -----------------------------------------------------------------------------
 # Public API
 # -----------------------------------------------------------------------------
@@ -715,6 +769,7 @@ def run_voltage_qc(
     max_points_per_segment_for_snr: Optional[int] = 60_000,
     overwrite: bool = False,
     make_plots: bool = True,
+    strict_epoch_match: bool = True,
 ) -> VoltageQcResult:
     """Run first-pass QC for one voltage session.
 
@@ -811,6 +866,11 @@ def run_voltage_qc(
             sample_rate_hz=sample_rate_hz,
             default_hz=default_sample_rate_hz,
         )
+        epoch_integrity = _voltage_epoch_integrity(asset, vs)
+        if strict_epoch_match and not epoch_integrity["passed"]:
+            raise ValueError(
+                "Voltage epoch-integrity QC failed: " + "; ".join(epoch_integrity["warnings"])
+            )
 
         for dmd in range(1, int(vs.n_dmds) + 1):
             label = f"DMD{dmd}"
@@ -959,6 +1019,7 @@ def run_voltage_qc(
         "n_voltage_rois_total": int(len(qc_table)),
         "n_voltage_rois_recommended": int(qc_table["recommended_for_analysis"].sum()) if "recommended_for_analysis" in qc_table else 0,
         "n_dmds": int(len(dmd_summary)),
+        "epoch_integrity": metadata["session_metadata"].get("epoch_integrity", {}),
         "dmd_summary": dmd_summary,
         "quality_score_summary": (
             qc_table.groupby("dmd")["quality_score"].agg(["count", "mean", "median", "std", "min", "max"]).to_dict()

@@ -23,6 +23,8 @@ import pandas as pd
 
 from vip_slap2_analysis.common.session import SessionAssets
 from vip_slap2_analysis.glutamate.summary import GlutamateSummary
+from vip_slap2_analysis.common.epoch_alignment import load_epoch_dataframe_from_asset
+from vip_slap2_analysis.calcium.extraction import _reconstruct_ca_session_traces
 
 
 DEFAULT_CAMP_REGEX = r"(?i)^[A-Za-z]*CaMP\d+[A-Za-z0-9._-]*$"
@@ -325,6 +327,10 @@ def run_calcium_qc(
     trace_type: str = "Fsvd",
     motion_correct: bool = False,
     max_session_minutes=None,
+    dff_scope: str = "epoch",
+    baseline_method: str = "percentile",
+    strict_epoch_match: bool = True,
+    epoch_scale_mode: str = "auto",
     thresholds: Optional[CalciumQcThresholds] = None,
     overwrite: bool = False,
     process_kwargs: Optional[Dict[str, Any]] = None,
@@ -415,6 +421,11 @@ def run_calcium_qc(
 
     exp = GlutamateSummary(asset.summary_mat)
     fs_hz = _resolve_fs_hz(asset, metadata, exp)
+    epoch_df = load_epoch_dataframe_from_asset(asset)
+    if epoch_df is None:
+        raise FileNotFoundError("Calcium QC requires qc/behavior/imaging_epochs.csv")
+    epoch_start_sec = float(epoch_df["start_time"].iloc[0])
+    epoch_end_sec = float(epoch_df["end_time"].iloc[-1])
 
     rows: List[Dict[str, Any]] = []
     per_dmd: Dict[str, Any] = {}
@@ -448,21 +459,37 @@ def run_calcium_qc(
             }
             continue
 
-        proc = exp.get_processed_soma_ca_all_trials(
+        baseline_kwargs = {
+            "denoise_window_s": float(process_kwargs.get("denoise_window_s", 2.0)),
+            "hull_window_s": float(process_kwargs.get("hull_window_s", 90.0)),
+            "baseline_window_s": float(process_kwargs.get("baseline_window_s", 20.0)),
+            "baseline_q": float(process_kwargs.get("baseline_q", 15.0)),
+            "baseline_smooth_s": float(process_kwargs.get("baseline_smooth_s", 2.0)),
+            "f0_floor_frac": float(process_kwargs.get("f0_floor_frac", 0.15)),
+        }
+        bundle = _reconstruct_ca_session_traces(
+            exp,
             dmd=dmd,
             trace_type=trace_type,
-            fs_hz=fs_hz,
-            include_invalid=True,
+            im_rate_hz=fs_hz,
+            epoch_start_sec=epoch_start_sec,
+            epoch_end_sec=epoch_end_sec,
+            epoch_df=epoch_df,
             motion_correct=motion_correct,
+            use_glu=bool(process_kwargs.get("use_glu_as_motion_regressor", False)),
             max_session_minutes=max_session_minutes,
-            **process_kwargs,
+            dff_scope=dff_scope,
+            baseline_method=baseline_method,
+            strict_epoch_match=strict_epoch_match,
+            epoch_scale_mode=epoch_scale_mode,
+            **baseline_kwargs,
         )
-        dff = np.asarray(proc["dff"], dtype=float)
-        if dff.ndim != 3:
-            raise ValueError(f"Expected processed calcium dff shape (n_trials, n_rois, T), got {dff.shape}")
-
-        n_trials, n_rois, trial_len = dff.shape
-        concat = _concat_trials_with_nans(dff)
+        concat = np.asarray(bundle["traces"], dtype=float)
+        if concat.ndim != 2:
+            raise ValueError(f"Expected reconstructed calcium dff shape (n_rois, time), got {concat.shape}")
+        n_rois = int(concat.shape[0])
+        n_trials = int(len(bundle["trial_lengths_samples"]))
+        trial_len = int(np.nanmedian(bundle["trial_lengths_samples"])) if n_trials else 0
 
         keep_mask = np.zeros((n_rois,), dtype=bool)
         roi_fail_reason_counts: Dict[str, int] = {}
@@ -493,6 +520,8 @@ def run_calcium_qc(
                 "indicator2": indicator2,
                 "trace_type": trace_type,
                 "motion_correct": bool(motion_correct),
+                "dff_scope": str(dff_scope),
+                "baseline_method": str(baseline_method),
                 "valid_trial_fraction": valid_trial_fraction,
                 "n_trials": int(n_trials),
                 "trial_len_samples": int(trial_len),
@@ -515,6 +544,10 @@ def run_calcium_qc(
             "keep_mask_path": str(keep_paths[label]),
             "thresholds": asdict(thresholds),
             "roi_fail_reason_counts": roi_fail_reason_counts,
+            "dff_scope": str(dff_scope),
+            "baseline_method": str(baseline_method),
+            "trial_epoch": np.asarray(bundle.get("trial_epoch", []), dtype=int).tolist(),
+            "epoch_alignment": bundle.get("epoch_metadata", {}),
         }
 
     table = pd.DataFrame(rows)
@@ -535,6 +568,10 @@ def run_calcium_qc(
         "should_process_calcium": bool(any_processed),
         "trace_type": trace_type,
         "motion_correct": bool(motion_correct),
+        "dff_scope": str(dff_scope),
+        "baseline_method": str(baseline_method),
+        "strict_epoch_match": bool(strict_epoch_match),
+        "epoch_scale_mode": str(epoch_scale_mode),
         "fs_hz": float(fs_hz),
         "thresholds": asdict(thresholds),
         "per_dmd": per_dmd,

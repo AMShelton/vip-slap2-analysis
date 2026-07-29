@@ -292,6 +292,74 @@ def _fit_robust_f0_model(
     }
 
 
+def _fit_epochwise_f0_model(
+    raw: np.ndarray,
+    *,
+    sample_epoch: Sequence[int],
+    sample_rate_hz: float,
+    method: str,
+    percentile: float,
+    robust_bin_sec: float,
+    robust_smooth_sec: float,
+) -> Dict[str, Any]:
+    """Fit independent compact F0 models within contiguous acquisition epochs."""
+    raw2, _ = _as_trace_2d(raw)
+    labels = np.asarray(sample_epoch, dtype=int).reshape(-1)
+    if labels.size != raw2.shape[1]:
+        raise ValueError("sample_epoch length must match the voltage trace time axis")
+    if labels.size == 0 or np.any(labels <= 0):
+        raise ValueError("Every voltage sample must have a positive epoch label")
+
+    changes = np.flatnonzero(np.diff(labels) != 0) + 1
+    starts = np.concatenate([[0], changes])
+    stops = np.concatenate([changes, [labels.size]])
+    epoch_models: List[Dict[str, Any]] = []
+    epoch_slices: List[Tuple[int, int, int]] = []
+    seen = set()
+    for start, stop in zip(starts, stops):
+        epoch_id = int(labels[start])
+        if epoch_id in seen:
+            raise ValueError(f"Epoch {epoch_id} appears in disjoint sample blocks")
+        seen.add(epoch_id)
+        model = _fit_f0_model_chunked(
+            raw2[:, int(start):int(stop)],
+            sample_rate_hz=sample_rate_hz,
+            method=method,
+            percentile=percentile,
+            robust_bin_sec=robust_bin_sec,
+            robust_smooth_sec=robust_smooth_sec,
+        )
+        model["epoch_id"] = epoch_id
+        epoch_models.append(model)
+        epoch_slices.append((epoch_id, int(start), int(stop)))
+
+    return {
+        "f0_method": "epochwise",
+        "base_f0_method": str(method),
+        "f0_scope": "epoch",
+        "f0_is_time_varying": any(bool(m.get("f0_is_time_varying", False)) for m in epoch_models),
+        "epoch_slices": np.asarray(epoch_slices, dtype=np.int64),
+        "epoch_models": epoch_models,
+        "sample_rate_hz": float(sample_rate_hz),
+        "input_shape": tuple(int(x) for x in raw2.shape),
+        "f0_storage": "compact_epoch_models",
+    }
+
+
+def _f0_model_n_rois(model: Mapping[str, Any]) -> int:
+    method = str(model.get("f0_method", ""))
+    if method == "epochwise":
+        models = list(model.get("epoch_models", []))
+        if not models:
+            return 0
+        return _f0_model_n_rois(models[0])
+    if "f0_per_roi" in model:
+        return int(np.asarray(model["f0_per_roi"]).reshape(-1).size)
+    if "f0_bin_values" in model:
+        return int(np.asarray(model["f0_bin_values"]).shape[0])
+    raise ValueError("Cannot infer ROI count from F0 model")
+
+
 def _fit_f0_model_chunked(
     raw: np.ndarray,
     *,
@@ -328,6 +396,28 @@ def _f0_chunk_from_model(model: Mapping[str, Any], *, start: int, stop: int, n_s
     method = str(model.get("f0_method", ""))
     start = int(start)
     stop = int(stop)
+    if method == "epochwise":
+        out = np.full((_f0_model_n_rois(model), max(0, stop - start)), np.nan, dtype=np.float32)
+        slices = np.asarray(model.get("epoch_slices", []), dtype=np.int64).reshape(-1, 3)
+        models = list(model.get("epoch_models", []))
+        if len(models) != len(slices):
+            raise ValueError("Malformed epochwise F0 model")
+        for (_epoch_id, epoch_start, epoch_stop), submodel in zip(slices, models):
+            overlap_start = max(start, int(epoch_start))
+            overlap_stop = min(stop, int(epoch_stop))
+            if overlap_stop <= overlap_start:
+                continue
+            local_start = overlap_start - int(epoch_start)
+            local_stop = overlap_stop - int(epoch_start)
+            out[:, overlap_start - start:overlap_stop - start] = _f0_chunk_from_model(
+                submodel,
+                start=local_start,
+                stop=local_stop,
+                n_samples=int(epoch_stop - epoch_start),
+            )
+        if np.any(~np.isfinite(out)):
+            raise ValueError("Requested F0 chunk contains samples not covered by an epoch model")
+        return out
     if method == "static_percentile":
         f0_roi = np.asarray(model["f0_per_roi"], dtype=np.float32).reshape(-1)
         return np.repeat(f0_roi[:, None], max(0, stop - start), axis=1).astype(np.float32, copy=False)
@@ -367,14 +457,33 @@ def _compute_dff_from_f0_model_chunked(
 
 
 def _metadata_without_large_arrays(meta: Mapping[str, Any]) -> Dict[str, Any]:
-    """Return JSON-friendly metadata without embedding large F0 model arrays."""
+    """Return JSON-friendly compact-model metadata without large numeric arrays."""
     out = dict(meta)
-    for key in ("f0_per_roi", "f0_bin_centers_sample", "f0_bin_values"):
+    if str(out.get("f0_method", "")) == "epochwise":
+        out["epoch_models"] = [_metadata_without_large_arrays(m) for m in out.get("epoch_models", [])]
+    for key in ("f0_per_roi", "f0_bin_centers_sample", "f0_bin_values", "epoch_slices"):
         if key in out:
             arr = np.asarray(out[key])
             out[f"{key}_shape"] = tuple(int(x) for x in arr.shape)
-            out.pop(key, None)
+            if key == "epoch_slices":
+                out[key] = arr.astype(int).tolist()
+            else:
+                out.pop(key, None)
     return out
+
+
+def _write_f0_model_group(group: h5py.Group, model: Mapping[str, Any]) -> None:
+    """Persist a compact static, robust, or epochwise F0 model recursively."""
+    group.attrs["metadata_json"] = json.dumps(_metadata_without_large_arrays(model), default=_json_default)
+    for key in ("f0_per_roi", "f0_bin_centers_sample", "f0_bin_values", "epoch_slices"):
+        if key in model:
+            group.create_dataset(key, data=np.asarray(model[key]))
+    if str(model.get("f0_method", "")) == "epochwise":
+        epochs_group = group.create_group("epochs")
+        slices = np.asarray(model.get("epoch_slices", []), dtype=np.int64).reshape(-1, 3)
+        for row, submodel in zip(slices, model.get("epoch_models", [])):
+            epoch_id = int(row[0])
+            _write_f0_model_group(epochs_group.create_group(f"epoch_{epoch_id:04d}"), submodel)
 
 
 def _normalize_indicator_text(indicator: Optional[Any]) -> str:
@@ -861,6 +970,7 @@ def _transform_voltage_bundle(
     robust_f0_smooth_sec: float = 180.0,
     indicator: Optional[Any] = None,
     dff_polarity: str = "auto",
+    f0_scope: str = "epoch",
 ) -> Tuple[ReconstructedTraceBundle, Dict[str, Any], Optional[Dict[str, Any]]]:
     """Apply an optional voltage transform to a reconstructed bundle.
 
@@ -879,14 +989,47 @@ def _transform_voltage_bundle(
 
     polarity = resolve_voltage_dff_polarity(indicator, dff_polarity=dff_polarity)
 
-    f0_model = _fit_f0_model_chunked(
-        bundle.traces,
-        sample_rate_hz=sample_rate_hz,
-        method=str(f0_method),
-        percentile=f0_percentile,
-        robust_bin_sec=robust_f0_bin_sec,
-        robust_smooth_sec=robust_f0_smooth_sec,
-    )
+    scope = str(f0_scope).strip().lower()
+    if scope not in {"epoch", "session"}:
+        raise ValueError("f0_scope must be 'epoch' or 'session'")
+    sample_epoch = getattr(bundle, "sample_epoch", None)
+    if scope == "epoch":
+        if sample_epoch is None:
+            # Backward-compatible single-epoch bundles used in direct transforms/tests.
+            sample_epoch = np.ones((bundle.traces.shape[1],), dtype=int)
+        labels = np.asarray(sample_epoch, dtype=int).reshape(-1)
+        unique_epochs = np.unique(labels[labels > 0])
+        if unique_epochs.size <= 1:
+            f0_model = _fit_f0_model_chunked(
+                bundle.traces,
+                sample_rate_hz=sample_rate_hz,
+                method=str(f0_method),
+                percentile=f0_percentile,
+                robust_bin_sec=robust_f0_bin_sec,
+                robust_smooth_sec=robust_f0_smooth_sec,
+            )
+            f0_model["f0_scope"] = "epoch"
+            f0_model["epoch_id"] = int(unique_epochs[0]) if unique_epochs.size else 1
+        else:
+            f0_model = _fit_epochwise_f0_model(
+                bundle.traces,
+                sample_epoch=labels,
+                sample_rate_hz=sample_rate_hz,
+                method=str(f0_method),
+                percentile=f0_percentile,
+                robust_bin_sec=robust_f0_bin_sec,
+                robust_smooth_sec=robust_f0_smooth_sec,
+            )
+    else:
+        f0_model = _fit_f0_model_chunked(
+            bundle.traces,
+            sample_rate_hz=sample_rate_hz,
+            method=str(f0_method),
+            percentile=f0_percentile,
+            robust_bin_sec=robust_f0_bin_sec,
+            robust_smooth_sec=robust_f0_smooth_sec,
+        )
+        f0_model["f0_scope"] = "session"
     dff = _compute_dff_from_f0_model_chunked(
         bundle.traces,
         f0_model,
@@ -898,6 +1041,7 @@ def _transform_voltage_bundle(
         "trace_signal_requested": trace_signal,
         "output_signal": "dff",
         "chunked_transform": True,
+        "f0_scope": scope,
         **polarity,
         **_metadata_without_large_arrays(f0_model),
     }
@@ -949,10 +1093,7 @@ def _write_h5_f0_from_model(
     chunk_samples: int = 8192,
 ) -> h5py.Dataset:
     """Write full-resolution F0 to HDF5 from a compact model in chunks."""
-    if "f0_per_roi" in model:
-        n_rois = int(np.asarray(model["f0_per_roi"]).reshape(-1).size)
-    else:
-        n_rois = int(np.asarray(model["f0_bin_values"]).shape[0])
+    n_rois = _f0_model_n_rois(model)
     chunks = (1, max(1, min(int(n_samples), int(chunk_samples)))) if n_samples else None
     ds = group.create_dataset(
         name,
@@ -994,9 +1135,7 @@ def _write_session_transform_group(
         grp.attrs["f0_model_json"] = json.dumps(_metadata_without_large_arrays(transform_payload["f0_model"]), default=_json_default)
         model_grp = grp.create_group("f0_model")
         model = transform_payload["f0_model"]
-        for key in ("f0_per_roi", "f0_bin_centers_sample", "f0_bin_values"):
-            if key in model:
-                model_grp.create_dataset(key, data=np.asarray(model[key]))
+        _write_f0_model_group(model_grp, model)
     if getattr(bundle, "metadata", None):
         grp.attrs["reconstruction_metadata_json"] = json.dumps(bundle.metadata, default=_json_default)
     grp.attrs["session_start_sec"] = float(bundle.session_start_sec)
@@ -1008,6 +1147,11 @@ def _write_session_transform_group(
     grp.create_dataset("trial_valid_mask", data=np.asarray(bundle.trial_valid_mask, dtype=bool))
     grp.create_dataset("trial_lengths_samples", data=np.asarray(bundle.trial_lengths_samples, dtype=np.int64))
     grp.create_dataset("trial_starts_sec", data=np.asarray(bundle.trial_starts_sec, dtype=np.float64))
+    if getattr(bundle, "sample_epoch", None) is not None:
+        grp.create_dataset("sample_epoch", data=np.asarray(bundle.sample_epoch, dtype=np.int16))
+    trial_epoch = (getattr(bundle, "metadata", {}) or {}).get("trial_epoch", None)
+    if trial_epoch is not None:
+        grp.create_dataset("trial_epoch", data=np.asarray(trial_epoch, dtype=np.int16))
 
     if transform_payload is None:
         _write_h5_2d_chunked(
@@ -1077,10 +1221,15 @@ def load_voltage_roi_transform_h5(
             raise KeyError(f"{dmd_key!r} not found in {path}")
         grp = h5[dmd_key]
         out["timebase_sec"] = grp["timebase_sec"][:]
+        if "sample_epoch" in grp:
+            out["sample_epoch"] = grp["sample_epoch"][:]
         for key in ("raw_f", "f0", "dff"):
             if key in grp:
                 out[key] = grp[key][int(roi_index), :]
         out["metadata"] = json.loads(grp.attrs.get("signal_transform_json", "{}"))
+        out["reconstruction_metadata"] = json.loads(
+            grp.attrs.get("reconstruction_metadata_json", "{}")
+        )
     return out
 
 
@@ -1101,8 +1250,10 @@ def compute_voltage_roi_transform_from_asset(
     f0_percentile: float = 50.0,
     robust_f0_bin_sec: float = 5.0,
     robust_f0_smooth_sec: float = 180.0,
+    f0_scope: str = "epoch",
     voltage_indicator: Optional[str] = None,
     dff_polarity: str = "auto",
+    strict_epoch_match: bool = True,
 ) -> Dict[str, Any]:
     """Compute raw/F0/dFF for one ROI directly from a session asset.
 
@@ -1110,12 +1261,14 @@ def compute_voltage_roi_transform_from_asset(
     DMD session trace using the same code path as batch extraction, selects one
     ROI, and computes static or robust F0 plus indicator-polarity-corrected dF/F.
     """
-    if epoch_start_sec is None or epoch_end_sec is None:
-        epoch_df = _open_imaging_epochs(asset)
-        if epoch_start_sec is None:
-            epoch_start_sec = float(epoch_df.iloc[0]["start_time"])
-        if epoch_end_sec is None and "end_time" in epoch_df.columns:
-            epoch_end_sec = float(epoch_df.iloc[-1]["end_time"])
+    # Always load all behavior-derived imaging epochs. Even when callers supply
+    # outer session bounds, epoch-scoped F0 and strict alignment require the
+    # internal acquisition boundaries and imaging-off gaps.
+    epoch_df = _open_imaging_epochs(asset)
+    if epoch_start_sec is None:
+        epoch_start_sec = float(epoch_df.iloc[0]["start_time"])
+    if epoch_end_sec is None and "end_time" in epoch_df.columns:
+        epoch_end_sec = float(epoch_df.iloc[-1]["end_time"])
 
     with load_voltage_summary_from_asset(asset, keep_open=True) as vs:
         rate = resolve_voltage_sample_rate_hz(
@@ -1130,41 +1283,50 @@ def compute_voltage_roi_transform_from_asset(
             sample_rate_hz=rate,
             epoch_start_sec=float(epoch_start_sec),
             epoch_end_sec=(float(epoch_end_sec) if epoch_end_sec is not None else None),
-            epoch_df=epoch_df if 'epoch_df' in locals() else None,
+            epoch_df=epoch_df,
             drop_discarded=drop_discarded,
             dtype=np.float32,
             trace_mode=trace_mode,
             timebase_strategy=timebase_strategy,
             max_timebase_error_sec=max_timebase_error_sec,
+            strict_epoch_match=strict_epoch_match,
         )
 
     if roi_index < 0 or roi_index >= bundle.traces.shape[0]:
         raise IndexError(f"roi_index={roi_index} is out of bounds for {bundle.traces.shape[0]} ROIs")
 
-    raw_f = np.asarray(bundle.traces[int(roi_index), :], dtype=np.float32)
     polarity = _resolve_voltage_dff_polarity_for_dmd(
         asset,
         int(dmd),
         voltage_indicator=voltage_indicator,
         dff_polarity=dff_polarity,
     )
-    transformed = transform_voltage_signal(
-        raw_f,
+    transformed_bundle, transform_meta, payload = _transform_voltage_bundle(
+        bundle,
+        trace_signal=f"dff_{str(f0_method).lower()}_f0",
         sample_rate_hz=rate,
-        method=f0_method,
-        percentile=f0_percentile,
-        robust_bin_sec=robust_f0_bin_sec,
-        robust_smooth_sec=robust_f0_smooth_sec,
+        f0_percentile=f0_percentile,
+        robust_f0_bin_sec=robust_f0_bin_sec,
+        robust_f0_smooth_sec=robust_f0_smooth_sec,
         indicator=polarity.get("indicator"),
         dff_polarity=dff_polarity,
+        f0_scope=f0_scope,
     )
-    transformed["metadata"].update(polarity)
+    assert payload is not None
+    f0_roi = _f0_chunk_from_model(
+        payload["f0_model"], start=0, stop=bundle.traces.shape[1], n_samples=bundle.traces.shape[1]
+    )[int(roi_index)]
     return {
         "timebase_sec": np.asarray(bundle.timebase_sec, dtype=np.float64),
-        "raw_f": transformed["raw_f"],
-        "f0": transformed["f0"],
-        "dff": transformed["dff"],
-        "metadata": transformed["metadata"],
+        "sample_epoch": (
+            np.asarray(bundle.sample_epoch, dtype=np.int16)
+            if getattr(bundle, "sample_epoch", None) is not None
+            else None
+        ),
+        "raw_f": np.asarray(bundle.traces[int(roi_index)], dtype=np.float32),
+        "f0": np.asarray(f0_roi, dtype=np.float32),
+        "dff": np.asarray(transformed_bundle.traces[int(roi_index)], dtype=np.float32),
+        "metadata": transform_meta,
         "dmd": int(dmd),
         "roi_index": int(roi_index),
         "sample_rate_hz": float(rate),
@@ -1283,6 +1445,14 @@ def _extract_one_snippet(
     stop = start + n_win
     if start < 0 or stop > bundle.traces.shape[1]:
         return None
+    if getattr(bundle, "sample_epoch", None) is not None:
+        labels = np.asarray(bundle.sample_epoch[start:stop], dtype=int)
+        if labels.size == 0 or np.unique(labels[labels > 0]).size != 1:
+            return None
+    if timebase_sec is not None and stop - start > 1:
+        dt = np.diff(timebase_sec[start:stop])
+        if np.any(dt <= 0) or np.any(dt > 5.0 / float(sample_rate_hz)):
+            return None
     return np.asarray(bundle.traces[roi_mask, start:stop], dtype=np.float32)
 
 
@@ -1575,12 +1745,14 @@ def process_voltage_extraction(
     f0_percentile: float = 50.0,
     robust_f0_bin_sec: float = 5.0,
     robust_f0_smooth_sec: float = 180.0,
+    f0_scope: str = "epoch",
     voltage_indicator: Optional[str] = None,
     dff_polarity: str = "auto",
     trace_mode: str = "trial",
     drop_discarded: bool = True,
     timebase_strategy: str = "auto",
     max_timebase_error_sec: float = 0.5,
+    strict_epoch_match: bool = True,
     dtype: np.dtype = np.float32,
     write_single_trials: bool = True,
     write_sequence: bool = True,
@@ -1704,7 +1876,11 @@ def process_voltage_extraction(
     epoch_df = _open_imaging_epochs(asset)
     epoch_start_sec = float(epoch_df.iloc[0]["start_time"])
     epoch_end_sec = float(epoch_df.iloc[-1]["end_time"])
-    epoch_duration_sec = float(epoch_end_sec - epoch_start_sec)
+    epoch_session_span_sec = float(epoch_end_sec - epoch_start_sec)
+    epoch_acquired_duration_sec = float(
+        np.sum(epoch_df["end_time"].to_numpy(dtype=float) - epoch_df["start_time"].to_numpy(dtype=float))
+    )
+    epoch_gap_duration_sec = float(epoch_session_span_sec - epoch_acquired_duration_sec)
 
     image_times, ordered_images = extract_image_intervals(stim_df)
     change_times = extract_change_intervals(stim_df)
@@ -1776,6 +1952,14 @@ def process_voltage_extraction(
             "f0_percentile": float(f0_percentile),
             "robust_f0_bin_sec": float(robust_f0_bin_sec),
             "robust_f0_smooth_sec": float(robust_f0_smooth_sec),
+            "f0_scope": str(f0_scope),
+            "strict_epoch_match": bool(strict_epoch_match),
+            "n_imaging_epochs": int(len(epoch_df)),
+            "epoch_starts_sec": epoch_df["start_time"].astype(float).tolist(),
+            "epoch_ends_sec": epoch_df["end_time"].astype(float).tolist(),
+            "epoch_acquired_duration_sec": epoch_acquired_duration_sec,
+            "epoch_session_span_sec": epoch_session_span_sec,
+            "epoch_gap_duration_sec": epoch_gap_duration_sec,
             "voltage_indicator_override": _normalize_indicator_text(voltage_indicator) or None,
             "dff_polarity_requested": str(dff_polarity),
             "epoch_start_sec": float(epoch_start_sec),
@@ -1799,6 +1983,12 @@ def process_voltage_extraction(
             "trace_suffix": suffix,
             "voltage_indicator_override": _normalize_indicator_text(voltage_indicator) or None,
             "dff_polarity_requested": str(dff_polarity),
+            "f0_scope": str(f0_scope),
+            "strict_epoch_match": bool(strict_epoch_match),
+            "n_imaging_epochs": int(len(epoch_df)),
+            "epoch_acquired_duration_sec": epoch_acquired_duration_sec,
+            "epoch_session_span_sec": epoch_session_span_sec,
+            "epoch_gap_duration_sec": epoch_gap_duration_sec,
             "windows_sec": base_meta["windows_sec"],
             "event_counts": {
                 "image_total": int(sum(len(v) for v in image_times.values())),
@@ -1810,7 +2000,9 @@ def process_voltage_extraction(
                 "n_unique_image_ids_total": int(len(image_times)),
                 "n_unique_image_ids_after_epoch_filter": int(len(image_times_f)),
             },
-            "epoch_duration_sec": float(epoch_duration_sec),
+            # Backward-compatible alias: historically this represented the outer
+            # first-start to last-end span, not acquired imaging duration.
+            "epoch_duration_sec": float(epoch_session_span_sec),
             "per_dmd": {},
         }
 
@@ -1839,6 +2031,7 @@ def process_voltage_extraction(
                     trace_mode=trace_mode,
                     timebase_strategy=timebase_strategy,
                     max_timebase_error_sec=max_timebase_error_sec,
+                    strict_epoch_match=strict_epoch_match,
                 )
                 if bundle.traces.size == 0:
                     qc["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no valid traces"}
@@ -1858,6 +2051,7 @@ def process_voltage_extraction(
                         dff_polarity=dff_polarity,
                     ).get("indicator"),
                     dff_polarity=dff_polarity,
+                    f0_scope=f0_scope,
                 )
 
                 event_rate = float((getattr(bundle, "metadata", {}) or {}).get("alignment_sample_rate_hz", rate))
@@ -1977,7 +2171,9 @@ def process_voltage_extraction(
                     "n_trials_invalid": int(np.sum(~bundle.trial_valid_mask)),
                     "trial_lengths_samples": bundle.trial_lengths_samples.tolist(),
                     "reconstructed_duration_sec": float(bundle.reconstructed_duration_sec),
-                    "duration_vs_epoch_error_sec": float(bundle.reconstructed_duration_sec - epoch_duration_sec),
+                    "duration_vs_session_span_error_sec": float(
+                        bundle.reconstructed_duration_sec - epoch_session_span_sec
+                    ),
                     "reconstruction_metadata": dict(getattr(bundle, "metadata", {}) or {}),
                     "alignment_sample_rate_hz": float(event_rate),
                     "timebase_strategy_used": str((getattr(bundle, "metadata", {}) or {}).get("timebase_strategy_used", "unknown")),

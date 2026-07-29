@@ -199,9 +199,10 @@ class VoltageSummary:
 
         trial_keys = self._trial_dataset_keys()
         continuous_keys = self._continuous_dataset_keys()
-        if len(trial_keys) == 0 and len(continuous_keys) == 0:
+        epoch_continuous_keys = self._epoch_continuous_dataset_keys()
+        if len(trial_keys) == 0 and len(continuous_keys) == 0 and len(epoch_continuous_keys) == 0:
             raise KeyError(
-                "Trace file contains '/traces' but no trial_XXXX datasets or continuous/DMD datasets."
+                "Trace file contains '/traces' but no trial, continuous, or epoch-local continuous datasets."
             )
 
         # Preserve the MATLAB metadata trial count whenever it is available.
@@ -220,9 +221,9 @@ class VoltageSummary:
                 if name in available:
                     self.keep_trials[:, trial - 1] = True
         else:
-            # Continuous traces can be read for any trial index conceptually because
-            # the trial argument is ignored in trace_mode='continuous'.
-            self.keep_trials[:, :] = True
+            # Continuous-only layouts have no trial datasets. Trial metadata remain
+            # available from the summary, but trial-sliced access is unavailable.
+            self.keep_trials[:, :] = bool(continuous_keys or epoch_continuous_keys)
 
         self.valid_trials = [
             list(1 + np.flatnonzero(self.keep_trials[dmd0])) for dmd0 in range(self.n_dmds)
@@ -342,6 +343,24 @@ class VoltageSummary:
         keys = [k for k in self._h5["traces/continuous"].keys() if re.match(r"DMD\d+$", k)]
         return sorted(keys, key=lambda x: int(x.replace("DMD", "")))
 
+    def _epoch_continuous_dataset_keys(self) -> List[Tuple[int, int, str]]:
+        """Return ``(epoch, dmd, path)`` entries for epoch-local continuous traces."""
+        if self._h5 is None or "traces/epochs" not in self._h5:
+            return []
+        out: List[Tuple[int, int, str]] = []
+        root = self._h5["traces/epochs"]
+        for epoch_name in root.keys():
+            match_epoch = re.match(r"epoch_(\d{4})$", epoch_name)
+            if not match_epoch or not isinstance(root[epoch_name], h5py.Group):
+                continue
+            epoch = int(match_epoch.group(1))
+            for dmd_name in root[epoch_name].keys():
+                match_dmd = re.match(r"DMD(\d+)$", dmd_name)
+                if match_dmd:
+                    dmd = int(match_dmd.group(1))
+                    out.append((epoch, dmd, f"traces/epochs/{epoch_name}/{dmd_name}"))
+        return sorted(out, key=lambda x: (x[0], x[1]))
+
     def _infer_representative_sample_count(self) -> int:
         """Infer a representative sample count from available trace datasets."""
         if self._h5 is None:
@@ -357,6 +376,10 @@ class VoltageSummary:
             match = re.search(r"DMD(\d+)$", key)
             dmd = int(match.group(1)) if match else 1
             return self._infer_time_len_from_split_dataset(ds, self.n_rois[dmd - 1])
+        epoch_keys = self._epoch_continuous_dataset_keys()
+        if epoch_keys:
+            _epoch, dmd, path = epoch_keys[0]
+            return self._infer_time_len_from_split_dataset(self._h5[path], self.n_rois[dmd - 1])
         return 0
 
     def _init_from_flat_summary(self, summary: h5py.Group) -> None:
@@ -745,6 +768,8 @@ class VoltageSummary:
             modes.append("trial")
         if self._continuous_dataset_keys():
             modes.append("continuous")
+        if self._epoch_continuous_dataset_keys():
+            modes.append("epoch_continuous")
         return modes
 
     def get_roi_traces(
@@ -756,6 +781,7 @@ class VoltageSummary:
         drop_discarded: bool = False,
         dtype: Optional[np.dtype] = None,
         trace_mode: str = "auto",
+        epoch: Optional[int] = None,
     ) -> np.ndarray:
         """Return ROI traces as ``(n_samples, n_rois)``.
 
@@ -788,6 +814,7 @@ class VoltageSummary:
                 roi_inds=roi_inds,
                 t_slice=t_slice,
                 trace_mode=trace_mode,
+                epoch=epoch,
             )
         elif self._summary_layout == "flat_traces":
             x = self._get_flat_traces(dmd=dmd, trial=trial, roi_inds=roi_inds, t_slice=t_slice)
@@ -814,19 +841,21 @@ class VoltageSummary:
         roi_inds: Optional[Sequence[int]],
         t_slice: slice,
         trace_mode: str,
+        epoch: Optional[int] = None,
     ) -> np.ndarray:
         """Read traces from new paired HDF5 files."""
         if self._h5 is None:
             raise RuntimeError("Trace HDF5 file is not open.")
 
         mode = trace_mode.lower()
-        if mode not in ("auto", "trial", "continuous"):
-            raise ValueError("trace_mode must be 'auto', 'trial', or 'continuous'.")
+        if mode not in ("auto", "trial", "continuous", "epoch_continuous"):
+            raise ValueError("trace_mode must be 'auto', 'trial', 'continuous', or 'epoch_continuous'.")
 
         trial_keys = self._trial_dataset_keys()
         continuous_keys = self._continuous_dataset_keys()
+        epoch_keys = self._epoch_continuous_dataset_keys()
         if mode == "auto":
-            mode = "trial" if trial_keys else "continuous"
+            mode = "trial" if trial_keys else ("continuous" if continuous_keys else "epoch_continuous")
 
         if mode == "trial":
             trial0 = self._validate_trial(trial)
@@ -839,12 +868,39 @@ class VoltageSummary:
             )
 
         self._validate_dmd(dmd)
-        ds_name = f"traces/continuous/DMD{dmd}"
-        if ds_name not in self._h5:
-            raise KeyError(f"Continuous dataset not found: /{ds_name}")
+        if mode == "continuous":
+            ds_name = f"traces/continuous/DMD{dmd}"
+            if ds_name not in self._h5:
+                raise KeyError(f"Continuous dataset not found: /{ds_name}")
+        else:
+            if epoch is None:
+                raise ValueError("epoch must be supplied for trace_mode='epoch_continuous'")
+            epoch = int(epoch)
+            ds_name = f"traces/epochs/epoch_{epoch:04d}/DMD{dmd}"
+            if ds_name not in self._h5:
+                raise KeyError(f"Epoch-continuous dataset not found: /{ds_name}")
         cols = self._local_roi_cols(dmd, roi_inds)
         return self._read_split_columns(
             self._h5[ds_name], t_slice, cols, self.n_rois[dmd - 1]
+        )
+
+    def get_epoch_continuous_traces(
+        self,
+        dmd: int,
+        epoch: int,
+        roi_inds: Optional[Sequence[int]] = None,
+        t_slice: Optional[slice] = None,
+        dtype: Optional[np.dtype] = None,
+    ) -> np.ndarray:
+        """Read one epoch-local continuous trace block as ``time × ROI``."""
+        return self.get_roi_traces(
+            dmd=dmd,
+            trial=1,
+            roi_inds=roi_inds,
+            t_slice=t_slice,
+            dtype=dtype,
+            trace_mode="epoch_continuous",
+            epoch=epoch,
         )
 
     def _get_flat_traces(
@@ -883,20 +939,31 @@ class VoltageSummary:
             x = np.asarray(F[t_slice, list(roi_inds)])
         return np.atleast_2d(x)
 
-    def get_trace_dataset(self, dmd: int = 1, trial: int = 1, trace_mode: str = "auto") -> h5py.Dataset:
+    def get_trace_dataset(
+        self,
+        dmd: int = 1,
+        trial: int = 1,
+        trace_mode: str = "auto",
+        epoch: Optional[int] = None,
+    ) -> h5py.Dataset:
         """Return the underlying HDF5 trace dataset for advanced lazy access."""
         if self._summary_layout != "split_h5" or self._h5 is None:
             raise ValueError("get_trace_dataset is only available for split-H5 outputs.")
         mode = trace_mode.lower()
         if mode == "auto":
-            mode = "trial" if self._trial_dataset_keys() else "continuous"
+            mode = "trial" if self._trial_dataset_keys() else ("continuous" if self._continuous_dataset_keys() else "epoch_continuous")
         if mode == "trial":
             trial0 = self._validate_trial(trial)
             return self._h5[f"traces/trial_{trial0 + 1:04d}"]
         if mode == "continuous":
             self._validate_dmd(dmd)
             return self._h5[f"traces/continuous/DMD{dmd}"]
-        raise ValueError("trace_mode must be 'auto', 'trial', or 'continuous'.")
+        if mode == "epoch_continuous":
+            self._validate_dmd(dmd)
+            if epoch is None:
+                raise ValueError("epoch must be supplied for trace_mode='epoch_continuous'")
+            return self._h5[f"traces/epochs/epoch_{int(epoch):04d}/DMD{dmd}"]
+        raise ValueError("Unsupported trace_mode.")
 
     def get_trial_traces(
         self,
@@ -1188,6 +1255,16 @@ class VoltageSummary:
             return {}
         trial0 = self._validate_trial(trial)
         ds_name = f"traces/trial_{trial0 + 1:04d}"
+        if ds_name not in self._h5:
+            return {}
+        return {k: bytes_to_str(v) for k, v in self._h5[ds_name].attrs.items()}
+
+    def epoch_continuous_dataset_attrs(self, dmd: int, epoch: int) -> Dict[str, Any]:
+        """Return attributes for ``/traces/epochs/epoch_####/DMD#``."""
+        if self._summary_layout != "split_h5" or self._h5 is None:
+            return {}
+        self._validate_dmd(dmd)
+        ds_name = f"traces/epochs/epoch_{int(epoch):04d}/DMD{dmd}"
         if ds_name not in self._h5:
             return {}
         return {k: bytes_to_str(v) for k, v in self._h5[ds_name].attrs.items()}

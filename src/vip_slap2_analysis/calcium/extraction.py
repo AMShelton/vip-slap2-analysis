@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from vip_slap2_analysis.common.session import SessionAssets
-from vip_slap2_analysis.common.epoch_alignment import build_epoch_aware_timebase
+from vip_slap2_analysis.common.epoch_alignment import build_epoch_aware_timebase, epoch_sample_slices
 from vip_slap2_analysis.common.alignment import (
     EventWindows,
     align_traces_to_session_intervals,
@@ -28,6 +28,7 @@ from vip_slap2_analysis.common.alignment import (
     extract_image_intervals,
     extract_omission_intervals,
     extract_ordered_change_targets,
+    extract_trace_snippet,
     filter_intervals_to_epochs,
     filter_ordered_images_to_epochs,
     load_corrected_bonsai_csv,
@@ -297,6 +298,7 @@ def _reconstruct_ca_session_traces(
     exp: GlutamateSummary,
     dmd: int,
     *,
+    trace_type: str = "Fsvd",
     im_rate_hz: float,
     epoch_start_sec: float,
     epoch_end_sec: Optional[float] = None,
@@ -304,6 +306,16 @@ def _reconstruct_ca_session_traces(
     motion_correct: bool = True,
     use_glu: bool = True,
     max_session_minutes=None,
+    dff_scope: str = "epoch",
+    baseline_method: str = "percentile",
+    denoise_window_s: float = 2.0,
+    hull_window_s: float = 90.0,
+    baseline_window_s: float = 20.0,
+    baseline_q: float = 15.0,
+    baseline_smooth_s: float = 2.0,
+    f0_floor_frac: float = 0.15,
+    strict_epoch_match: bool = True,
+    epoch_scale_mode: str = "auto",
 ) -> Dict[str, Any]:
     """
     Reconstruct session-wide soma Ca traces by concatenating processed per-trial
@@ -318,14 +330,26 @@ def _reconstruct_ca_session_traces(
         which prevents small per-trial rounding errors from accumulating into a
         noticeable global stimulus lag later in the session
     """
+    dff_scope = str(dff_scope).strip().lower()
+    if dff_scope not in {"epoch", "trial"}:
+        raise ValueError("dff_scope must be 'epoch' or 'trial'")
+
     ca_dict = exp.get_processed_soma_ca_all_trials(
         dmd=dmd,
+        trace_type=trace_type,
         fs_hz=im_rate_hz,
         pad_to="none",
         include_invalid=True,
         motion_correct=motion_correct,
         use_glu_as_motion_regressor=use_glu,
         max_session_minutes=max_session_minutes,
+        baseline_method=baseline_method,
+        denoise_window_s=denoise_window_s,
+        hull_window_s=hull_window_s,
+        baseline_window_s=baseline_window_s,
+        baseline_q=baseline_q,
+        baseline_smooth_s=baseline_smooth_s,
+        f0_floor_frac=f0_floor_frac,
     )
 
     if ca_dict is None:
@@ -344,22 +368,23 @@ def _reconstruct_ca_session_traces(
             "duration_vs_epoch_error_sec": np.nan,
         }
 
-    if "dff" not in ca_dict:
+    source_key = "ca_mc" if dff_scope == "epoch" else "dff"
+    if source_key not in ca_dict:
         raise KeyError(
-            "get_processed_soma_ca_all_trials(...) did not return key 'dff'. "
+            f"get_processed_soma_ca_all_trials(...) did not return key {source_key!r}. "
             f"Available keys: {list(ca_dict.keys())}"
         )
 
-    dff_trials = ca_dict["dff"]
-    if isinstance(dff_trials, np.ndarray):
-        if dff_trials.ndim != 3:
+    source_trials = ca_dict[source_key]
+    if isinstance(source_trials, np.ndarray):
+        if source_trials.ndim != 3:
             raise ValueError(
-                f"Expected Ca dff shape (n_trials, n_rois, n_samples), got {dff_trials.shape}"
+                f"Expected calcium source shape (n_trials, n_rois, n_samples), got {source_trials.shape}"
             )
-        trial_list: List[Optional[np.ndarray]] = [np.asarray(dff_trials[i], dtype=float) for i in range(dff_trials.shape[0])]
+        trial_list: List[Optional[np.ndarray]] = [np.asarray(source_trials[i], dtype=float) for i in range(source_trials.shape[0])]
     else:
         trial_list = []
-        for tr in list(dff_trials):
+        for tr in list(source_trials):
             if tr is None:
                 trial_list.append(None)
             else:
@@ -456,18 +481,24 @@ def _reconstruct_ca_session_traces(
     effective_im_rate_hz = float(im_rate_hz)
     duration_vs_epoch_error_sec = np.nan
     epoch_metadata: Dict[str, Any] = {"epoch_aware": False}
+    epoch_tb = None
+    sample_epoch = np.ones((total_samples,), dtype=int)
+    trial_epoch = np.ones((n_trials,), dtype=int)
 
     if epoch_df is not None and len(epoch_df) > 0 and total_samples > 0:
         epoch_tb = build_epoch_aware_timebase(
             trial_lengths,
             sample_rate_hz=float(im_rate_hz),
             epoch_df=epoch_df,
-            scale_each_epoch=True,
+            scale_each_epoch=epoch_scale_mode,
+            strict_epoch_match=strict_epoch_match,
         )
         timebase_sec = epoch_tb.timebase_sec
         trial_starts_sec = epoch_tb.trial_starts_sec
         timebase_mode = "epoch_aware" if len(epoch_df) > 1 else "epoch_scaled_single"
         epoch_metadata = epoch_tb.metadata
+        sample_epoch = epoch_tb.sample_epoch
+        trial_epoch = epoch_tb.trial_epoch
         if epoch_tb.metadata.get("effective_sample_rate_hz_by_epoch"):
             vals = list(epoch_tb.metadata["effective_sample_rate_hz_by_epoch"].values())
             effective_im_rate_hz = float(np.nanmedian(np.asarray(vals, dtype=float)))
@@ -486,10 +517,38 @@ def _reconstruct_ca_session_traces(
             effective_im_rate_hz = float((total_samples - 1) / epoch_span_sec)
             duration_vs_epoch_error_sec = float(nominal_span_sec - epoch_span_sec)
 
+    corrected_f = traces.copy() if dff_scope == "epoch" else None
+    f0 = None
+    if dff_scope == "epoch":
+        f0 = np.full_like(corrected_f, np.nan, dtype=float)
+        # Estimate F0 independently within each acquired epoch. This prevents a
+        # restart offset or imaging-off gap from entering a rolling baseline.
+        for epoch_id, start, stop in epoch_sample_slices(trial_lengths, trial_epoch):
+            if stop <= start:
+                continue
+            for roi in range(corrected_f.shape[0]):
+                f0[roi, start:stop] = exp._estimate_ca_baseline(
+                    corrected_f[roi, start:stop],
+                    float(im_rate_hz),
+                    baseline_method=baseline_method,
+                    denoise_window_s=denoise_window_s,
+                    hull_window_s=hull_window_s,
+                    baseline_window_s=baseline_window_s,
+                    baseline_q=baseline_q,
+                    baseline_smooth_s=baseline_smooth_s,
+                    f0_floor_frac=f0_floor_frac,
+                )
+        dff = np.full_like(corrected_f, np.nan, dtype=float)
+        valid = np.isfinite(corrected_f) & np.isfinite(f0) & (np.abs(f0) > 1e-8)
+        np.divide(corrected_f - f0, f0, out=dff, where=valid)
+        traces = dff
+
     reconstructed_duration_sec = float(timebase_sec[-1] - timebase_sec[0]) if total_samples > 1 else 0.0
 
     return {
         "traces": traces,
+        "corrected_f": corrected_f,
+        "f0": f0,
         "trial_valid_mask": trial_valid_mask,
         "trial_lengths_samples": trial_lengths,
         "trial_starts_sec": trial_starts_sec,
@@ -502,6 +561,18 @@ def _reconstruct_ca_session_traces(
         "effective_im_rate_hz": effective_im_rate_hz,
         "duration_vs_epoch_error_sec": duration_vs_epoch_error_sec,
         "epoch_metadata": epoch_metadata,
+        "sample_epoch": sample_epoch,
+        "trial_epoch": trial_epoch,
+        "dff_scope": dff_scope,
+        "baseline_method": baseline_method,
+        "baseline_parameters": {
+            "denoise_window_s": float(denoise_window_s),
+            "hull_window_s": float(hull_window_s),
+            "baseline_window_s": float(baseline_window_s),
+            "baseline_q": float(baseline_q),
+            "baseline_smooth_s": float(baseline_smooth_s),
+            "f0_floor_frac": float(f0_floor_frac),
+        },
     }
 
 
@@ -554,6 +625,16 @@ def process_calcium_extraction(
     motion_correct: bool = True,
     use_glu: bool = True,
     max_session_minutes=None,
+    dff_scope: str = "epoch",
+    baseline_method: str = "percentile",
+    denoise_window_s: float = 2.0,
+    hull_window_s: float = 90.0,
+    baseline_window_s: float = 20.0,
+    baseline_q: float = 15.0,
+    baseline_smooth_s: float = 2.0,
+    f0_floor_frac: float = 0.15,
+    strict_epoch_match: bool = True,
+    epoch_scale_mode: str = "auto",
     overwrite: bool = False,
 ) -> Dict[str, Any]:
     """Extract event-aligned soma calcium datasets for one session.
@@ -626,7 +707,9 @@ def process_calcium_extraction(
     epoch_df = load_imaging_epochs_csv(Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv")
     epoch_start_sec = float(epoch_df.iloc[0]["start_time"])
     epoch_end_sec = float(epoch_df.iloc[-1]["end_time"])
-    epoch_duration_sec = float(epoch_end_sec - epoch_start_sec)
+    epoch_span_sec = float(epoch_end_sec - epoch_start_sec)
+    epoch_acquired_duration_sec = float((epoch_df["end_time"] - epoch_df["start_time"]).sum())
+    epoch_gap_duration_sec = float(epoch_span_sec - epoch_acquired_duration_sec)
 
     image_times, ordered_images = extract_image_intervals(stim_df)
     change_times = extract_change_intervals(stim_df)
@@ -656,6 +739,21 @@ def process_calcium_extraction(
         },
         "use_soma_qc": bool(use_soma_qc),
         "motion_correct": bool(motion_correct),
+        "dff_scope": str(dff_scope),
+        "baseline_method": str(baseline_method),
+        "baseline_parameters": {
+            "denoise_window_s": float(denoise_window_s),
+            "hull_window_s": float(hull_window_s),
+            "baseline_window_s": float(baseline_window_s),
+            "baseline_q": float(baseline_q),
+            "baseline_smooth_s": float(baseline_smooth_s),
+            "f0_floor_frac": float(f0_floor_frac),
+        },
+        "strict_epoch_match": bool(strict_epoch_match),
+        "epoch_scale_mode": str(epoch_scale_mode),
+        "epoch_acquired_duration_sec": epoch_acquired_duration_sec,
+        "epoch_session_span_sec": epoch_span_sec,
+        "epoch_gap_duration_sec": epoch_gap_duration_sec,
         "epoch_start_sec": epoch_start_sec,
         "epoch_end_sec": epoch_end_sec,
         "n_imaging_epochs": int(len(epoch_df)),
@@ -673,6 +771,11 @@ def process_calcium_extraction(
         "indicator2": indicator2,
         "motion_correct": bool(motion_correct),
         "use_soma_qc": bool(use_soma_qc),
+        "dff_scope": str(dff_scope),
+        "baseline_method": str(baseline_method),
+        "baseline_parameters": dict(base_meta["baseline_parameters"]),
+        "strict_epoch_match": bool(strict_epoch_match),
+        "epoch_scale_mode": str(epoch_scale_mode),
         "windows_sec": base_meta["windows_sec"],
         "event_counts": {
             "image_total": int(sum(len(v) for v in image_times.values())),
@@ -684,7 +787,9 @@ def process_calcium_extraction(
             "n_unique_image_ids_total": int(len(image_times)),
             "n_unique_image_ids_after_epoch_filter": int(len(image_times_f)),
         },
-        "epoch_duration_sec": epoch_duration_sec,
+        "epoch_acquired_duration_sec": epoch_acquired_duration_sec,
+        "epoch_session_span_sec": epoch_span_sec,
+        "epoch_gap_duration_sec": epoch_gap_duration_sec,
         "per_dmd": {},
     }
 
@@ -702,6 +807,7 @@ def process_calcium_extraction(
         bundle = _reconstruct_ca_session_traces(
             exp,
             dmd=dmd,
+            trace_type="Fsvd",
             im_rate_hz=im_rate_hz,
             epoch_start_sec=epoch_start_sec,
             epoch_end_sec=epoch_end_sec,
@@ -709,6 +815,16 @@ def process_calcium_extraction(
             motion_correct=motion_correct,
             use_glu=use_glu,
             max_session_minutes=max_session_minutes,
+            dff_scope=dff_scope,
+            baseline_method=baseline_method,
+            denoise_window_s=denoise_window_s,
+            hull_window_s=hull_window_s,
+            baseline_window_s=baseline_window_s,
+            baseline_q=baseline_q,
+            baseline_smooth_s=baseline_smooth_s,
+            f0_floor_frac=f0_floor_frac,
+            strict_epoch_match=strict_epoch_match,
+            epoch_scale_mode=epoch_scale_mode,
         )
         if bundle["traces"].size == 0:
             meta_out["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no calcium traces"}
@@ -757,13 +873,16 @@ def process_calcium_extraction(
         ordered_snippets: Dict[int, np.ndarray] = {}
         n_img_time = len(tvecs["image"])
         for evt in ordered_images_f:
-            center = _nearest_timebase_index(bundle, float(evt.onset), im_rate_hz=im_rate_hz)
-            n_pre = int(round(windows.image[0] * im_rate_hz))
-            start = center - n_pre
-            stop = start + n_img_time
-            if start < 0 or stop > bundle["traces"].shape[1]:
+            snippet = extract_trace_snippet(
+                bundle,
+                float(evt.onset),
+                sample_rate_hz=im_rate_hz,
+                pre_time=windows.image[0],
+                post_time=windows.image[1],
+            )
+            if snippet is None or snippet.shape[1] != n_img_time:
                 continue
-            ordered_snippets[evt.event_idx] = _apply_roi_mask_to_array(bundle["traces"][:, start:stop], roi_mask)
+            ordered_snippets[evt.event_idx] = _apply_roi_mask_to_array(snippet, roi_mask)
 
         mean_pkg[f"DMD{dmd}"]["image_identity"] = {
             img: summarize_event_tensor(arr) for img, arr in aligned_images.items()
@@ -804,6 +923,12 @@ def process_calcium_extraction(
             "reconstructed_duration_sec": float(bundle["reconstructed_duration_sec"]),
             "nominal_reconstructed_duration_sec": float(bundle.get("nominal_reconstructed_duration_sec", bundle["reconstructed_duration_sec"])),
             "duration_vs_epoch_error_sec": float(bundle.get("duration_vs_epoch_error_sec", np.nan)),
+            "dff_scope": str(bundle.get("dff_scope", dff_scope)),
+            "baseline_method": str(bundle.get("baseline_method", baseline_method)),
+            "trial_epoch": np.asarray(bundle.get("trial_epoch", []), dtype=int).tolist(),
+            "acquired_duration_sec": float(bundle.get("epoch_metadata", {}).get("acquired_duration_sec", np.sum(bundle["trial_lengths_samples"]) / im_rate_hz)),
+            "imaging_gap_duration_sec": float(bundle.get("epoch_metadata", {}).get("imaging_gap_duration_sec", epoch_gap_duration_sec)),
+            "duration_error_sec_by_epoch": bundle.get("epoch_metadata", {}).get("duration_error_sec_by_epoch", {}),
             "n_image_ids_extracted": int(len(image_count_by_id)),
             "image_count_by_id": image_count_by_id,
             "zero_count_image_ids": zero_count_ids,

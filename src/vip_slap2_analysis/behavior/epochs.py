@@ -290,7 +290,25 @@ def epochs_to_dataframe(epochs: List[List[float]]) -> pd.DataFrame:
 
 
 def summarize_epochs(epoch_df: pd.DataFrame, *, mode: str, gap_threshold_used: float, detection_method: str = "unknown") -> dict:
-    """Build a compact QC summary for detected imaging epochs."""
+    """Build a compact QC summary for detected imaging epochs and imaging gaps."""
+    warnings = []
+    if len(epoch_df) == 0:
+        warnings.append("No imaging epochs detected.")
+        acquired_duration = 0.0
+        session_span = 0.0
+        gaps = []
+        ordered_nonoverlap = False
+    else:
+        starts = epoch_df["start_time"].to_numpy(dtype=float)
+        ends = epoch_df["end_time"].to_numpy(dtype=float)
+        durations = ends - starts
+        gaps_arr = starts[1:] - ends[:-1]
+        ordered_nonoverlap = bool(np.all(durations > 0) and np.all(gaps_arr >= 0))
+        if not ordered_nonoverlap:
+            warnings.append("Epoch intervals are not strictly positive and non-overlapping.")
+        acquired_duration = float(np.sum(durations))
+        session_span = float(ends[-1] - starts[0])
+        gaps = gaps_arr.astype(float).round(6).tolist()
     return {
         "mode": mode,
         "detection_method": str(detection_method),
@@ -298,7 +316,12 @@ def summarize_epochs(epoch_df: pd.DataFrame, *, mode: str, gap_threshold_used: f
         "n_epochs": int(len(epoch_df)),
         "durations_s": epoch_df["duration_s"].round(6).tolist() if len(epoch_df) else [],
         "mean_duration_s": float(epoch_df["duration_s"].mean()) if len(epoch_df) else 0.0,
+        "acquired_duration_s": acquired_duration,
+        "session_span_s": session_span,
+        "imaging_gap_duration_s": float(session_span - acquired_duration),
+        "inter_epoch_gaps_s": gaps,
+        "ordered_nonoverlapping": ordered_nonoverlap,
         "timebase": "photodiode_harp_seconds",
-        "passed": len(epoch_df) > 0,
-        "warnings": [] if len(epoch_df) > 0 else ["No imaging epochs detected."],
+        "passed": bool(len(epoch_df) > 0 and ordered_nonoverlap),
+        "warnings": warnings,
     }

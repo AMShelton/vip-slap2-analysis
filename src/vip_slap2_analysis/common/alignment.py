@@ -70,6 +70,7 @@ class ReconstructedTraceBundle:
     session_end_sec: float
     reconstructed_duration_sec: float
     metadata: Optional[Dict[str, Any]] = None
+    sample_epoch: Optional[np.ndarray] = None
 
 
 # -----------------------------------------------------------------------------
@@ -418,7 +419,8 @@ def reconstruct_dmd_session_traces(
     mode: str = "ls",
     epoch_df: Optional[pd.DataFrame] = None,
     trial_epoch: Optional[Sequence[int]] = None,
-    scale_epochs: bool = True,
+    scale_epochs: Union[bool, str] = "auto",
+    strict_epoch_match: bool = True,
 ) -> ReconstructedTraceBundle:
     """
     Reconstruct a session-wide trace by concatenating all trials in order.
@@ -491,6 +493,7 @@ def reconstruct_dmd_session_traces(
         "n_samples_total": int(total_samples),
     }
 
+    sample_epoch = None
     if epoch_df is not None and len(epoch_df) > 0:
         epoch_tb = build_epoch_aware_timebase(
             trial_lengths,
@@ -498,10 +501,12 @@ def reconstruct_dmd_session_traces(
             epoch_df=epoch_df,
             trial_epoch=trial_epoch,
             scale_each_epoch=scale_epochs,
+            strict_epoch_match=strict_epoch_match,
         )
         timebase_sec = epoch_tb.timebase_sec
         trial_starts_sec = epoch_tb.trial_starts_sec
         metadata.update(epoch_tb.metadata)
+        sample_epoch = epoch_tb.sample_epoch
     else:
         timebase_sec = epoch_start_sec + np.arange(total_samples, dtype=float) / float(im_rate_hz)
 
@@ -515,6 +520,7 @@ def reconstruct_dmd_session_traces(
         session_end_sec=float(timebase_sec[-1]) if total_samples else float(epoch_start_sec),
         reconstructed_duration_sec=float(timebase_sec[-1] - timebase_sec[0]) if total_samples > 1 else 0.0,
         metadata=metadata,
+        sample_epoch=sample_epoch,
     )
 
 
@@ -563,23 +569,17 @@ def _resolve_bundle_timebase(bundle) -> Tuple[np.ndarray, np.ndarray, float, Opt
     return traces, np.asarray([session_start_sec], dtype=float), session_start_sec, timebase_sec
 
 
-def _nearest_sample_index(
+def nearest_sample_index(
     onset_sec: float,
     *,
     session_start_sec: float,
-    im_rate_hz: float,
+    sample_rate_hz: float,
     n_total_samples: int,
     timebase_sec: Optional[np.ndarray] = None,
 ) -> int:
-    """
-    Convert an event time to the nearest sample center.
-
-    When a valid explicit sample timebase is available, use nearest-neighbor search
-    on that timebase. Otherwise, fall back to the nominal fixed-rate mapping.
-    """
+    """Convert an event time to the nearest acquired sample center."""
     if n_total_samples <= 0:
         return 0
-
     if timebase_sec is not None and timebase_sec.size == n_total_samples:
         idx = int(np.searchsorted(timebase_sec, float(onset_sec), side="left"))
         if idx <= 0:
@@ -590,9 +590,84 @@ def _nearest_sample_index(
         if abs(float(timebase_sec[idx]) - float(onset_sec)) < abs(float(onset_sec) - float(timebase_sec[prev_idx])):
             return idx
         return prev_idx
-
-    center = int(round((float(onset_sec) - float(session_start_sec)) * float(im_rate_hz)))
+    center = int(round((float(onset_sec) - float(session_start_sec)) * float(sample_rate_hz)))
     return max(0, min(center, n_total_samples - 1))
+
+
+def _nearest_sample_index(
+    onset_sec: float,
+    *,
+    session_start_sec: float,
+    im_rate_hz: float,
+    n_total_samples: int,
+    timebase_sec: Optional[np.ndarray] = None,
+) -> int:
+    """Backward-compatible alias for :func:`nearest_sample_index`."""
+    return nearest_sample_index(
+        onset_sec,
+        session_start_sec=session_start_sec,
+        sample_rate_hz=im_rate_hz,
+        n_total_samples=n_total_samples,
+        timebase_sec=timebase_sec,
+    )
+
+
+def _bundle_sample_epoch(bundle, n_samples: int) -> Optional[np.ndarray]:
+    if isinstance(bundle, dict):
+        candidate = bundle.get("sample_epoch", None)
+    else:
+        candidate = getattr(bundle, "sample_epoch", None)
+    if candidate is None:
+        return None
+    arr = np.asarray(candidate, dtype=int).reshape(-1)
+    return arr if arr.size == n_samples else None
+
+
+def extract_trace_snippet(
+    bundle,
+    onset_sec: float,
+    *,
+    sample_rate_hz: float,
+    pre_time: float,
+    post_time: float,
+    max_gap_factor: float = 5.0,
+) -> Optional[np.ndarray]:
+    """Extract one ROI×time snippet without crossing an imaging restart.
+
+    The explicit HARP timebase selects the event sample. A snippet is rejected if
+    its samples span multiple acquisition epochs or contain a time jump much larger
+    than the nominal sample interval.
+    """
+    traces, _start_arr, session_start_sec, timebase_sec = _resolve_bundle_timebase(bundle)
+    if traces.ndim != 2 or traces.shape[1] == 0:
+        return None
+    n_pre = int(round(float(pre_time) * float(sample_rate_hz)))
+    n_post = int(round(float(post_time) * float(sample_rate_hz)))
+    n_win = n_pre + n_post
+    center = nearest_sample_index(
+        float(onset_sec),
+        session_start_sec=session_start_sec,
+        sample_rate_hz=float(sample_rate_hz),
+        n_total_samples=traces.shape[1],
+        timebase_sec=timebase_sec,
+    )
+    start = center - n_pre
+    stop = start + n_win
+    if start < 0 or stop > traces.shape[1] or n_win <= 0:
+        return None
+
+    sample_epoch = _bundle_sample_epoch(bundle, traces.shape[1])
+    if sample_epoch is not None:
+        labels = sample_epoch[start:stop]
+        labels = labels[labels > 0]
+        if labels.size == 0 or np.unique(labels).size != 1:
+            return None
+    if timebase_sec is not None and stop - start > 1:
+        dt = np.diff(timebase_sec[start:stop])
+        nominal_dt = 1.0 / float(sample_rate_hz)
+        if np.any(dt <= 0) or np.any(dt > float(max_gap_factor) * nominal_dt):
+            return None
+    return traces[:, start:stop]
 
 
 def align_traces_to_session_intervals(
@@ -623,18 +698,16 @@ def align_traces_to_session_intervals(
         kept_onsets = []
 
         for onset, _ in intervals:
-            center = _nearest_sample_index(
+            snippet = extract_trace_snippet(
+                bundle,
                 float(onset),
-                session_start_sec=session_start_sec,
-                im_rate_hz=im_rate_hz,
-                n_total_samples=traces.shape[1],
-                timebase_sec=timebase_sec,
+                sample_rate_hz=im_rate_hz,
+                pre_time=pre_time,
+                post_time=post_time,
             )
-            start = center - n_pre
-            stop = start + n_win
-            if start < 0 or stop > traces.shape[1]:
+            if snippet is None:
                 continue
-            snippets.append(traces[:, start:stop])
+            snippets.append(snippet)
             kept_onsets.append(float(onset))
 
         if len(snippets) == 0:
