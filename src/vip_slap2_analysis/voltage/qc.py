@@ -284,7 +284,6 @@ def collect_dmd_voltage_segments(
             drop_discarded=False,
             dtype=dtype,
             trace_mode=trace_mode,
-            epoch_integrity=epoch_integrity,
         )
         x = _as_time_by_roi(x, expected_n_rois=n_rois, dmd=dmd, trial=trial)
         if n_samples_raw < 0:
