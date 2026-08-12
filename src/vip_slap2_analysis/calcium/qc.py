@@ -23,7 +23,10 @@ import pandas as pd
 
 from vip_slap2_analysis.common.session import SessionAssets
 from vip_slap2_analysis.glutamate.summary import GlutamateSummary
-from vip_slap2_analysis.common.epoch_alignment import load_epoch_dataframe_from_asset
+from vip_slap2_analysis.common.epoch_alignment import (
+    DEFAULT_MIN_EPOCH_DURATION_SEC,
+    load_epoch_dataframe_from_asset,
+)
 from vip_slap2_analysis.calcium.extraction import _reconstruct_ca_session_traces
 
 
@@ -330,7 +333,8 @@ def run_calcium_qc(
     dff_scope: str = "epoch",
     baseline_method: str = "percentile",
     strict_epoch_match: bool = True,
-    epoch_scale_mode: str = "auto",
+    epoch_scale_mode: str = "never",
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
     thresholds: Optional[CalciumQcThresholds] = None,
     overwrite: bool = False,
     process_kwargs: Optional[Dict[str, Any]] = None,
@@ -421,7 +425,10 @@ def run_calcium_qc(
 
     exp = GlutamateSummary(asset.summary_mat)
     fs_hz = _resolve_fs_hz(asset, metadata, exp)
-    epoch_df = load_epoch_dataframe_from_asset(asset)
+    epoch_df = load_epoch_dataframe_from_asset(
+        asset,
+        min_duration_sec=min_epoch_duration_sec,
+    )
     if epoch_df is None:
         raise FileNotFoundError("Calcium QC requires qc/behavior/imaging_epochs.csv")
     epoch_start_sec = float(epoch_df["start_time"].iloc[0])
@@ -475,6 +482,7 @@ def run_calcium_qc(
             epoch_start_sec=epoch_start_sec,
             epoch_end_sec=epoch_end_sec,
             epoch_df=epoch_df,
+            source_trial_epoch=getattr(exp, "trial_epoch", None),
             motion_correct=motion_correct,
             use_glu=bool(process_kwargs.get("use_glu_as_motion_regressor", False)),
             max_session_minutes=max_session_minutes,
@@ -482,14 +490,22 @@ def run_calcium_qc(
             baseline_method=baseline_method,
             strict_epoch_match=strict_epoch_match,
             epoch_scale_mode=epoch_scale_mode,
+            min_epoch_duration_sec=min_epoch_duration_sec,
             **baseline_kwargs,
         )
         concat = np.asarray(bundle["traces"], dtype=float)
         if concat.ndim != 2:
             raise ValueError(f"Expected reconstructed calcium dff shape (n_rois, time), got {concat.shape}")
         n_rois = int(concat.shape[0])
-        n_trials = int(len(bundle["trial_lengths_samples"]))
-        trial_len = int(np.nanmedian(bundle["trial_lengths_samples"])) if n_trials else 0
+        retained_trial_mask = np.asarray(bundle["trial_lengths_samples"], dtype=int) > 0
+        bundle_valid_mask = np.asarray(bundle["trial_valid_mask"], dtype=bool)
+        n_trials = int(np.sum(retained_trial_mask))
+        n_trials_valid = int(np.sum(bundle_valid_mask & retained_trial_mask))
+        valid_trial_fraction = (
+            float(n_trials_valid / n_trials) if n_trials > 0 else 0.0
+        )
+        retained_lengths = np.asarray(bundle["trial_lengths_samples"], dtype=int)[retained_trial_mask]
+        trial_len = int(np.nanmedian(retained_lengths)) if retained_lengths.size else 0
 
         keep_mask = np.zeros((n_rois,), dtype=bool)
         roi_fail_reason_counts: Dict[str, int] = {}
@@ -547,7 +563,10 @@ def run_calcium_qc(
             "dff_scope": str(dff_scope),
             "baseline_method": str(baseline_method),
             "trial_epoch": np.asarray(bundle.get("trial_epoch", []), dtype=int).tolist(),
+            "source_trial_epoch": np.asarray(bundle.get("source_trial_epoch", []), dtype=int).tolist(),
             "epoch_alignment": bundle.get("epoch_metadata", {}),
+            "epoch_qc": bundle.get("epoch_metadata", {}).get("epoch_qc", {}),
+            "source_epoch_qc": bundle.get("epoch_metadata", {}).get("source_epoch_qc", []),
         }
 
     table = pd.DataFrame(rows)
@@ -571,7 +590,12 @@ def run_calcium_qc(
         "dff_scope": str(dff_scope),
         "baseline_method": str(baseline_method),
         "strict_epoch_match": bool(strict_epoch_match),
-        "epoch_scale_mode": str(epoch_scale_mode),
+        "epoch_scale_mode_requested": str(epoch_scale_mode),
+        "epoch_scale_mode_used": "never",
+        "min_epoch_duration_sec": float(min_epoch_duration_sec),
+        "epoch_duration_qc_policy": "accept_duration_greater_than_or_equal_to_threshold",
+        "source_trial_epoch_available": getattr(exp, "trial_epoch", None) is not None,
+        "source_trial_epoch_source": getattr(exp, "trial_epoch_source", "unavailable"),
         "fs_hz": float(fs_hz),
         "thresholds": asdict(thresholds),
         "per_dmd": per_dmd,

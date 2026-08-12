@@ -8,14 +8,21 @@ metadata from behavior QC."""
 
 from __future__ import annotations
 
+import glob
 import json
+import os
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
+import pandas as pd
 
 from vip_slap2_analysis.common.session import SessionAssets
+from vip_slap2_analysis.common.epoch_alignment import (
+    DEFAULT_MIN_EPOCH_DURATION_SEC,
+    classify_epochs_by_duration,
+)
 from vip_slap2_analysis.glutamate.summary import GlutamateSummary
 from vip_slap2_analysis.packaging.stimulus_events import (
     DEFAULT_EVENT_TIME_COLUMN,
@@ -28,14 +35,12 @@ from vip_slap2_analysis.packaging.trial_concat import (
     trial_lengths,
 )
 
-import glob
-import os
-from pathlib import Path
-from typing import Any, Dict, Optional
 
-import pandas as pd
-
-def _load_imaging_epoch_metadata(asset) -> Optional[Dict[str, Any]]:
+def _load_imaging_epoch_metadata(
+    asset,
+    *,
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
+) -> Optional[Dict[str, Any]]:
     """
     Load imaging epoch metadata from:
         <asset.qc_dir>/behavior/imaging_epochs.csv
@@ -58,9 +63,9 @@ def _load_imaging_epoch_metadata(asset) -> Optional[Dict[str, Any]]:
         return None
 
     path = Path(matches[0])
-    df = pd.read_csv(path)
+    raw_df = pd.read_csv(path)
 
-    if df.empty:
+    if raw_df.empty:
         return {
             "source_csv": str(path),
             "n_epochs": 0,
@@ -70,13 +75,17 @@ def _load_imaging_epoch_metadata(asset) -> Optional[Dict[str, Any]]:
             "total_imaged_duration_s": None,
         }
 
-    required_cols = {"start_idx", "end_idx", "start_time", "end_time", "duration_s"}
-    missing = required_cols.difference(df.columns)
+    required_cols = {"start_idx", "end_idx", "start_time", "end_time"}
+    missing = required_cols.difference(raw_df.columns)
     if missing:
         raise ValueError(
             f"imaging_epochs.csv is missing required columns: {sorted(missing)}"
         )
 
+    qc_df = classify_epochs_by_duration(
+        raw_df, min_duration_sec=min_epoch_duration_sec
+    )
+    df = qc_df.loc[qc_df["accepted"]].copy().reset_index(drop=True)
     epochs = []
     for _, row in df.iterrows():
         epochs.append(
@@ -91,11 +100,21 @@ def _load_imaging_epoch_metadata(asset) -> Optional[Dict[str, Any]]:
 
     return {
         "source_csv": str(path),
+        "n_epochs_raw": int(len(qc_df)),
         "n_epochs": int(len(df)),
+        "n_epochs_rejected": int((~qc_df["accepted"]).sum()),
+        "min_epoch_duration_sec": float(min_epoch_duration_sec),
+        "epoch_qc": qc_df.to_dict(orient="records"),
         "epochs": epochs,
-        "session_imaging_start_time_s": float(df["start_time"].min()),
-        "session_imaging_end_time_s": float(df["end_time"].max()),
-        "total_imaged_duration_s": float(df["duration_s"].sum()),
+        "session_imaging_start_time_s": (
+            float(df["start_time"].min()) if len(df) else None
+        ),
+        "session_imaging_end_time_s": (
+            float(df["end_time"].max()) if len(df) else None
+        ),
+        "total_imaged_duration_s": (
+            float(df["duration_s"].sum()) if len(df) else 0.0
+        ),
     }
 
 def _session_export_root(

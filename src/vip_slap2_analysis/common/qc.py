@@ -20,6 +20,7 @@ import pandas as pd
 from scipy.signal import savgol_filter
 
 from vip_slap2_analysis.glutamate.summary import GlutamateSummary
+from vip_slap2_analysis.common.epoch_alignment import DEFAULT_MIN_EPOCH_DURATION_SEC
 from vip_slap2_analysis.plotting.qc_plots import make_all_synapse_qc_plots
 
 
@@ -243,7 +244,9 @@ def collect_dmd_synapse_segments(
     dmd: int,
     signal: str = "dF",
     mode: str = "ls",
-) -> Tuple[List[List[np.ndarray]], Dict[str, float]]:
+    trial_keep_mask: Optional[np.ndarray] = None,
+    source_epoch_qc: Optional[List[Dict[str, object]]] = None,
+) -> Tuple[List[List[np.ndarray]], Dict[str, object]]:
     """
     Collect valid-trial segments per synapse for one DMD.
 
@@ -257,9 +260,24 @@ def collect_dmd_synapse_segments(
     """
     dmd0 = dmd - 1
     n_trials_total = int(exp.n_trials)
-    valid_trials = list(exp.valid_trials[dmd0])
+    valid_trials_all = list(exp.valid_trials[dmd0])
+    if trial_keep_mask is None:
+        analysis_trial_mask = np.ones((n_trials_total,), dtype=bool)
+    else:
+        analysis_trial_mask = np.asarray(trial_keep_mask, dtype=bool).reshape(-1)
+        if analysis_trial_mask.size != n_trials_total:
+            raise ValueError(
+                f"trial_keep_mask has {analysis_trial_mask.size} entries; expected {n_trials_total}"
+            )
+    valid_trials = [
+        int(tr) for tr in valid_trials_all
+        if 1 <= int(tr) <= n_trials_total and analysis_trial_mask[int(tr) - 1]
+    ]
+    n_trials_analysis = int(np.sum(analysis_trial_mask))
     n_valid_trials = len(valid_trials)
-    valid_trial_fraction = n_valid_trials / n_trials_total if n_trials_total > 0 else np.nan
+    valid_trial_fraction = (
+        n_valid_trials / n_trials_analysis if n_trials_analysis > 0 else np.nan
+    )
     n_synapses = int(exp.n_synapses[dmd0])
 
     synapse_segments: List[List[np.ndarray]] = [[] for _ in range(n_synapses)]
@@ -280,11 +298,14 @@ def collect_dmd_synapse_segments(
     dmd_info = {
         "dmd": dmd,
         "n_trials_total": n_trials_total,
+        "n_trials_analysis_eligible": n_trials_analysis,
+        "n_trials_rejected_epoch_qc": int(n_trials_total - n_trials_analysis),
         "n_valid_trials": n_valid_trials,
         "valid_trial_fraction": float(valid_trial_fraction) if np.isfinite(valid_trial_fraction) else np.nan,
         "n_synapses": n_synapses,
         "mean_valid_trial_length": float(np.mean(segment_lengths)) if len(segment_lengths) else np.nan,
         "total_valid_samples_per_synapse": int(np.sum(segment_lengths)) if len(segment_lengths) else 0,
+        "source_epoch_qc": source_epoch_qc or [],
     }
     return synapse_segments, dmd_info
 
@@ -560,6 +581,64 @@ def build_qc_metadata(
     }
 
 
+def _summary_source_epoch_qc(
+    exp: GlutamateSummary,
+    *,
+    dmd: int,
+    signal: str,
+    mode: str,
+    fs_hz: float,
+    min_epoch_duration_sec: float,
+) -> Tuple[np.ndarray, List[Dict[str, object]]]:
+    """Classify SummaryLoCo source epochs without requiring behavior files."""
+    n_trials = int(exp.n_trials)
+    labels = getattr(exp, "trial_epoch", None)
+    if labels is None:
+        return np.ones((n_trials,), dtype=bool), []
+    labels = np.asarray(labels, dtype=int).reshape(-1)
+    if labels.size != n_trials:
+        raise ValueError(
+            f"Summary source trial_epoch has {labels.size} entries; expected {n_trials}."
+        )
+
+    lengths = np.zeros((n_trials,), dtype=int)
+    readable: List[int] = []
+    for tr in exp.valid_trials[dmd - 1]:
+        x = _get_valid_trial_trace_matrix(
+            exp, dmd=dmd, trial=int(tr), signal=signal, mode=mode
+        )
+        length = int(x.shape[1])
+        lengths[int(tr) - 1] = length
+        if length > 0:
+            readable.append(length)
+    fallback = int(round(float(np.median(readable)))) if readable else 0
+    if fallback > 0:
+        lengths[lengths <= 0] = fallback
+
+    rows: List[Dict[str, object]] = []
+    accepted_ids = set()
+    for epoch_id in [int(x) for x in np.unique(labels) if int(x) > 0]:
+        idx_epoch = labels == epoch_id
+        samples = int(np.sum(lengths[idx_epoch]))
+        duration = float(samples / float(fs_hz))
+        accepted = bool(duration >= float(min_epoch_duration_sec))
+        if accepted:
+            accepted_ids.add(epoch_id)
+        rows.append({
+            "source_epoch_index": epoch_id,
+            "source_duration_s": duration,
+            "source_samples": samples,
+            "n_trials_total": int(np.sum(idx_epoch)),
+            "accepted_by_duration": accepted,
+            "discard_reason": "" if accepted else "duration_below_minimum",
+            "min_duration_sec": float(min_epoch_duration_sec),
+        })
+    keep = np.asarray(
+        [int(label) in accepted_ids for label in labels], dtype=bool
+    )
+    return keep, rows
+
+
 # =============================================================================
 # Public API
 # =============================================================================
@@ -596,6 +675,7 @@ def run_session_synapse_qc(
     score_params: Optional[Dict[str, float]] = None,
     save: bool = True,
     make_plots: bool = True,
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
 ) -> SessionQCResult:
     """
     Compute behavior-independent synapse QC from SummaryLoCo*.mat alone.
@@ -637,11 +717,21 @@ def run_session_synapse_qc(
     dmd_summary: Dict[str, Dict[str, float]] = {}
 
     for dmd in range(1, exp.n_dmds + 1):
+        trial_keep_mask, source_epoch_qc = _summary_source_epoch_qc(
+            exp,
+            dmd=dmd,
+            signal=trace_signal,
+            mode=trace_mode,
+            fs_hz=fs_hz,
+            min_epoch_duration_sec=min_epoch_duration_sec,
+        )
         synapse_segments, dmd_info = collect_dmd_synapse_segments(
             exp=exp,
             dmd=dmd,
             signal=trace_signal,
             mode=trace_mode,
+            trial_keep_mask=trial_keep_mask,
+            source_epoch_qc=source_epoch_qc,
         )
         dmd_summary[f"DMD{dmd}"] = dmd_info
 
@@ -699,6 +789,13 @@ def run_session_synapse_qc(
         score_params=score_params,
         dmd_summary=dmd_summary,
     )
+    metadata["epoch_duration_qc"] = {
+        "min_epoch_duration_sec": float(min_epoch_duration_sec),
+        "policy": "accept_source_epochs_at_or_above_minimum_duration",
+        "source_trial_epoch_available": getattr(exp, "trial_epoch", None) is not None,
+        "source_trial_epoch_source": getattr(exp, "trial_epoch_source", "unavailable"),
+        "fallback_when_unavailable": "retain_all_trials",
+    }
 
     summary = {
         "session_id": session_id,
@@ -706,6 +803,7 @@ def run_session_synapse_qc(
         "summary_mat_path": str(summary_mat_path),
         "n_synapses_total": int(len(qc_df)),
         "n_dmds": int(exp.n_dmds),
+        "min_epoch_duration_sec": float(min_epoch_duration_sec),
         "dmd_summary": dmd_summary,
         "quality_score_summary": (
             qc_df.groupby("dmd")["quality_score"]

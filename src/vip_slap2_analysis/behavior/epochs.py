@@ -94,6 +94,7 @@ def detect_pulse_train_epochs(
     starts = np.concatenate([[0], gap_idx + 1])
     stops = np.concatenate([gap_idx + 1, [edges.size]])
     epochs: List[List[float]] = []
+    candidate_rows: List[Dict[str, object]] = []
     gap_rows = []
     for gi in gap_idx:
         gap_rows.append({
@@ -112,7 +113,26 @@ def detect_pulse_train_epochs(
         start_time = float(t[start_edge])
         end_time = float(t[end_edge])
         duration = end_time - start_time
-        if n_pulse >= int(min_pulses) and duration >= float(min_duration):
+        accepted = bool(
+            n_pulse >= int(min_pulses) and duration >= float(min_duration)
+        )
+        reasons = []
+        if n_pulse < int(min_pulses):
+            reasons.append("pulse_count_below_minimum")
+        if duration < float(min_duration):
+            reasons.append("duration_below_minimum")
+        candidate_rows.append({
+            "source_epoch_index": int(len(candidate_rows) + 1),
+            "start_idx": int(start_edge),
+            "end_idx": int(end_edge + 1),
+            "start_time": start_time,
+            "end_time": end_time,
+            "duration_s": float(duration),
+            "n_pulses": int(n_pulse),
+            "accepted": accepted,
+            "discard_reason": ";".join(reasons),
+        })
+        if accepted:
             epochs.append([start_edge, end_edge + 1, start_time, end_time])
     diagnostics: Dict[str, object] = {
         "method": "pulse_train",
@@ -123,7 +143,11 @@ def detect_pulse_train_epochs(
         "min_gap_s": float(min_gap_s),
         "n_gaps": int(gap_idx.size),
         "gaps": gap_rows,
+        "n_candidate_epochs": int(len(candidate_rows)),
         "n_epochs": int(len(epochs)),
+        "n_epochs_accepted": int(len(epochs)),
+        "n_epochs_rejected": int(len(candidate_rows) - len(epochs)),
+        "candidate_epochs": candidate_rows,
         "min_duration_s": float(min_duration),
         "min_pulses": int(min_pulses),
         "warnings": [] if epochs else ["No pulse-train imaging epochs passed duration/pulse thresholds."],

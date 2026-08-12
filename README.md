@@ -147,6 +147,26 @@ Not every workflow needs every file. For example, `GlutamateSummary` can inspect
 single `SummaryLoCo*.mat` file directly, while `run_glutamate_analysis` expects the
 derived glutamate `.npz` products created by the extraction/alignment workflow.
 
+## Shared epoch-duration QC
+
+Behavior, glutamate, calcium, and voltage processing use a shared acquisition-
+epoch rule: epochs lasting **at least 30 seconds** are eligible for analysis by
+default. Raw extractors retain all epochs; Python QC rejects shorter fragments.
+A mismatch between the raw number of SLAP2 and behavior epochs is therefore
+allowed when short source fragments are discarded. The numbers of accepted
+source and behavior epochs must still match when `strict_epoch_match=True`.
+
+Accepted source epochs are paired chronologically with accepted HARP/DI3
+intervals. Nominal sample spacing is preserved, overlong terminal data are
+clipped rather than rescaled, and voltage/calcium F0 is estimated separately
+within each retained epoch. Rejected source trials use analysis epoch label `0`
+and are excluded from QC metrics and event-response outputs.
+
+The default can be changed explicitly through `min_epoch_duration_sec` in
+physiology functions or `min_epoch_duration` in behavior preprocessing. See
+[`EPOCH_DURATION_QC_PATCH_NOTES.md`](EPOCH_DURATION_QC_PATCH_NOTES.md) for the
+full policy and modality-specific behavior.
+
 ## Glutamate workflow
 
 ### Open a SLAP2 summary file

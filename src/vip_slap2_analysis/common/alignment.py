@@ -17,7 +17,13 @@ import numpy as np
 import pandas as pd
 
 from vip_slap2_analysis.glutamate.summary import GlutamateSummary
-from vip_slap2_analysis.common.epoch_alignment import build_epoch_aware_timebase, normalize_epoch_dataframe
+from vip_slap2_analysis.common.epoch_alignment import (
+    DEFAULT_MIN_EPOCH_DURATION_SEC,
+    accepted_epoch_dataframe,
+    build_epoch_aware_timebase,
+    normalize_epoch_dataframe,
+    reconcile_trial_epochs,
+)
 
 
 Interval = Tuple[float, float]
@@ -95,19 +101,24 @@ def load_corrected_bonsai_csv(path: Union[str, Path]) -> pd.DataFrame:
     return df
 
 
-def load_imaging_epochs_csv(path: Union[str, Path]) -> pd.DataFrame:
-    """
-    Load imaging epoch boundaries used to filter behavior events.
-    
-    The returned DataFrame must contain ``start_time`` and ``end_time`` columns in the
-    same corrected timebase as the event log.
+def load_imaging_epochs_csv(
+    path: Union[str, Path],
+    *,
+    min_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
+) -> pd.DataFrame:
+    """Load accepted imaging epochs used to filter physiology events.
+
+    Epochs shorter than ``min_duration_sec`` remain represented in behavior QC
+    diagnostics but are excluded from physiology processing. Accepted epochs are
+    relabeled consecutively for analysis while their original behavior labels are
+    retained in ``behavior_epoch_index``.
     """
     df = pd.read_csv(path)
-    required = {"start_time", "end_time"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"{path} is missing epoch columns: {sorted(missing)}")
-    return df
+    return accepted_epoch_dataframe(
+        df,
+        min_duration_sec=min_duration_sec,
+        require_any=True,
+    )
 
 
 def _time_col(stim_df: pd.DataFrame) -> str:
@@ -419,12 +430,17 @@ def reconstruct_dmd_session_traces(
     mode: str = "ls",
     epoch_df: Optional[pd.DataFrame] = None,
     trial_epoch: Optional[Sequence[int]] = None,
-    scale_epochs: Union[bool, str] = "auto",
+    scale_epochs: Union[bool, str] = "never",
     strict_epoch_match: bool = True,
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
 ) -> ReconstructedTraceBundle:
-    """
-    Reconstruct a session-wide trace by concatenating all trials in order.
-    Invalid trials are represented by NaN blocks of the inferred trial length.
+    """Reconstruct a session-wide glutamate trace from trial-wise outputs.
+
+    The shared epoch-QC policy is applied before allocation: behavior epochs and
+    explicit source epochs shorter than ``min_epoch_duration_sec`` are rejected,
+    accepted source epochs are mapped chronologically to accepted behavior epochs,
+    and excess source samples are clipped at the behavior endpoint without changing
+    the nominal imaging rate.
     """
     n_trials = int(exp.n_trials)
     valid_set = set(int(t) for t in exp.valid_trials[dmd - 1])
@@ -437,13 +453,13 @@ def reconstruct_dmd_session_traces(
         if trial not in valid_set:
             continue
         arr = _trial_trace_as_syn_by_time(
-                exp,
-                dmd=dmd,
-                trial=trial,
-                signal=signal,
-                mode=mode,
-                channel=0,
-            )
+            exp,
+            dmd=dmd,
+            trial=trial,
+            signal=signal,
+            mode=mode,
+            channel=0,
+        )
         valid_trial_data[trial] = arr
         valid_lengths.append(arr.shape[1])
         if n_syn_expected is None:
@@ -455,70 +471,107 @@ def reconstruct_dmd_session_traces(
             timebase_sec=np.empty((0,), dtype=float),
             trial_valid_mask=np.zeros((n_trials,), dtype=bool),
             trial_lengths_samples=np.zeros((n_trials,), dtype=int),
-            trial_starts_sec=np.zeros((n_trials,), dtype=float),
+            trial_starts_sec=np.full((n_trials,), np.nan, dtype=float),
             session_start_sec=float(epoch_start_sec),
             session_end_sec=float(epoch_start_sec),
             reconstructed_duration_sec=0.0,
+            metadata={"epoch_qc": {"status": "no_valid_trials"}},
+            sample_epoch=np.empty((0,), dtype=int),
         )
 
     if n_syn_expected is None:
         n_syn_expected = next(iter(valid_trial_data.values())).shape[0]
 
     default_len = int(round(float(np.median(valid_lengths))))
-    trial_lengths = np.full((n_trials,), default_len, dtype=int)
+    source_trial_lengths = np.full((n_trials,), default_len, dtype=int)
     for trial, arr in valid_trial_data.items():
-        trial_lengths[trial - 1] = int(arr.shape[1])
+        source_trial_lengths[trial - 1] = int(arr.shape[1])
+
+    if epoch_df is not None and len(epoch_df) > 0:
+        reconciliation = reconcile_trial_epochs(
+            source_trial_lengths,
+            sample_rate_hz=float(im_rate_hz),
+            behavior_epoch_df=epoch_df,
+            source_trial_epoch=trial_epoch,
+            min_epoch_duration_sec=min_epoch_duration_sec,
+            strict_epoch_match=strict_epoch_match,
+        )
+        trial_lengths = reconciliation.trial_lengths_samples
+        analysis_trial_epoch = reconciliation.analysis_trial_epoch
+        behavior_epochs = reconciliation.behavior_epoch_df
+    else:
+        reconciliation = None
+        trial_lengths = source_trial_lengths
+        analysis_trial_epoch = np.ones((n_trials,), dtype=int)
+        behavior_epochs = None
 
     total_samples = int(np.sum(trial_lengths))
     traces = np.full((n_syn_expected, total_samples), np.nan, dtype=float)
     trial_valid_mask = np.zeros((n_trials,), dtype=bool)
-    trial_starts_sec = np.zeros((n_trials,), dtype=float)
 
     pos = 0
     for trial in range(1, n_trials + 1):
-        L = int(trial_lengths[trial - 1])
-        trial_starts_sec[trial - 1] = float(epoch_start_sec + pos / im_rate_hz)
+        keep_len = int(trial_lengths[trial - 1])
+        if keep_len <= 0:
+            continue
         if trial in valid_trial_data:
             arr = valid_trial_data[trial]
             s = min(n_syn_expected, arr.shape[0])
-            LL = min(L, arr.shape[1])
-            traces[:s, pos:pos + LL] = arr[:s, :LL]
-            trial_valid_mask[trial - 1] = True
-        pos += L
+            ll = min(keep_len, arr.shape[1])
+            traces[:s, pos:pos + ll] = arr[:s, :ll]
+            trial_valid_mask[trial - 1] = bool(ll > 0 and np.isfinite(arr[:s, :ll]).any())
+        pos += keep_len
 
     metadata: Dict[str, Any] = {
         "epoch_aware": False,
         "n_trials_total": int(n_trials),
         "n_trials_valid": int(np.sum(trial_valid_mask)),
         "n_samples_total": int(total_samples),
+        "min_epoch_duration_sec": float(min_epoch_duration_sec),
+        "source_trial_lengths_samples": source_trial_lengths.astype(int).tolist(),
     }
 
-    sample_epoch = None
-    if epoch_df is not None and len(epoch_df) > 0:
+    sample_epoch: Optional[np.ndarray] = None
+    if behavior_epochs is not None and len(behavior_epochs) > 0:
+        # Current policy preserves nominal sample spacing. ``scale_epochs`` remains
+        # in the signature for compatibility but is intentionally ignored here.
         epoch_tb = build_epoch_aware_timebase(
             trial_lengths,
             sample_rate_hz=float(im_rate_hz),
-            epoch_df=epoch_df,
-            trial_epoch=trial_epoch,
-            scale_each_epoch=scale_epochs,
+            epoch_df=behavior_epochs,
+            trial_epoch=analysis_trial_epoch,
+            scale_each_epoch="never",
             strict_epoch_match=strict_epoch_match,
         )
         timebase_sec = epoch_tb.timebase_sec
         trial_starts_sec = epoch_tb.trial_starts_sec
         metadata.update(epoch_tb.metadata)
         sample_epoch = epoch_tb.sample_epoch
+        if reconciliation is not None:
+            metadata["epoch_qc"] = reconciliation.metadata
+            metadata["source_trial_epoch"] = reconciliation.source_trial_epoch.astype(int).tolist()
+            metadata["analysis_trial_epoch"] = reconciliation.analysis_trial_epoch.astype(int).tolist()
+            metadata["source_epoch_qc"] = reconciliation.source_epoch_qc.to_dict(orient="records")
     else:
         timebase_sec = epoch_start_sec + np.arange(total_samples, dtype=float) / float(im_rate_hz)
+        trial_offsets = np.concatenate([[0], np.cumsum(trial_lengths)])
+        trial_starts_sec = np.full((n_trials,), np.nan, dtype=float)
+        for i, (offset, length) in enumerate(zip(trial_offsets[:-1], trial_lengths)):
+            if length > 0:
+                trial_starts_sec[i] = float(epoch_start_sec + offset / float(im_rate_hz))
+        sample_epoch = np.ones((total_samples,), dtype=int)
 
+    session_start = float(timebase_sec[0]) if total_samples else float(epoch_start_sec)
+    session_end = float(timebase_sec[-1]) if total_samples else float(epoch_start_sec)
     return ReconstructedTraceBundle(
         traces=traces,
         timebase_sec=timebase_sec,
         trial_valid_mask=trial_valid_mask,
         trial_lengths_samples=trial_lengths,
         trial_starts_sec=trial_starts_sec,
-        session_start_sec=float(timebase_sec[0]) if total_samples else float(epoch_start_sec),
-        session_end_sec=float(timebase_sec[-1]) if total_samples else float(epoch_start_sec),
-        reconstructed_duration_sec=float(timebase_sec[-1] - timebase_sec[0]) if total_samples > 1 else 0.0,
+        session_start_sec=session_start,
+        session_end_sec=session_end,
+        reconstructed_duration_sec=float(session_end - session_start) if total_samples > 1 else 0.0,
         metadata=metadata,
         sample_epoch=sample_epoch,
     )

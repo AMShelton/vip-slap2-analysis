@@ -116,6 +116,7 @@ def test_calcium_epochwise_dff_does_not_bridge_restart_offset():
         dff_scope="epoch",
         motion_correct=False,
         strict_epoch_match=True,
+        min_epoch_duration_sec=1.0,
     )
     assert bundle["traces"].shape == (1, 200)
     assert np.nanmax(np.abs(bundle["traces"])) < 1e-8

@@ -30,6 +30,11 @@ import warnings
 import numpy as np
 import pandas as pd
 
+from vip_slap2_analysis.common.epoch_alignment import (
+    DEFAULT_MIN_EPOCH_DURATION_SEC,
+    accepted_epoch_dataframe,
+)
+
 from scipy import signal
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import medfilt
@@ -291,11 +296,21 @@ def load_harp_df_summary(harp_df_csv: Optional[str | Path], session_harp_t0_abs:
     }
 
 
-def load_imaging_epochs(qc_dir: str | Path, session_harp_t0_abs: float) -> pd.DataFrame:
+def load_imaging_epochs(
+    qc_dir: str | Path,
+    session_harp_t0_abs: float,
+    *,
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
+) -> pd.DataFrame:
     p = find_file(qc_dir, "imaging_epochs.csv")
     if p is None:
         raise FileNotFoundError(f"No imaging_epochs.csv found under {qc_dir}")
-    epochs = pd.read_csv(p).copy()
+    raw_epochs = pd.read_csv(p).copy()
+    epochs = accepted_epoch_dataframe(
+        raw_epochs,
+        min_duration_sec=min_epoch_duration_sec,
+        require_any=True,
+    )
     for col in ["start_time", "end_time"]:
         if col not in epochs:
             raise KeyError(f"{p} missing required column {col!r}")
@@ -306,6 +321,7 @@ def load_imaging_epochs(qc_dir: str | Path, session_harp_t0_abs: float) -> pd.Da
         )
     epochs["duration_sec"] = epochs["end_time_sec"] - epochs["start_time_sec"]
     epochs.attrs["path"] = str(p)
+    epochs.attrs["min_epoch_duration_sec"] = float(min_epoch_duration_sec)
     return epochs
 
 

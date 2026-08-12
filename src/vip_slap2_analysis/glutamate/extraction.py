@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from vip_slap2_analysis.common.session import SessionAssets
+from vip_slap2_analysis.common.epoch_alignment import DEFAULT_MIN_EPOCH_DURATION_SEC
 from vip_slap2_analysis.glutamate.summary import GlutamateSummary
 from vip_slap2_analysis.common.alignment import (
     EventWindows,
@@ -216,7 +217,8 @@ def process_glutamate_extraction(
     trace_signal: str = "dF",
     trace_mode: Optional[str] = "ls",
     strict_epoch_match: bool = True,
-    epoch_scale_mode: str = "auto",
+    epoch_scale_mode: str = "never",
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
 ) -> Dict[str, Any]:
     """
     Extract event-aligned glutamate response packages for one registered session asset.
@@ -263,7 +265,10 @@ def process_glutamate_extraction(
         }
 
     stim_df = load_corrected_bonsai_csv(asset.bonsai_event_log_csv)
-    epoch_df = load_imaging_epochs_csv(Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv")
+    epoch_df = load_imaging_epochs_csv(
+        Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv",
+        min_duration_sec=min_epoch_duration_sec,
+    )
     epoch_start_sec = float(epoch_df.iloc[0]["start_time"])
     epoch_end_sec = float(epoch_df.iloc[-1]["end_time"])
     epoch_span_sec = float(epoch_end_sec - epoch_start_sec)
@@ -306,7 +311,12 @@ def process_glutamate_extraction(
         "trace_suffix": trace_suffix,
         "dff_provenance": "SummaryLoCo per-trial dFF: stored when available, otherwise dF/F0 using the per-trial F0 dataset; no baseline operation spans acquisition epochs",
         "strict_epoch_match": bool(strict_epoch_match),
-        "epoch_scale_mode": str(epoch_scale_mode),
+        "epoch_scale_mode_requested": str(epoch_scale_mode),
+        "epoch_scale_mode_used": "never",
+        "min_epoch_duration_sec": float(min_epoch_duration_sec),
+        "epoch_duration_qc_policy": "accept_duration_greater_than_or_equal_to_threshold",
+        "source_trial_epoch_available": getattr(exp, "trial_epoch", None) is not None,
+        "source_trial_epoch_source": getattr(exp, "trial_epoch_source", "unavailable"),
         "epoch_acquired_duration_sec": epoch_acquired_duration_sec,
         "epoch_session_span_sec": epoch_span_sec,
         "epoch_gap_duration_sec": epoch_gap_duration_sec,
@@ -327,7 +337,12 @@ def process_glutamate_extraction(
         "trace_suffix": trace_suffix,
         "dff_provenance": "SummaryLoCo per-trial dFF: stored when available, otherwise dF/F0 using the per-trial F0 dataset; no baseline operation spans acquisition epochs",
         "strict_epoch_match": bool(strict_epoch_match),
-        "epoch_scale_mode": str(epoch_scale_mode),
+        "epoch_scale_mode_requested": str(epoch_scale_mode),
+        "epoch_scale_mode_used": "never",
+        "min_epoch_duration_sec": float(min_epoch_duration_sec),
+        "epoch_duration_qc_policy": "accept_duration_greater_than_or_equal_to_threshold",
+        "source_trial_epoch_available": getattr(exp, "trial_epoch", None) is not None,
+        "source_trial_epoch_source": getattr(exp, "trial_epoch_source", "unavailable"),
         "windows_sec": base_meta["windows_sec"],
         "event_counts": {
             "image_total": int(sum(len(v) for v in image_times.values())),
@@ -356,8 +371,10 @@ def process_glutamate_extraction(
             signal=trace_signal,
             mode=trace_mode,
             epoch_df=epoch_df,
+            trial_epoch=getattr(exp, "trial_epoch", None),
             scale_epochs=epoch_scale_mode,
             strict_epoch_match=strict_epoch_match,
+            min_epoch_duration_sec=min_epoch_duration_sec,
         )
         if bundle.traces.size == 0:
             qc["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no valid traces"}
@@ -448,6 +465,10 @@ def process_glutamate_extraction(
             "imaging_gap_duration_sec": float((bundle.metadata or {}).get("imaging_gap_duration_sec", epoch_gap_duration_sec)),
             "duration_error_sec_by_epoch": (bundle.metadata or {}).get("duration_error_sec_by_epoch", {}),
             "trial_epoch_assignment_method": (bundle.metadata or {}).get("trial_epoch_assignment_method", "unknown"),
+            "analysis_trial_epoch": (bundle.metadata or {}).get("analysis_trial_epoch", (bundle.metadata or {}).get("trial_epoch", [])),
+            "source_trial_epoch": (bundle.metadata or {}).get("source_trial_epoch", []),
+            "epoch_qc": (bundle.metadata or {}).get("epoch_qc", {}),
+            "source_epoch_qc": (bundle.metadata or {}).get("source_epoch_qc", []),
             "n_image_ids_extracted": int(len(image_count_by_id)),
             "image_count_by_id": image_count_by_id,
             "zero_count_image_ids": zero_count_ids,

@@ -21,7 +21,12 @@ import numpy as np
 import pandas as pd
 
 from vip_slap2_analysis.common.alignment import ReconstructedTraceBundle
-from vip_slap2_analysis.common.epoch_alignment import build_epoch_aware_timebase, load_epoch_dataframe
+from vip_slap2_analysis.common.epoch_alignment import (
+    DEFAULT_MIN_EPOCH_DURATION_SEC,
+    build_epoch_aware_timebase,
+    load_epoch_dataframe,
+    reconcile_trial_epochs,
+)
 from vip_slap2_analysis.common.session import SessionAssets
 from vip_slap2_analysis.voltage.summary import VoltageSummary
 
@@ -405,57 +410,18 @@ def reconstruct_voltage_dmd_session_traces(
     drop_discarded: bool = True,
     dtype=np.float32,
     trace_mode: str = "trial",
-    timebase_strategy: str = "auto",
+    timebase_strategy: str = "sample_rate",
     max_timebase_error_sec: float = 0.5,
     strict_epoch_match: bool = True,
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
 ) -> ReconstructedTraceBundle:
-    """Reconstruct one DMD's voltage traces as a session-wide alignment bundle.
+    """Reconstruct one DMD's voltage traces under the shared epoch-QC policy.
 
-    Parameters
-    ----------
-    vs
-        A :class:`vip_slap2_analysis.voltage.summary.VoltageSummary`-like object.
-    dmd
-        1-indexed DMD number.
-    sample_rate_hz
-        Voltage sample/line rate in hertz.  For current SLAP2 integration-mode
-        voltage imaging this is expected to be approximately 10.8 kHz.
-    epoch_start_sec
-        Corrected behavior/HARP time corresponding to sample 0 of the first trial
-        in the reconstructed voltage stream.  In the current pipeline this should
-        be the first ``imaging_epochs.csv`` ``start_time``.
-    epoch_end_sec
-        Optional corrected behavior/HARP time corresponding to the end of the
-        imaging epoch.  When provided, ``timebase_strategy='auto'`` can scale the
-        voltage timebase to this duration if the nominal sample-rate duration
-        would otherwise drift relative to behavior time.
-    drop_discarded
-        Remove samples marked by ``discardFrames`` before reconstruction.
-    dtype
-        Output dtype for loaded voltage traces.
-    trace_mode
-        Trace mode passed to ``VoltageSummary.get_roi_traces``.  Current voltage
-        outputs are trial-based, so the default is ``"trial"``.
-    timebase_strategy
-        ``"sample_rate"`` preserves nominal sample spacing. ``"epoch_scaled"``
-        maps the reconstructed trace onto ``epoch_start_sec`` → ``epoch_end_sec``.
-        ``"auto"`` uses epoch scaling only when the nominal duration and behavior
-        epoch differ by more than ``max_timebase_error_sec``.
-    max_timebase_error_sec
-        Duration mismatch threshold used by ``timebase_strategy='auto'``.
-
-    Returns
-    -------
-    ReconstructedTraceBundle
-        Bundle with ROI-major traces shaped ``(n_rois, n_total_samples)`` and an
-        explicit per-sample timebase.  Invalid trials are represented by NaN
-        blocks of the median valid trial length, mirroring the glutamate pipeline.
-
-    Notes
-    -----
-    This function is the boundary between voltage I/O and shared event alignment:
-    voltage blocks are read as ``(n_samples, n_rois)``, then transposed exactly
-    once into ``(n_rois, n_total_samples)`` for downstream alignment helpers.
+    Extractor-provided source epoch labels are retained, but only source epochs at
+    least ``min_epoch_duration_sec`` are eligible for analysis. Accepted source
+    epochs are mapped chronologically to accepted behavior epochs. Short source
+    fragments are discarded and overlong source epochs are clipped at the paired
+    behavior endpoint while preserving the nominal voltage sampling interval.
     """
     sample_rate_hz = float(sample_rate_hz)
     if not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
@@ -485,23 +451,19 @@ def reconstruct_voltage_dmd_session_traces(
             timebase_sec=np.empty((0,), dtype=float),
             trial_valid_mask=np.zeros((n_trials,), dtype=bool),
             trial_lengths_samples=np.zeros((n_trials,), dtype=int),
-            trial_starts_sec=np.zeros((n_trials,), dtype=float),
+            trial_starts_sec=np.full((n_trials,), np.nan, dtype=float),
             session_start_sec=float(epoch_start_sec),
             session_end_sec=float(epoch_start_sec),
             reconstructed_duration_sec=0.0,
             metadata={"timebase_strategy_used": "empty"},
+            sample_epoch=np.empty((0,), dtype=int),
         )
 
     default_len = int(round(float(np.median(valid_lengths))))
-    trial_lengths = _expected_trial_lengths_from_summary(vs, dmd, n_trials)
-    trial_lengths[trial_lengths <= 0] = default_len
+    source_trial_lengths = _expected_trial_lengths_from_summary(vs, dmd, n_trials)
+    source_trial_lengths[source_trial_lengths <= 0] = default_len
     for trial, length in valid_lengths_by_trial.items():
-        trial_lengths[trial - 1] = int(length)
-
-    total_samples = int(np.sum(trial_lengths))
-    traces = _allocate_roi_time_array(shape=(n_rois, total_samples), dtype=dtype)
-    trial_valid_mask = np.zeros((n_trials,), dtype=bool)
-    trial_starts_sec = np.zeros((n_trials,), dtype=float)
+        source_trial_lengths[trial - 1] = int(length)
 
     if trial_epoch is None and hasattr(vs, "trial_epoch"):
         try:
@@ -509,47 +471,89 @@ def reconstruct_voltage_dmd_session_traces(
         except Exception:
             trial_epoch = None
 
-    sample_epoch = None
+    reconciliation = None
+    sample_epoch: Optional[np.ndarray] = None
     if epoch_df is not None and len(epoch_df) > 0:
-        if len(epoch_df) > 1 and trial_epoch is None and strict_epoch_match:
+        if trial_epoch is None and int(getattr(vs, "n_epochs", 0) or 0) > 1 and strict_epoch_match:
             raise ValueError(
                 "Multi-epoch voltage reconstruction requires extractor trialEpoch metadata. "
                 "Re-run the patched extractDendrites.m before downstream processing."
             )
-        strategy_norm = str(timebase_strategy or "auto").lower().replace("-", "_")
-        scale_mode = {"sample_rate": "never", "nominal": "never", "epoch_scaled": "always"}.get(strategy_norm, "auto")
+        source_epoch_durations_sec = (
+            vs.get_dmd_epoch_durations_sec(dmd, sample_rate_hz=sample_rate_hz)
+            if hasattr(vs, "get_dmd_epoch_durations_sec")
+            else {}
+        )
+        reconciliation = reconcile_trial_epochs(
+            source_trial_lengths,
+            sample_rate_hz=sample_rate_hz,
+            behavior_epoch_df=epoch_df,
+            source_trial_epoch=trial_epoch,
+            source_epoch_durations_sec=source_epoch_durations_sec or None,
+            min_epoch_duration_sec=min_epoch_duration_sec,
+            strict_epoch_match=strict_epoch_match,
+            duration_warning_sec=max_timebase_error_sec,
+        )
+        trial_lengths = reconciliation.trial_lengths_samples
+        analysis_trial_epoch = reconciliation.analysis_trial_epoch
+        source_trial_epoch_arr = reconciliation.source_trial_epoch
+        behavior_epochs = reconciliation.behavior_epoch_df
         epoch_tb = build_epoch_aware_timebase(
             trial_lengths,
             sample_rate_hz=sample_rate_hz,
-            epoch_df=epoch_df,
-            trial_epoch=trial_epoch,
-            scale_each_epoch=scale_mode,
-            scale_tolerance_sec=max_timebase_error_sec,
+            epoch_df=behavior_epochs,
+            trial_epoch=analysis_trial_epoch,
+            scale_each_epoch="never",
             strict_epoch_match=strict_epoch_match,
         )
         timebase_sec = epoch_tb.timebase_sec
+        trial_starts_sec = epoch_tb.trial_starts_sec
         sample_epoch = epoch_tb.sample_epoch
-        trial_epoch = epoch_tb.trial_epoch
         alignment_rate_hz = sample_rate_hz
         timebase_meta = dict(epoch_tb.metadata)
-        timebase_meta["timebase_strategy_used"] = "epoch_aware" if len(epoch_df) > 1 else "epoch_scaled_single"
+        timebase_meta.update(
+            {
+                "timebase_strategy_requested": str(timebase_strategy),
+                "timebase_strategy_used": "nominal_rate_epoch_qc_clipped",
+                "epoch_qc": reconciliation.metadata,
+                "source_epoch_qc": reconciliation.source_epoch_qc.to_dict(orient="records"),
+                "source_trial_epoch": source_trial_epoch_arr.astype(int).tolist(),
+                "analysis_trial_epoch": analysis_trial_epoch.astype(int).tolist(),
+            }
+        )
     else:
+        trial_lengths = source_trial_lengths
+        source_trial_epoch_arr = (
+            np.asarray(trial_epoch, dtype=int).reshape(-1)
+            if trial_epoch is not None
+            else np.ones((n_trials,), dtype=int)
+        )
+        analysis_trial_epoch = source_trial_epoch_arr.copy()
+        total_samples_no_epoch = int(np.sum(trial_lengths))
         timebase_sec, alignment_rate_hz, timebase_meta = _build_voltage_alignment_timebase(
-            total_samples=total_samples,
+            total_samples=total_samples_no_epoch,
             sample_rate_hz=sample_rate_hz,
             epoch_start_sec=epoch_start_sec,
             epoch_end_sec=epoch_end_sec,
             strategy=timebase_strategy,
             max_timebase_error_sec=max_timebase_error_sec,
         )
+        trial_offsets = np.concatenate([[0], np.cumsum(trial_lengths)])
+        trial_starts_sec = np.full((n_trials,), np.nan, dtype=float)
+        for i, (offset, length) in enumerate(zip(trial_offsets[:-1], trial_lengths)):
+            if length > 0 and offset < timebase_sec.size:
+                trial_starts_sec[i] = float(timebase_sec[offset])
+        sample_epoch = np.ones((int(np.sum(trial_lengths)),), dtype=int)
+
+    total_samples = int(np.sum(trial_lengths))
+    traces = _allocate_roi_time_array(shape=(n_rois, total_samples), dtype=dtype)
+    trial_valid_mask = np.zeros((n_trials,), dtype=bool)
 
     pos = 0
     for trial in range(1, n_trials + 1):
-        length = int(trial_lengths[trial - 1])
-        if total_samples and pos < timebase_sec.size:
-            trial_starts_sec[trial - 1] = float(timebase_sec[pos])
-        else:
-            trial_starts_sec[trial - 1] = float(epoch_start_sec + pos / alignment_rate_hz)
+        keep_length = int(trial_lengths[trial - 1])
+        if keep_length <= 0:
+            continue
 
         if trial in valid_lengths_by_trial:
             n_raw = _trace_time_len_for_trial(vs, dmd=dmd, trial=trial, trace_mode=trace_mode)
@@ -581,39 +585,42 @@ def reconstruct_voltage_dmd_session_traces(
                     x = x[keep, :]
                 if x.size == 0:
                     continue
-                n_time = min(int(x.shape[0]), length - dst_cursor)
+                n_time = min(int(x.shape[0]), keep_length - dst_cursor)
                 if n_time <= 0:
                     break
                 n_roi = min(n_rois, int(x.shape[1]))
                 traces[:n_roi, pos + dst_cursor:pos + dst_cursor + n_time] = x[:n_time, :n_roi].T
                 dst_cursor += n_time
-            trial_valid_mask[trial - 1] = True
+            trial_valid_mask[trial - 1] = bool(dst_cursor > 0)
 
-        pos += length
+        pos += keep_length
 
+    session_start_sec = float(timebase_sec[0]) if total_samples else float(epoch_start_sec)
     session_end_sec = float(timebase_sec[-1]) if total_samples else float(epoch_start_sec)
-    if epoch_df is not None and len(epoch_df) > 0:
-        session_end_sec = float(epoch_df["end_time"].iloc[-1])
-        reconstructed_duration_sec = float(session_end_sec - float(epoch_df["start_time"].iloc[0]))
-    elif timebase_meta["timebase_strategy_used"] == "epoch_scaled" and epoch_end_sec is not None:
-        session_end_sec = float(epoch_end_sec)
-        reconstructed_duration_sec = float(float(epoch_end_sec) - float(epoch_start_sec))
-    else:
-        reconstructed_duration_sec = float(total_samples / alignment_rate_hz)
+    reconstructed_duration_sec = (
+        float(session_end_sec - session_start_sec) if total_samples > 1 else 0.0
+    )
 
     metadata: Dict[str, Any] = dict(timebase_meta)
-    metadata.update({
-        "trace_mode": str(trace_mode),
-        "drop_discarded": bool(drop_discarded),
-        "n_trials_total": int(n_trials),
-        "n_trials_valid": int(np.sum(trial_valid_mask)),
-        "n_samples_total": int(total_samples),
-        "trial_epoch": None if trial_epoch is None else np.asarray(trial_epoch, dtype=int).tolist(),
-        "strict_epoch_match": bool(strict_epoch_match),
-        "invalid_trial_length_source": "summary_line_ranges_then_median_fallback",
-        "traces_storage": "memmap" if isinstance(traces, np.memmap) else "memory",
-        "traces_memmap_path": str(getattr(traces, "filename", "")) if isinstance(traces, np.memmap) else None,
-    })
+    metadata.update(
+        {
+            "trace_mode": str(trace_mode),
+            "drop_discarded": bool(drop_discarded),
+            "n_trials_total": int(n_trials),
+            "n_trials_valid": int(np.sum(trial_valid_mask)),
+            "n_trials_rejected_by_epoch_qc": int(np.sum(np.asarray(trial_lengths) <= 0)),
+            "n_samples_total": int(total_samples),
+            "source_trial_lengths_samples": source_trial_lengths.astype(int).tolist(),
+            "trial_epoch": analysis_trial_epoch.astype(int).tolist(),
+            "source_trial_epoch": source_trial_epoch_arr.astype(int).tolist(),
+            "analysis_trial_epoch": analysis_trial_epoch.astype(int).tolist(),
+            "strict_epoch_match": bool(strict_epoch_match),
+            "min_epoch_duration_sec": float(min_epoch_duration_sec),
+            "invalid_trial_length_source": "summary_line_ranges_then_median_fallback",
+            "traces_storage": "memmap" if isinstance(traces, np.memmap) else "memory",
+            "traces_memmap_path": str(getattr(traces, "filename", "")) if isinstance(traces, np.memmap) else None,
+        }
+    )
 
     return ReconstructedTraceBundle(
         traces=traces,
@@ -621,7 +628,7 @@ def reconstruct_voltage_dmd_session_traces(
         trial_valid_mask=trial_valid_mask,
         trial_lengths_samples=trial_lengths,
         trial_starts_sec=trial_starts_sec,
-        session_start_sec=float(epoch_start_sec),
+        session_start_sec=session_start_sec,
         session_end_sec=session_end_sec,
         reconstructed_duration_sec=reconstructed_duration_sec,
         metadata=metadata,
@@ -745,6 +752,7 @@ def _resolve_imaging_epoch_bounds(
     epoch_end_sec: Optional[float],
     imaging_epochs_csv: Optional[Union[str, Path]],
     asset: Optional[SessionAssets],
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
 ) -> Tuple[float, Optional[float]]:
     """Resolve corrected-time imaging-epoch bounds for voltage sample mapping."""
     if epoch_start_sec is not None and epoch_end_sec is not None:
@@ -766,11 +774,15 @@ def _resolve_imaging_epoch_bounds(
             "resolved from asset.qc_dir / 'behavior'."
         )
 
-    import pandas as pd
-
-    epochs = pd.read_csv(candidate)
-    if "start_time" not in epochs.columns or len(epochs) == 0:
-        raise ValueError(f"{candidate} must contain at least one start_time value.")
+    epochs = load_epoch_dataframe(
+        candidate,
+        min_duration_sec=min_epoch_duration_sec,
+    )
+    if epochs is None or "start_time" not in epochs.columns or len(epochs) == 0:
+        raise ValueError(
+            f"{candidate} must contain at least one epoch of at least "
+            f"{float(min_epoch_duration_sec):g} s."
+        )
     start = float(epoch_start_sec) if epoch_start_sec is not None else float(epochs["start_time"].iloc[0])
     end: Optional[float]
     if epoch_end_sec is not None:
@@ -787,6 +799,7 @@ def _resolve_epoch_start_sec(
     epoch_start_sec: Optional[float],
     imaging_epochs_csv: Optional[Union[str, Path]],
     asset: Optional[SessionAssets],
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
 ) -> float:
     """Backward-compatible helper returning only the first imaging-epoch start."""
     start, _ = _resolve_imaging_epoch_bounds(
@@ -794,6 +807,7 @@ def _resolve_epoch_start_sec(
         epoch_end_sec=None,
         imaging_epochs_csv=imaging_epochs_csv,
         asset=asset,
+        min_epoch_duration_sec=min_epoch_duration_sec,
     )
     return start
 
@@ -810,9 +824,10 @@ def reconstruct_voltage_dmd_session_traces_from_asset(
     drop_discarded: bool = True,
     dtype=np.float32,
     trace_mode: str = "trial",
-    timebase_strategy: str = "auto",
+    timebase_strategy: str = "sample_rate",
     max_timebase_error_sec: float = 0.5,
     strict_epoch_match: bool = True,
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
 ) -> ReconstructedTraceBundle:
     """Load voltage assets and reconstruct one DMD as an alignment bundle.
 
@@ -833,11 +848,15 @@ def reconstruct_voltage_dmd_session_traces_from_asset(
             epoch_end_sec=epoch_end_sec,
             imaging_epochs_csv=imaging_epochs_csv,
             asset=asset,
+            min_epoch_duration_sec=min_epoch_duration_sec,
         )
         epoch_df = None
         candidate = Path(imaging_epochs_csv) if imaging_epochs_csv is not None else (Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv" if asset.qc_dir is not None else None)
         if candidate is not None and Path(candidate).exists():
-            epoch_df = pd.read_csv(candidate)
+            epoch_df = load_epoch_dataframe(
+                candidate,
+                min_duration_sec=min_epoch_duration_sec,
+            )
         return reconstruct_voltage_dmd_session_traces(
             vs,
             dmd=dmd,
@@ -851,4 +870,5 @@ def reconstruct_voltage_dmd_session_traces_from_asset(
             timebase_strategy=timebase_strategy,
             max_timebase_error_sec=max_timebase_error_sec,
             strict_epoch_match=strict_epoch_match,
+            min_epoch_duration_sec=min_epoch_duration_sec,
         )

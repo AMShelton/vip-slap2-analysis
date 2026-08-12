@@ -548,6 +548,125 @@ class VoltageSummary:
             return {}
         return self._read_group_scalars(node)
 
+    def get_dmd_epoch_metadata(self, dmd: int) -> List[Dict[str, Any]]:
+        """Return acquisition-level metadata for each source epoch of one DMD.
+
+        Patched ``extractDendrites.m`` summaries store a MATLAB struct array under
+        ``summary/dmd/epochs{dmd}``.  This method decodes its scalar, string, and
+        nested metadata fields into one dictionary per epoch. Older summaries
+        without this field return an empty list.
+        """
+        dmd0 = self._validate_dmd(dmd)
+        node = self._dmd_cell_item("epochs", dmd0)
+        if node is None or not isinstance(node, h5py.Group):
+            return []
+
+        field_names = list(node.keys())
+        if not field_names:
+            return []
+
+        n_epochs = 0
+        for field_name in field_names:
+            field = node[field_name]
+            if isinstance(field, h5py.Dataset):
+                n_epochs = max(n_epochs, int(np.prod(field.shape)))
+        if n_epochs <= 0:
+            return []
+
+        rows: List[Dict[str, Any]] = [dict() for _ in range(n_epochs)]
+        for field_name in field_names:
+            field = node[field_name]
+            if not isinstance(field, h5py.Dataset):
+                continue
+            values = np.ravel(field[()])
+            for i, raw in enumerate(values[:n_epochs]):
+                value: Any = None
+                if self._is_ref_dataset(field):
+                    try:
+                        target = self._mat.deref(raw)
+                    except Exception:
+                        target = None
+                    if isinstance(target, h5py.Group):
+                        value = self._read_group_scalars(target)
+                    elif isinstance(target, h5py.Dataset):
+                        text = self._decode_matlab_string_dataset(target)
+                        scalar = self._scalar(target)
+                        # Numeric scalar datasets can also be rendered as a one-
+                        # character string, so prefer scalar numeric values first.
+                        if isinstance(scalar, (int, float, np.integer, np.floating, bool, np.bool_)):
+                            value = scalar.item() if isinstance(scalar, np.generic) else scalar
+                        elif text:
+                            value = text
+                        else:
+                            value = scalar
+                else:
+                    try:
+                        arr = np.asarray(raw).squeeze()
+                        value = arr.item() if arr.ndim == 0 else arr.tolist()
+                    except Exception:
+                        value = raw
+                rows[i][field_name] = value
+
+        rows = [row for row in rows if row]
+        for row in rows:
+            for key in ("epochIdx", "firstTrial", "lastTrial", "linesPerCycle", "nCycles", "totalNumLines"):
+                try:
+                    value = float(row[key])
+                except Exception:
+                    continue
+                row[key] = int(round(value)) if np.isfinite(value) else row[key]
+            if "available" in row:
+                value = row["available"]
+                if isinstance(value, str) and len(value) == 1:
+                    row["available"] = bool(ord(value))
+                else:
+                    try:
+                        row["available"] = bool(int(value))
+                    except Exception:
+                        pass
+
+        def _epoch_sort_key(row: Dict[str, Any]) -> int:
+            try:
+                return int(row.get("epochIdx", 0))
+            except Exception:
+                return 0
+
+        rows.sort(key=_epoch_sort_key)
+        return rows
+
+    def get_dmd_epoch_durations_sec(
+        self,
+        dmd: int,
+        *,
+        sample_rate_hz: Optional[float] = None,
+    ) -> Dict[int, float]:
+        """Return ``{source_epoch: acquisition_duration_seconds}`` when available."""
+        rows = self.get_dmd_epoch_metadata(dmd)
+        if not rows:
+            return {}
+        fallback_rate = float(sample_rate_hz) if sample_rate_hz is not None else self.get_line_rate_hz(dmd)
+        out: Dict[int, float] = {}
+        for row in rows:
+            try:
+                epoch_id = int(round(float(row.get("epochIdx"))))
+                total_lines = float(row.get("totalNumLines"))
+            except Exception:
+                continue
+            metadata = row.get("metadata", {})
+            rate = fallback_rate
+            if isinstance(metadata, dict):
+                for key in ("lineRateHz", "line_rate_hz", "sample_rate_hz", "fs_hz"):
+                    try:
+                        candidate = float(np.asarray(metadata.get(key)).squeeze())
+                    except Exception:
+                        continue
+                    if np.isfinite(candidate) and candidate > 0:
+                        rate = candidate
+                        break
+            if epoch_id > 0 and np.isfinite(total_lines) and total_lines >= 0 and np.isfinite(rate) and rate > 0:
+                out[epoch_id] = float(total_lines / rate)
+        return out
+
     def get_line_rate_hz(self, dmd: Optional[int] = None) -> float:
         """Return the per-DMD or representative SLAP2 line rate in Hz.
 

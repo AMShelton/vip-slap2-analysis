@@ -139,7 +139,7 @@ def process_behavior_session(
     overwrite_harp_extract: bool = False,
     overwrite_alignment: bool = False,
     save_corrected_in_place: bool = True,
-    min_epoch_duration: float = 6.0,
+    min_epoch_duration: float = 30.0,
     trial_gap_start: float = 0.02,
     expected_trial_epoch_min: Optional[int] = None,
     use_piecewise_warp: bool = True,
@@ -147,7 +147,7 @@ def process_behavior_session(
     pulse_gap_factor: float = 10.0,
     pulse_min_gap_s: float = 0.5,
     pulse_min_pulses: int = 10,
-    pulse_min_duration: float = 30.0,
+    pulse_min_duration: Optional[float] = None,
 ) -> BehaviorProcessingResult:
     """Run the full behavior preprocessing workflow for a session asset.
     
@@ -249,6 +249,12 @@ def process_behavior_session(
 
     acq_type = metadata.get("epochs_mode", "continuous")
     epoch_detection_method = str(metadata.get("epoch_detection_method", epoch_detection_method))
+    pulse_duration_override = metadata.get("pulse_min_duration", pulse_min_duration)
+    effective_pulse_min_duration = float(min_epoch_duration)
+    if pulse_duration_override is not None:
+        effective_pulse_min_duration = max(
+            effective_pulse_min_duration, float(pulse_duration_override)
+        )
 
     epochs, gap_used = detect_epochs_adaptive(
         harp_df,
@@ -261,7 +267,7 @@ def process_behavior_session(
         pulse_gap_factor=float(metadata.get("pulse_gap_factor", pulse_gap_factor)),
         pulse_min_gap_s=float(metadata.get("pulse_min_gap_s", pulse_min_gap_s)),
         pulse_min_pulses=int(metadata.get("pulse_min_pulses", pulse_min_pulses)),
-        pulse_min_duration=float(metadata.get("pulse_min_duration", pulse_min_duration)),
+        pulse_min_duration=effective_pulse_min_duration,
     )
 
     pulse_diag = {}
@@ -273,13 +279,19 @@ def process_behavior_session(
             t,
             gap_factor=float(metadata.get("pulse_gap_factor", pulse_gap_factor)),
             min_gap_s=float(metadata.get("pulse_min_gap_s", pulse_min_gap_s)),
-            min_duration=max(float(min_epoch_duration), float(metadata.get("pulse_min_duration", pulse_min_duration))),
+            min_duration=effective_pulse_min_duration,
             min_pulses=int(metadata.get("pulse_min_pulses", pulse_min_pulses)),
         )
         with open(paths.qc_dir / "di3_pulse_train_detection.json", "w") as f:
             json.dump(pulse_diag, f, indent=2)
         if pulse_diag.get("gaps") is not None:
-            pd.DataFrame(pulse_diag.get("gaps", [])).to_csv(paths.qc_dir / "di3_pulse_train_gaps.csv", index=False)
+            pd.DataFrame(pulse_diag.get("gaps", [])).to_csv(
+                paths.qc_dir / "di3_pulse_train_gaps.csv", index=False
+            )
+        if pulse_diag.get("candidate_epochs") is not None:
+            pd.DataFrame(pulse_diag.get("candidate_epochs", [])).to_csv(
+                paths.qc_dir / "di3_pulse_train_epoch_qc.csv", index=False
+            )
 
     epochs = shift_epochs_to_photodiode_time(epochs, harp_df, photodiode_df)
     epoch_df = epochs_to_dataframe(epochs)
@@ -292,6 +304,16 @@ def process_behavior_session(
         gap_threshold_used=gap_used,
         detection_method=epoch_detection_method,
     )
+    shared_min_duration = float(
+        effective_pulse_min_duration
+        if epoch_detection_method.lower() == "pulse_train"
+        else min_epoch_duration
+    )
+    epochs_summary.update({
+        "min_duration_s": shared_min_duration,
+        "duration_qc_policy": "accept_duration_greater_than_or_equal_to_threshold",
+        "short_epoch_policy": "retain_in_detection_diagnostics_exclude_from_physiology",
+    })
     if pulse_diag:
         epochs_summary["pulse_train"] = pulse_diag
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Literal
 
 import numpy as np
@@ -422,8 +423,11 @@ class GlutamateSummary:
         # lazy metadata
         self._metadata: Optional[Dict[str, Any]] = None
         self._align_params: Optional[Dict[str, Any]] = None
+        self.trial_epoch: Optional[np.ndarray] = None
+        self.trial_epoch_source: str = "unavailable"
 
         self._get_info()
+        self.trial_epoch, self.trial_epoch_source = self._infer_trial_epoch()
 
     # ----------------- lifecycle -----------------
 
@@ -643,6 +647,123 @@ class GlutamateSummary:
             except Exception:
                 pass
         return out
+
+    def _read_trial_table_strings(self, field_name: str) -> List[str]:
+        """Best-effort decode of a MATLAB cell-string trial-table field."""
+        path = f"exptSummary/trialTable/{field_name}"
+        if path not in self._mat.f:
+            return []
+        ds = self._mat.f[path]
+        if not isinstance(ds, h5py.Dataset):
+            return []
+
+        def decode_ref(ref) -> str:
+            try:
+                if not ref:
+                    return ""
+                node = self._mat.deref(ref)
+                if isinstance(node, h5py.Dataset):
+                    value = bytes_to_str(node[()])
+                    if isinstance(value, np.ndarray):
+                        value = bytes_to_str(np.asarray(value))
+                    return str(value) if value is not None else ""
+            except Exception:
+                return ""
+            return ""
+
+        if ds.dtype == h5py.ref_dtype:
+            raw = np.asarray(ds[()])
+            # Filename is commonly DMD x trial or trial x DMD. Resolve one
+            # nonempty filename per trial without assuming orientation.
+            if raw.ndim == 1:
+                return [decode_ref(ref) for ref in raw]
+            if raw.ndim == 2:
+                if raw.shape[1] == self.n_trials:
+                    trial_axis = 1
+                elif raw.shape[0] == self.n_trials:
+                    trial_axis = 0
+                else:
+                    trial_axis = 1 if raw.shape[1] >= raw.shape[0] else 0
+                out: List[str] = []
+                for trial0 in range(self.n_trials):
+                    refs = raw[:, trial0] if trial_axis == 1 else raw[trial0, :]
+                    value = ""
+                    for ref in np.ravel(refs):
+                        value = decode_ref(ref)
+                        if value:
+                            break
+                    out.append(value)
+                return out
+        try:
+            value = bytes_to_str(ds[()])
+            if isinstance(value, str):
+                return [value]
+            return [str(bytes_to_str(x)) for x in np.ravel(value)]
+        except Exception:
+            return []
+
+    @staticmethod
+    def _stable_relabel_epoch_vector(values: np.ndarray) -> np.ndarray:
+        """Relabel arbitrary positive epoch labels to 1..N in first-use order."""
+        arr = np.asarray(values).reshape(-1)
+        out = np.ones(arr.size, dtype=int)
+        mapping: Dict[Any, int] = {}
+        next_id = 1
+        for i, value in enumerate(arr):
+            try:
+                key = float(value)
+                if not np.isfinite(key):
+                    key = 1.0
+            except Exception:
+                key = str(value)
+            if key not in mapping:
+                mapping[key] = next_id
+                next_id += 1
+            out[i] = mapping[key]
+        return out
+
+    def _infer_trial_epoch(self) -> Tuple[Optional[np.ndarray], str]:
+        """Infer source acquisition epochs from trial-table metadata.
+
+        Explicit ``trialEpoch``/``epoch`` arrays are preferred when informative.
+        Otherwise acquisition filename-prefix changes are used. ``None`` means the
+        source summary does not expose enough information, in which case downstream
+        code uses behavior-duration assignment and records that fallback.
+        """
+        candidates = (
+            "exptSummary/trialEpoch",
+            "exptSummary/trialTable/trialEpoch",
+            "exptSummary/trialTable/epoch",
+        )
+        for path in candidates:
+            if path not in self._mat.f:
+                continue
+            node = self._mat.f[path]
+            if not isinstance(node, h5py.Dataset):
+                continue
+            try:
+                values = np.asarray(node[()]).squeeze().reshape(-1)
+                if values.size != self.n_trials:
+                    continue
+                labels = self._stable_relabel_epoch_vector(values)
+                if np.unique(labels).size > 1:
+                    return labels, f"explicit:{path}"
+            except Exception:
+                continue
+
+        filenames = self._read_trial_table_strings("filename")
+        if len(filenames) == self.n_trials and any(filenames):
+            prefixes: List[str] = []
+            for filename in filenames:
+                name = Path(str(filename)).stem
+                prefix = re.sub(r"[_-]DMD\d+.*$", "", name, flags=re.IGNORECASE)
+                prefix = re.sub(r"[_-]CYCLE[_-]?\d+.*$", "", prefix, flags=re.IGNORECASE)
+                prefixes.append(prefix or name)
+            labels = self._stable_relabel_epoch_vector(np.asarray(prefixes, dtype=object))
+            if np.unique(labels).size > 1:
+                return labels, "filename_prefix:exptSummary/trialTable/filename"
+
+        return None, "unavailable"
 
     # ----------------- channel selection -----------------
 

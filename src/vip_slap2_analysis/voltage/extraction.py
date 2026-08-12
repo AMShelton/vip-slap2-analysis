@@ -27,6 +27,7 @@ import h5py
 import numpy as np
 
 from vip_slap2_analysis.common.session import SessionAssets
+from vip_slap2_analysis.common.epoch_alignment import DEFAULT_MIN_EPOCH_DURATION_SEC
 from vip_slap2_analysis.common.alignment import (
     EventWindows,
     ReconstructedTraceBundle,
@@ -124,11 +125,18 @@ def _modality_dir(asset: SessionAssets, family: str, modality: str) -> Path:
     return out
 
 
-def _open_imaging_epochs(asset: SessionAssets):
-    """Load behavior QC imaging epochs for the current session."""
+def _open_imaging_epochs(
+    asset: SessionAssets,
+    *,
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
+):
+    """Load behavior epochs accepted by the shared duration-QC policy."""
     if asset.qc_dir is None:
         raise ValueError("asset.qc_dir is required to load behavior/imaging_epochs.csv")
-    return load_imaging_epochs_csv(Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv")
+    return load_imaging_epochs_csv(
+        Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv",
+        min_duration_sec=min_epoch_duration_sec,
+    )
 
 
 def _load_voltage_roi_qc_mask(asset: SessionAssets, dmd: int) -> Optional[np.ndarray]:
@@ -1244,8 +1252,9 @@ def compute_voltage_roi_transform_from_asset(
     epoch_end_sec: Optional[float] = None,
     trace_mode: str = "trial",
     drop_discarded: bool = True,
-    timebase_strategy: str = "auto",
+    timebase_strategy: str = "sample_rate",
     max_timebase_error_sec: float = 0.5,
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
     f0_method: str = "robust",
     f0_percentile: float = 50.0,
     robust_f0_bin_sec: float = 5.0,
@@ -1264,7 +1273,10 @@ def compute_voltage_roi_transform_from_asset(
     # Always load all behavior-derived imaging epochs. Even when callers supply
     # outer session bounds, epoch-scoped F0 and strict alignment require the
     # internal acquisition boundaries and imaging-off gaps.
-    epoch_df = _open_imaging_epochs(asset)
+    epoch_df = _open_imaging_epochs(
+        asset,
+        min_epoch_duration_sec=min_epoch_duration_sec,
+    )
     if epoch_start_sec is None:
         epoch_start_sec = float(epoch_df.iloc[0]["start_time"])
     if epoch_end_sec is None and "end_time" in epoch_df.columns:
@@ -1290,6 +1302,7 @@ def compute_voltage_roi_transform_from_asset(
             timebase_strategy=timebase_strategy,
             max_timebase_error_sec=max_timebase_error_sec,
             strict_epoch_match=strict_epoch_match,
+            min_epoch_duration_sec=min_epoch_duration_sec,
         )
 
     if roi_index < 0 or roi_index >= bundle.traces.shape[0]:
@@ -1750,9 +1763,10 @@ def process_voltage_extraction(
     dff_polarity: str = "auto",
     trace_mode: str = "trial",
     drop_discarded: bool = True,
-    timebase_strategy: str = "auto",
+    timebase_strategy: str = "sample_rate",
     max_timebase_error_sec: float = 0.5,
     strict_epoch_match: bool = True,
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
     dtype: np.dtype = np.float32,
     write_single_trials: bool = True,
     write_sequence: bool = True,
@@ -1873,7 +1887,9 @@ def process_voltage_extraction(
         }
 
     stim_df = load_corrected_bonsai_csv(asset.bonsai_event_log_csv)
-    epoch_df = _open_imaging_epochs(asset)
+    epoch_df = _open_imaging_epochs(
+        asset, min_epoch_duration_sec=min_epoch_duration_sec
+    )
     epoch_start_sec = float(epoch_df.iloc[0]["start_time"])
     epoch_end_sec = float(epoch_df.iloc[-1]["end_time"])
     epoch_session_span_sec = float(epoch_end_sec - epoch_start_sec)
@@ -1954,6 +1970,8 @@ def process_voltage_extraction(
             "robust_f0_smooth_sec": float(robust_f0_smooth_sec),
             "f0_scope": str(f0_scope),
             "strict_epoch_match": bool(strict_epoch_match),
+            "min_epoch_duration_sec": float(min_epoch_duration_sec),
+            "epoch_duration_qc_policy": "accept_duration_greater_than_or_equal_to_threshold",
             "n_imaging_epochs": int(len(epoch_df)),
             "epoch_starts_sec": epoch_df["start_time"].astype(float).tolist(),
             "epoch_ends_sec": epoch_df["end_time"].astype(float).tolist(),
@@ -1985,6 +2003,8 @@ def process_voltage_extraction(
             "dff_polarity_requested": str(dff_polarity),
             "f0_scope": str(f0_scope),
             "strict_epoch_match": bool(strict_epoch_match),
+            "min_epoch_duration_sec": float(min_epoch_duration_sec),
+            "epoch_duration_qc_policy": "accept_duration_greater_than_or_equal_to_threshold",
             "n_imaging_epochs": int(len(epoch_df)),
             "epoch_acquired_duration_sec": epoch_acquired_duration_sec,
             "epoch_session_span_sec": epoch_session_span_sec,
@@ -2032,6 +2052,7 @@ def process_voltage_extraction(
                     timebase_strategy=timebase_strategy,
                     max_timebase_error_sec=max_timebase_error_sec,
                     strict_epoch_match=strict_epoch_match,
+                    min_epoch_duration_sec=min_epoch_duration_sec,
                 )
                 if bundle.traces.size == 0:
                     qc["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no valid traces"}

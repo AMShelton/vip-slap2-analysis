@@ -27,10 +27,17 @@ import pandas as pd
 from scipy.signal import savgol_filter
 
 from vip_slap2_analysis.common.session import SessionAssets
+from vip_slap2_analysis.common.epoch_alignment import (
+    DEFAULT_MIN_EPOCH_DURATION_SEC,
+    EpochReconciliation,
+    classify_epochs_by_duration,
+    reconcile_trial_epochs,
+)
 from vip_slap2_analysis.voltage.postprocess import (
     _as_time_by_roi,
     _discard_mask_for_trace,
     _expected_n_rois,
+    _expected_trial_lengths_from_summary,
     _valid_trials_for_dmd,
     _trace_time_len_for_trial,
     load_voltage_summary_from_asset,
@@ -234,47 +241,89 @@ def collect_dmd_voltage_segments(
     trace_mode: str = "trial",
     max_trials: Optional[int] = None,
     max_points_per_trial_for_metrics: Optional[int] = 1_000_000,
+    epoch_reconciliation: Optional[EpochReconciliation] = None,
 ) -> Tuple[List[List[np.ndarray]], Dict[str, Any], pd.DataFrame]:
-    """Collect valid-trial voltage trace segments for one DMD.
+    """Collect voltage segments restricted to accepted acquisition epochs.
 
-    Returns
-    -------
-    roi_segments
-        List of length ``n_rois``. Each entry is a list of one-dimensional
-        valid-trial segments for that ROI.
-    dmd_info
-        DMD-level structural metadata.
-    trial_table
-        Per-trial shape and finite-data QC rows.
+    When ``epoch_reconciliation`` is supplied, rejected/short source epochs are
+    skipped and overlong terminal trials are clipped to the common behavior and
+    physiology interval. Metrics therefore reflect only analysis-eligible data.
     """
-    valid_trials = _valid_trials_for_dmd(vs, dmd)
+    all_valid_trials = _valid_trials_for_dmd(vs, dmd)
+    n_trials_total = int(vs.n_trials)
+    n_rois = _expected_n_rois(vs, dmd)
+
+    if epoch_reconciliation is None:
+        retained_lengths = np.full((n_trials_total,), -1, dtype=int)
+        source_epoch = (
+            np.asarray(vs.trial_epoch, dtype=int).reshape(-1)
+            if getattr(vs, "trial_epoch", None) is not None
+            else np.ones((n_trials_total,), dtype=int)
+        )
+        analysis_epoch = source_epoch.copy()
+        accepted_trial_mask = np.ones((n_trials_total,), dtype=bool)
+    else:
+        retained_lengths = np.asarray(
+            epoch_reconciliation.trial_lengths_samples, dtype=int
+        ).reshape(-1)
+        source_epoch = np.asarray(
+            epoch_reconciliation.source_trial_epoch, dtype=int
+        ).reshape(-1)
+        analysis_epoch = np.asarray(
+            epoch_reconciliation.analysis_trial_epoch, dtype=int
+        ).reshape(-1)
+        accepted_trial_mask = retained_lengths > 0
+
+    valid_trials = [
+        int(t) for t in all_valid_trials
+        if 1 <= int(t) <= n_trials_total and accepted_trial_mask[int(t) - 1]
+    ]
     if max_trials is not None:
         valid_trials = valid_trials[: int(max_trials)]
-    n_trials_total = int(vs.n_trials)
-    n_valid_trials_total = len(_valid_trials_for_dmd(vs, dmd))
+
+    n_analysis_trials = int(np.sum(accepted_trial_mask))
+    n_valid_trials_total = int(
+        np.sum([
+            accepted_trial_mask[int(t) - 1]
+            for t in all_valid_trials
+            if 1 <= int(t) <= n_trials_total
+        ])
+    )
     n_valid_trials_loaded = len(valid_trials)
     valid_trial_fraction = (
-        n_valid_trials_total / n_trials_total if n_trials_total > 0 else np.nan
+        n_valid_trials_total / n_analysis_trials if n_analysis_trials > 0 else np.nan
     )
-    n_rois = _expected_n_rois(vs, dmd)
 
     roi_segments: List[List[np.ndarray]] = [[] for _ in range(n_rois)]
     trial_rows: List[Dict[str, Any]] = []
     segment_lengths: List[int] = []
 
     for trial in valid_trials:
+        trial0 = trial - 1
         try:
-            n_samples_raw = int(_trace_time_len_for_trial(vs, dmd=dmd, trial=trial, trace_mode=trace_mode))
+            n_samples_raw = int(
+                _trace_time_len_for_trial(
+                    vs, dmd=dmd, trial=trial, trace_mode=trace_mode
+                )
+            )
         except Exception:
             n_samples_raw = -1
 
+        keep_after_discard = (
+            int(retained_lengths[trial0])
+            if retained_lengths[trial0] >= 0
+            else None
+        )
         metric_stride = 1
+        stride_basis = n_samples_raw if keep_after_discard is None else keep_after_discard
         if (
             max_points_per_trial_for_metrics is not None
-            and n_samples_raw > int(max_points_per_trial_for_metrics)
+            and stride_basis > int(max_points_per_trial_for_metrics)
             and int(max_points_per_trial_for_metrics) > 0
         ):
-            metric_stride = int(np.ceil(n_samples_raw / int(max_points_per_trial_for_metrics)))
+            metric_stride = int(
+                np.ceil(stride_basis / int(max_points_per_trial_for_metrics))
+            )
         read_slice = slice(None, None, metric_stride)
 
         x = vs.get_roi_traces(
@@ -285,16 +334,26 @@ def collect_dmd_voltage_segments(
             dtype=dtype,
             trace_mode=trace_mode,
         )
-        x = _as_time_by_roi(x, expected_n_rois=n_rois, dmd=dmd, trial=trial)
+        x = _as_time_by_roi(
+            x, expected_n_rois=n_rois, dmd=dmd, trial=trial
+        )
         if n_samples_raw < 0:
-            n_samples_raw = int(x.shape[0]) if metric_stride == 1 else int(x.shape[0] * metric_stride)
+            n_samples_raw = (
+                int(x.shape[0])
+                if metric_stride == 1
+                else int(x.shape[0] * metric_stride)
+            )
         discard_fraction = 0.0
         n_discarded = 0
 
         if drop_discarded:
-            discard = _discard_mask_for_trace(vs, dmd=dmd, trial=trial, n_samples=n_samples_raw)
+            discard = _discard_mask_for_trace(
+                vs, dmd=dmd, trial=trial, n_samples=n_samples_raw
+            )
             n_discarded = int(np.sum(discard))
-            discard_fraction = float(n_discarded / n_samples_raw) if n_samples_raw else np.nan
+            discard_fraction = (
+                float(n_discarded / n_samples_raw) if n_samples_raw else np.nan
+            )
             discard_sample = discard[read_slice]
             if discard_sample.size != x.shape[0]:
                 aligned = np.zeros((x.shape[0],), dtype=bool)
@@ -303,7 +362,15 @@ def collect_dmd_voltage_segments(
                 discard_sample = aligned
             x = x[~discard_sample, :]
 
-        n_samples = int(n_samples_raw - n_discarded)
+        n_available_after_discard = int(max(n_samples_raw - n_discarded, 0))
+        n_samples = (
+            min(n_available_after_discard, int(keep_after_discard))
+            if keep_after_discard is not None
+            else n_available_after_discard
+        )
+        if keep_after_discard is not None:
+            n_loaded_target = int(np.ceil(n_samples / metric_stride))
+            x = x[:n_loaded_target, :]
         n_samples_loaded = int(x.shape[0])
         segment_lengths.append(n_samples)
 
@@ -311,10 +378,13 @@ def collect_dmd_voltage_segments(
             {
                 "dmd": int(dmd),
                 "trial": int(trial),
-                "epoch": (int(vs.trial_epoch[trial - 1]) if getattr(vs, "trial_epoch", None) is not None and len(vs.trial_epoch) >= trial else None),
+                "source_epoch": int(source_epoch[trial0]) if trial0 < source_epoch.size else None,
+                "analysis_epoch": int(analysis_epoch[trial0]) if trial0 < analysis_epoch.size else None,
+                "epoch_qc_accepted": bool(accepted_trial_mask[trial0]),
                 "valid_trial": True,
                 "n_samples_raw": n_samples_raw,
-                "n_samples": n_samples,
+                "n_samples_after_discard": n_available_after_discard,
+                "n_samples_retained": n_samples,
                 "n_samples_loaded_for_metrics": n_samples_loaded,
                 "metrics_stride": int(metric_stride),
                 "metrics_are_downsampled": bool(metric_stride > 1),
@@ -331,22 +401,37 @@ def collect_dmd_voltage_segments(
         )
 
         for roi_idx in range(n_rois):
-            roi_segments[roi_idx].append(x[:, roi_idx].astype(dtype, copy=False))
+            roi_segments[roi_idx].append(
+                x[:, roi_idx].astype(dtype, copy=False)
+            )
 
     dmd_info: Dict[str, Any] = {
         "dmd": int(dmd),
         "n_trials_total": n_trials_total,
+        "n_trials_analysis_eligible": n_analysis_trials,
+        "n_trials_rejected_epoch_qc": int(n_trials_total - n_analysis_trials),
         "n_valid_trials": int(n_valid_trials_total),
         "n_valid_trials_loaded": int(n_valid_trials_loaded),
-        "valid_trial_fraction": float(valid_trial_fraction) if np.isfinite(valid_trial_fraction) else np.nan,
+        "valid_trial_fraction": (
+            float(valid_trial_fraction) if np.isfinite(valid_trial_fraction) else np.nan
+        ),
         "n_rois": int(n_rois),
         "mean_valid_trial_length": float(np.mean(segment_lengths)) if segment_lengths else np.nan,
         "median_valid_trial_length": float(np.median(segment_lengths)) if segment_lengths else np.nan,
         "min_valid_trial_length": int(np.min(segment_lengths)) if segment_lengths else 0,
         "max_valid_trial_length": int(np.max(segment_lengths)) if segment_lengths else 0,
         "total_valid_samples_per_roi": int(np.sum(segment_lengths)) if segment_lengths else 0,
-        "max_points_per_trial_for_metrics": (int(max_points_per_trial_for_metrics) if max_points_per_trial_for_metrics is not None else None),
+        "max_points_per_trial_for_metrics": (
+            int(max_points_per_trial_for_metrics)
+            if max_points_per_trial_for_metrics is not None
+            else None
+        ),
     }
+    if epoch_reconciliation is not None:
+        dmd_info["epoch_qc"] = epoch_reconciliation.metadata
+        dmd_info["source_epoch_qc"] = (
+            epoch_reconciliation.source_epoch_qc.to_dict(orient="records")
+        )
     return roi_segments, dmd_info, pd.DataFrame(trial_rows)
 
 
@@ -545,11 +630,18 @@ def _save_dmd_trace_examples(
     dtype,
     max_rois: int = 6,
     max_points: int = 50_000,
+    trial_keep_mask: Optional[np.ndarray] = None,
 ) -> None:
     try:
         import matplotlib.pyplot as plt
 
         valid_trials = _valid_trials_for_dmd(vs, dmd)
+        if trial_keep_mask is not None:
+            keep = np.asarray(trial_keep_mask, dtype=bool).reshape(-1)
+            valid_trials = [
+                int(t) for t in valid_trials
+                if 1 <= int(t) <= keep.size and keep[int(t) - 1]
+            ]
         if not valid_trials:
             return
         trial = valid_trials[0]
@@ -586,11 +678,19 @@ def _save_dmd_trial_heatmap(
     dtype,
     max_trials: int = 30,
     max_points: int = 20_000,
+    trial_keep_mask: Optional[np.ndarray] = None,
 ) -> None:
     try:
         import matplotlib.pyplot as plt
 
-        valid_trials = _valid_trials_for_dmd(vs, dmd)[:max_trials]
+        valid_trials = _valid_trials_for_dmd(vs, dmd)
+        if trial_keep_mask is not None:
+            keep = np.asarray(trial_keep_mask, dtype=bool).reshape(-1)
+            valid_trials = [
+                int(t) for t in valid_trials
+                if 1 <= int(t) <= keep.size and keep[int(t) - 1]
+            ]
+        valid_trials = valid_trials[:max_trials]
         if not valid_trials:
             return
         n_rois = _expected_n_rois(vs, dmd)
@@ -667,6 +767,16 @@ def _build_metadata(
                 "sg_polyorder": sg_poly,
                 "interpretation": "slow Savitzky-Golay component divided by fast residual; QC proxy only, not final oscillation analysis",
             },
+            "epoch_duration_qc": {
+                "min_epoch_duration_sec": float(
+                    epoch_integrity.get("min_epoch_duration_sec", DEFAULT_MIN_EPOCH_DURATION_SEC)
+                ),
+                "policy": "accept_epochs_at_or_above_minimum_duration",
+                "raw_epoch_count_mismatch_is_fatal": False,
+                "accepted_epoch_count_mismatch_is_fatal": True,
+                "tail_policy": "clip_to_common_behavior_physiology_interval",
+                "preserve_nominal_sample_spacing": True,
+            },
             "quality_score": {
                 "weights": score_weights,
                 "score_params": score_params,
@@ -694,54 +804,216 @@ def _build_metadata(
     }
 
 
-def _voltage_epoch_integrity(asset: SessionAssets, vs: VoltageSummary) -> Dict[str, Any]:
-    """Compare behavior imaging epochs with extractor trial/epoch metadata."""
-    epoch_path = Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv" if asset.qc_dir is not None else None
+def _voltage_source_trial_lengths(
+    vs: VoltageSummary,
+    *,
+    dmd: int,
+    drop_discarded: bool,
+    trace_mode: str,
+) -> np.ndarray:
+    """Return source-trial lengths used for epoch-duration QC.
+
+    Readable trial datasets provide the authoritative length. Missing trial blocks
+    use extractor line-range metadata and finally the median readable length. This
+    mirrors session reconstruction without loading the full fluorescence arrays.
+    """
+    n_trials = int(vs.n_trials)
+    expected = _expected_trial_lengths_from_summary(vs, dmd, n_trials)
+    lengths = np.asarray(expected, dtype=int).reshape(-1)
+    if lengths.size != n_trials:
+        aligned = np.zeros((n_trials,), dtype=int)
+        n = min(n_trials, lengths.size)
+        aligned[:n] = lengths[:n]
+        lengths = aligned
+
+    readable_lengths: List[int] = []
+    for trial in _valid_trials_for_dmd(vs, dmd):
+        trial = int(trial)
+        if not (1 <= trial <= n_trials):
+            continue
+        n_raw = int(
+            _trace_time_len_for_trial(
+                vs, dmd=dmd, trial=trial, trace_mode=trace_mode
+            )
+        )
+        if drop_discarded:
+            discard = _discard_mask_for_trace(
+                vs, dmd=dmd, trial=trial, n_samples=n_raw
+            )
+            n_kept = int(np.sum(~discard))
+        else:
+            n_kept = n_raw
+        lengths[trial - 1] = max(n_kept, 0)
+        if n_kept > 0:
+            readable_lengths.append(n_kept)
+
+    fallback = int(round(float(np.median(readable_lengths)))) if readable_lengths else 0
+    if fallback > 0:
+        lengths[lengths <= 0] = fallback
+    return np.maximum(lengths, 0).astype(int)
+
+
+def _voltage_epoch_integrity(
+    asset: SessionAssets,
+    vs: VoltageSummary,
+    *,
+    sample_rate_hz: float,
+    drop_discarded: bool,
+    trace_mode: str,
+    min_epoch_duration_sec: float,
+    strict_epoch_match: bool,
+) -> Tuple[Dict[str, Any], Dict[int, EpochReconciliation]]:
+    """Reconcile extractor and behavior epochs after duration filtering.
+
+    Raw epoch-count disagreement is diagnostic only. Each modality first rejects
+    source acquisition fragments shorter than ``min_epoch_duration_sec``; only the
+    accepted source-epoch count must match the accepted behavior-epoch count. The
+    returned per-DMD reconciliation is reused by trace QC so rejected fragments do
+    not contribute ROI metrics.
+    """
+    epoch_path = (
+        Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv"
+        if asset.qc_dir is not None
+        else None
+    )
     out: Dict[str, Any] = {
+        "policy": "accept_epochs_at_or_above_minimum_duration",
+        "min_epoch_duration_sec": float(min_epoch_duration_sec),
         "behavior_epoch_csv": str(epoch_path) if epoch_path is not None else None,
-        "behavior_n_epochs": None,
-        "extractor_n_epochs": int(getattr(vs, "n_epochs", 0) or 0),
+        "behavior_epoch_count_raw": None,
+        "behavior_epoch_count_accepted": None,
+        "extractor_epoch_count_raw": int(getattr(vs, "n_epochs", 0) or 0),
         "trial_epoch_present": getattr(vs, "trial_epoch", None) is not None,
+        "raw_epoch_count_mismatch": None,
         "passed": True,
         "warnings": [],
+        "errors": [],
+        "per_dmd": {},
     }
+    reconciliations: Dict[int, EpochReconciliation] = {}
+
     if epoch_path is None or not epoch_path.exists():
         out["passed"] = False
-        out["warnings"].append("Missing qc/behavior/imaging_epochs.csv")
-        return out
-    epoch_df = pd.read_csv(epoch_path)
-    out["behavior_n_epochs"] = int(len(epoch_df))
-    if len(epoch_df):
-        durations = epoch_df["end_time"].to_numpy(float) - epoch_df["start_time"].to_numpy(float)
-        span = float(epoch_df["end_time"].iloc[-1] - epoch_df["start_time"].iloc[0])
-        out["behavior_acquired_duration_sec"] = float(np.sum(durations))
-        out["behavior_session_span_sec"] = span
-        out["behavior_gap_duration_sec"] = float(span - np.sum(durations))
-    if out["extractor_n_epochs"] != out["behavior_n_epochs"]:
-        out["passed"] = False
-        out["warnings"].append(
-            f"Extractor reports {out['extractor_n_epochs']} epochs but behavior QC reports {out['behavior_n_epochs']}"
+        out["errors"].append("Missing qc/behavior/imaging_epochs.csv")
+        return out, reconciliations
+
+    try:
+        behavior_raw = pd.read_csv(epoch_path)
+        behavior_qc = classify_epochs_by_duration(
+            behavior_raw, min_duration_sec=min_epoch_duration_sec
         )
-    te = getattr(vs, "trial_epoch", None)
-    if te is None:
-        if int(out["behavior_n_epochs"] or 0) > 1:
-            out["passed"] = False
-            out["warnings"].append("Missing extractor trialEpoch metadata for a multi-epoch session")
-    else:
-        te = np.asarray(te, dtype=int).reshape(-1)
-        out["trial_epoch"] = te.tolist()
-        out["trials_per_epoch"] = {str(ep): int(np.sum(te == ep)) for ep in np.unique(te) if ep > 0}
-        if te.size != int(vs.n_trials):
-            out["passed"] = False
-            out["warnings"].append(
-                f"trialEpoch has {te.size} entries but summary reports {int(vs.n_trials)} trials"
+    except Exception as exc:
+        out["passed"] = False
+        out["errors"].append(f"Could not classify behavior epochs: {exc}")
+        return out, reconciliations
+
+    out["behavior_epoch_count_raw"] = int(len(behavior_qc))
+    out["behavior_epoch_count_accepted"] = int(behavior_qc["accepted"].sum())
+    out["behavior_epoch_qc"] = behavior_qc.to_dict(orient="records")
+    if len(behavior_qc):
+        accepted_behavior = behavior_qc.loc[behavior_qc["accepted"]]
+        if len(accepted_behavior):
+            durations = accepted_behavior["duration_s"].to_numpy(dtype=float)
+            starts = accepted_behavior["start_time"].to_numpy(dtype=float)
+            ends = accepted_behavior["end_time"].to_numpy(dtype=float)
+            out["behavior_acquired_duration_sec"] = float(np.sum(durations))
+            out["behavior_session_span_sec"] = float(ends[-1] - starts[0])
+            out["behavior_gap_duration_sec"] = float(
+                out["behavior_session_span_sec"] - np.sum(durations)
             )
-        expected = set(range(1, int(out["behavior_n_epochs"] or 0) + 1))
-        observed = set(int(x) for x in np.unique(te) if x > 0)
-        if expected != observed:
+
+    trial_epoch = getattr(vs, "trial_epoch", None)
+    if trial_epoch is None:
+        if int(getattr(vs, "n_epochs", 0) or 0) > 1:
             out["passed"] = False
-            out["warnings"].append(f"Observed trial epochs {sorted(observed)} do not match expected {sorted(expected)}")
-    return out
+            out["errors"].append(
+                "Missing extractor trialEpoch metadata for a multi-epoch voltage session"
+            )
+            return out, reconciliations
+        trial_epoch_arr = np.ones((int(vs.n_trials),), dtype=int)
+        out["warnings"].append(
+            "Extractor trialEpoch metadata was absent; treated this as one source epoch."
+        )
+    else:
+        trial_epoch_arr = np.asarray(trial_epoch, dtype=int).reshape(-1)
+        if trial_epoch_arr.size != int(vs.n_trials):
+            out["passed"] = False
+            out["errors"].append(
+                f"trialEpoch has {trial_epoch_arr.size} entries but summary reports "
+                f"{int(vs.n_trials)} trials"
+            )
+            return out, reconciliations
+        if np.any(trial_epoch_arr <= 0):
+            out["warnings"].append(
+                "One or more trials have a non-positive source epoch label and will be rejected."
+            )
+
+    out["trial_epoch"] = trial_epoch_arr.astype(int).tolist()
+    observed = [int(x) for x in np.unique(trial_epoch_arr) if int(x) > 0]
+    out["extractor_epoch_ids_raw"] = observed
+    out["trials_per_source_epoch"] = {
+        str(ep): int(np.sum(trial_epoch_arr == ep)) for ep in observed
+    }
+    out["raw_epoch_count_mismatch"] = bool(
+        int(out["extractor_epoch_count_raw"]) != int(out["behavior_epoch_count_raw"])
+    )
+    if out["raw_epoch_count_mismatch"]:
+        out["warnings"].append(
+            "Raw extractor and behavior epoch counts differ; this is allowed when "
+            "short acquisition fragments are rejected by duration QC."
+        )
+
+    for dmd in range(1, int(vs.n_dmds) + 1):
+        label = f"DMD{dmd}"
+        try:
+            source_lengths = _voltage_source_trial_lengths(
+                vs,
+                dmd=dmd,
+                drop_discarded=drop_discarded,
+                trace_mode=trace_mode,
+            )
+            source_epoch_durations_sec = (
+                vs.get_dmd_epoch_durations_sec(
+                    dmd, sample_rate_hz=float(sample_rate_hz)
+                )
+                if hasattr(vs, "get_dmd_epoch_durations_sec")
+                else {}
+            )
+            reconciliation = reconcile_trial_epochs(
+                source_lengths,
+                sample_rate_hz=float(sample_rate_hz),
+                behavior_epoch_df=behavior_raw,
+                source_trial_epoch=trial_epoch_arr,
+                source_epoch_durations_sec=source_epoch_durations_sec or None,
+                min_epoch_duration_sec=float(min_epoch_duration_sec),
+                strict_epoch_match=bool(strict_epoch_match),
+            )
+            reconciliations[dmd] = reconciliation
+            out["per_dmd"][label] = {
+                "passed": True,
+                "source_epoch_qc": reconciliation.source_epoch_qc.to_dict(
+                    orient="records"
+                ),
+                "epoch_qc": reconciliation.metadata,
+                "source_trial_lengths_samples": source_lengths.astype(int).tolist(),
+                "analysis_trial_epoch": reconciliation.analysis_trial_epoch.astype(
+                    int
+                ).tolist(),
+            }
+            out["warnings"].extend(
+                [f"{label}: {w}" for w in reconciliation.metadata.get("warnings", [])]
+            )
+        except Exception as exc:
+            out["passed"] = False
+            msg = f"{label}: {type(exc).__name__}: {exc}"
+            out["errors"].append(msg)
+            out["per_dmd"][label] = {"passed": False, "error": msg}
+
+    if not reconciliations:
+        out["passed"] = False
+    if out["errors"]:
+        out["passed"] = False
+    return out, reconciliations
 
 
 # -----------------------------------------------------------------------------
@@ -769,6 +1041,7 @@ def run_voltage_qc(
     overwrite: bool = False,
     make_plots: bool = True,
     strict_epoch_match: bool = True,
+    min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
 ) -> VoltageQcResult:
     """Run first-pass QC for one voltage session.
 
@@ -802,6 +1075,10 @@ def run_voltage_qc(
         Recompute QC even if JSON/CSV/mask outputs already exist.
     make_plots
         Save lightweight diagnostic plots under the QC directory.
+    min_epoch_duration_sec
+        Minimum accepted behavior and source-acquisition epoch duration. Shorter
+        source fragments remain in the raw extraction but are excluded from QC and
+        downstream physiology.
 
     Returns
     -------
@@ -865,10 +1142,19 @@ def run_voltage_qc(
             sample_rate_hz=sample_rate_hz,
             default_hz=default_sample_rate_hz,
         )
-        epoch_integrity = _voltage_epoch_integrity(asset, vs)
+        epoch_integrity, epoch_reconciliations = _voltage_epoch_integrity(
+            asset,
+            vs,
+            sample_rate_hz=fs_hz,
+            drop_discarded=drop_discarded,
+            trace_mode=trace_mode,
+            min_epoch_duration_sec=min_epoch_duration_sec,
+            strict_epoch_match=strict_epoch_match,
+        )
         if strict_epoch_match and not epoch_integrity["passed"]:
+            reasons = epoch_integrity.get("errors", []) or epoch_integrity.get("warnings", [])
             raise ValueError(
-                "Voltage epoch-integrity QC failed: " + "; ".join(epoch_integrity["warnings"])
+                "Voltage epoch-integrity QC failed: " + "; ".join(reasons)
             )
 
         for dmd in range(1, int(vs.n_dmds) + 1):
@@ -881,6 +1167,7 @@ def run_voltage_qc(
                 trace_mode=trace_mode,
                 max_trials=max_trials_for_metrics,
                 max_points_per_trial_for_metrics=max_points_per_trial_for_metrics,
+                epoch_reconciliation=epoch_reconciliations.get(dmd),
             )
             dmd_summary[label] = dmd_info
             if not trial_df.empty:
@@ -937,6 +1224,10 @@ def run_voltage_qc(
                     sample_rate_hz=fs_hz,
                     trace_mode=trace_mode,
                     dtype=dtype,
+                    trial_keep_mask=(
+                        epoch_reconciliations[dmd].trial_keep_mask
+                        if dmd in epoch_reconciliations else None
+                    ),
                 )
                 _save_dmd_trial_heatmap(
                     vs,
@@ -945,6 +1236,10 @@ def run_voltage_qc(
                     sample_rate_hz=fs_hz,
                     trace_mode=trace_mode,
                     dtype=dtype,
+                    trial_keep_mask=(
+                        epoch_reconciliations[dmd].trial_keep_mask
+                        if dmd in epoch_reconciliations else None
+                    ),
                 )
 
         qc_table = pd.DataFrame(rows)
@@ -1006,6 +1301,7 @@ def run_voltage_qc(
             dmd_summary=dmd_summary,
             drop_discarded=drop_discarded,
             trace_mode=trace_mode,
+            epoch_integrity=epoch_integrity,
         )
 
     summary = {
