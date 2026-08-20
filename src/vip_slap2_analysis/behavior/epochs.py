@@ -1,9 +1,12 @@
 """Imaging-epoch detection utilities for behavior-aligned physiology sessions.
 
 The preferred detector for SLAP2 sessions is pulse-train based: DI3 is treated as
-an acquisition line/cycle clock, and large gaps between rising edges define breaks
-between imaging epochs.  A legacy level-based detector is retained for sessions
-where DI3 is a sustained acquisition gate rather than a pulse train.
+an acquisition-related hardware clock, and large gaps between rising edges define
+breaks between imaging epochs. Modern sessions typically expose the DMD1 cycle
+clock, but historical sessions can use a different integer-line cadence; downstream
+SLAP2/HARP clock QC determines that relationship from the raw line rate and
+``linesPerCycle`` rather than assuming it. A legacy level-based detector is retained
+for sessions where DI3 is a sustained acquisition gate rather than a pulse train.
 """
 from __future__ import annotations
 

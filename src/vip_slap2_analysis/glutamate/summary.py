@@ -425,9 +425,21 @@ class GlutamateSummary:
         self._align_params: Optional[Dict[str, Any]] = None
         self.trial_epoch: Optional[np.ndarray] = None
         self.trial_epoch_source: str = "unavailable"
+        self.n_epochs: int = 0
 
         self._get_info()
         self.trial_epoch, self.trial_epoch_source = self._infer_trial_epoch()
+        if self.trial_epoch is not None and np.asarray(self.trial_epoch).size:
+            positive = np.asarray(self.trial_epoch, dtype=int)
+            positive = positive[positive > 0]
+            if positive.size:
+                self.n_epochs = int(np.max(positive))
+        try:
+            if "nEpochs" in self._mat.f["exptSummary"]:
+                n_raw = np.asarray(self._mat.f["exptSummary"]["nEpochs"][()]).squeeze()
+                self.n_epochs = max(self.n_epochs, int(n_raw))
+        except Exception:
+            pass
 
     # ----------------- lifecycle -----------------
 
@@ -648,6 +660,255 @@ class GlutamateSummary:
                 pass
         return out
 
+    # ----------------- raw SLAP2 acquisition metadata -----------------
+
+    @staticmethod
+    def _is_ref_dataset(node: object) -> bool:
+        """Return True when ``node`` stores MATLAB-style HDF5 references."""
+        return (
+            isinstance(node, h5py.Dataset)
+            and (node.dtype == h5py.ref_dtype or getattr(node.dtype, "kind", None) == "O")
+        )
+
+    @staticmethod
+    def _scalar(node: h5py.Dataset, default: Any = None) -> Any:
+        """Read a scalar-like HDF5 dataset and decode simple MATLAB values."""
+        try:
+            val = bytes_to_str(node[()])
+            if isinstance(val, np.ndarray):
+                val = np.squeeze(val)
+                if val.ndim == 0:
+                    return val.item()
+                return val.tolist()
+            return val
+        except Exception:
+            return default
+
+    @staticmethod
+    def _decode_matlab_string_dataset(ds: h5py.Dataset) -> str:
+        """Decode a MATLAB char/string dataset into a Python string."""
+        try:
+            val = bytes_to_str(ds[()])
+            if isinstance(val, bytes):
+                return val.decode(errors="ignore")
+            if isinstance(val, str):
+                return val.rstrip("\x00")
+            arr = np.asarray(val)
+            if arr.dtype.kind in ("U", "S", "O"):
+                return "".join(np.ravel(arr).astype(str).tolist()).rstrip("\x00")
+            if np.issubdtype(arr.dtype, np.number):
+                return "".join(chr(int(x)) for x in np.ravel(arr) if int(x) != 0)
+        except Exception:
+            pass
+        return ""
+
+    def _read_group_scalars(self, group: h5py.Group) -> Dict[str, Any]:
+        """Decode scalar/string datasets from one MATLAB metadata structure."""
+        out: Dict[str, Any] = {}
+        for key, node in group.items():
+            if not isinstance(node, h5py.Dataset):
+                continue
+            value = self._scalar(node)
+            if isinstance(value, list):
+                text = self._decode_matlab_string_dataset(node)
+                out[key] = text if text else value
+            else:
+                out[key] = value
+        return out
+
+    def _validate_dmd(self, dmd: int) -> int:
+        """Validate a 1-indexed DMD argument and return its 0-indexed value."""
+        dmd0 = int(dmd) - 1
+        if dmd0 < 0 or dmd0 >= int(self.n_dmds):
+            raise IndexError(f"dmd must be in [1, {self.n_dmds}], got {dmd}")
+        return dmd0
+
+    def _dmd_struct_item(
+        self, field_name: str, dmd0: int
+    ) -> Optional[Union[h5py.Dataset, h5py.Group]]:
+        """Dereference one field of ``exptSummary.dmd(dmd)`` when present."""
+        summary = self._mat.f["exptSummary"]
+        if "dmd" not in summary or not isinstance(summary["dmd"], h5py.Group):
+            return None
+        dmd_group = summary["dmd"]
+        if field_name not in dmd_group:
+            return None
+        field = dmd_group[field_name]
+        if not self._is_ref_dataset(field):
+            return field
+
+        for i, j in ((dmd0, 0), (0, dmd0)):
+            try:
+                ref = field[i, j]
+                if ref is None:
+                    continue
+                try:
+                    if int(ref) == 0:  # type: ignore[arg-type]
+                        continue
+                except Exception:
+                    pass
+                return self._mat.deref(ref)
+            except Exception:
+                continue
+        # Fallback for one-dimensional cell/struct representations.
+        try:
+            ref = np.ravel(field[()])[dmd0]
+            return self._mat.deref(ref)
+        except Exception:
+            return None
+
+    def get_dmd_metadata(self, dmd: int) -> Dict[str, Any]:
+        """Return authoritative raw-acquisition metadata for one DMD.
+
+        Patched ``summarize_LoCo.m`` files store this under
+        ``exptSummary/dmd/metadata`` using the same schema as the voltage
+        extractor: line rate, line period, lines per cycle, geometry, and planned
+        acquisition fields. Older SummaryLoCo files return an empty dictionary.
+        """
+        dmd0 = self._validate_dmd(dmd)
+        node = self._dmd_struct_item("metadata", dmd0)
+        if node is None or not isinstance(node, h5py.Group):
+            return {}
+        return self._read_group_scalars(node)
+
+    def get_dmd_epoch_metadata(self, dmd: int) -> List[Dict[str, Any]]:
+        """Return actual raw-SLAP2 acquisition metadata for each source epoch."""
+        dmd0 = self._validate_dmd(dmd)
+        node = self._dmd_struct_item("epochs", dmd0)
+        if node is None or not isinstance(node, h5py.Group):
+            return []
+
+        field_names = list(node.keys())
+        if not field_names:
+            return []
+        n_epochs = 0
+        for field_name in field_names:
+            field = node[field_name]
+            if isinstance(field, h5py.Dataset):
+                n_epochs = max(n_epochs, int(np.prod(field.shape)))
+        if n_epochs <= 0:
+            return []
+
+        rows: List[Dict[str, Any]] = [dict() for _ in range(n_epochs)]
+        for field_name in field_names:
+            field = node[field_name]
+            if not isinstance(field, h5py.Dataset):
+                continue
+            values = np.ravel(field[()])
+            for i, raw in enumerate(values[:n_epochs]):
+                value: Any = None
+                if self._is_ref_dataset(field):
+                    try:
+                        target = self._mat.deref(raw)
+                    except Exception:
+                        target = None
+                    if isinstance(target, h5py.Group):
+                        value = self._read_group_scalars(target)
+                    elif isinstance(target, h5py.Dataset):
+                        scalar = self._scalar(target)
+                        text = self._decode_matlab_string_dataset(target)
+                        if isinstance(scalar, (int, float, np.integer, np.floating, bool, np.bool_)):
+                            value = scalar.item() if isinstance(scalar, np.generic) else scalar
+                        elif text:
+                            value = text
+                        else:
+                            value = scalar
+                else:
+                    try:
+                        arr = np.asarray(raw).squeeze()
+                        value = arr.item() if arr.ndim == 0 else arr.tolist()
+                    except Exception:
+                        value = raw
+                rows[i][field_name] = value
+
+        rows = [row for row in rows if row]
+        int_fields = (
+            "epochIdx", "firstTrial", "lastTrial", "linesPerCycle",
+            "nCycles", "totalNumLines",
+        )
+        for row in rows:
+            for key in int_fields:
+                try:
+                    value = float(row[key])
+                except Exception:
+                    continue
+                if np.isfinite(value):
+                    row[key] = int(round(value))
+            if "available" in row:
+                value = row["available"]
+                if isinstance(value, str) and len(value) == 1:
+                    row["available"] = bool(ord(value))
+                else:
+                    try:
+                        row["available"] = bool(int(value))
+                    except Exception:
+                        pass
+
+        rows.sort(key=lambda row: int(row.get("epochIdx", 0) or 0))
+        return rows
+
+    def get_dmd_epoch_durations_sec(self, dmd: int) -> Dict[int, float]:
+        """Return ``{source_epoch: actual acquisition duration seconds}``.
+
+        Duration is derived from ``totalNumLines / lineRateHz``. This is deliberately
+        independent of the 200-Hz SummaryLoCo analysis rate so downstream alignment
+        can preserve nominal trace sampling while QC'ing against the raw acquisition.
+        """
+        rows = self.get_dmd_epoch_metadata(dmd)
+        out: Dict[int, float] = {}
+        for row in rows:
+            try:
+                epoch_id = int(round(float(row.get("epochIdx"))))
+                total_lines = float(row.get("totalNumLines"))
+            except Exception:
+                continue
+            rate = float("nan")
+            metadata = row.get("metadata", {})
+            if isinstance(metadata, dict):
+                for key in ("lineRateHz", "line_rate_hz"):
+                    try:
+                        candidate = float(np.asarray(metadata.get(key)).squeeze())
+                    except Exception:
+                        continue
+                    if np.isfinite(candidate) and candidate > 0:
+                        rate = candidate
+                        break
+            if not np.isfinite(rate) or rate <= 0:
+                md = self.get_dmd_metadata(dmd)
+                try:
+                    rate = float(np.asarray(md.get("lineRateHz")).squeeze())
+                except Exception:
+                    rate = float("nan")
+            if epoch_id > 0 and np.isfinite(total_lines) and total_lines >= 0 and np.isfinite(rate) and rate > 0:
+                out[epoch_id] = float(total_lines / rate)
+        return out
+
+    def get_line_rate_hz(self, dmd: Optional[int] = None) -> float:
+        """Return the raw SLAP2 line rate for one DMD or the median across DMDs."""
+        rates: List[float] = []
+        dmds = [int(dmd)] if dmd is not None else list(range(1, int(self.n_dmds) + 1))
+        for d in dmds:
+            md = self.get_dmd_metadata(d)
+            try:
+                value = float(np.asarray(md.get("lineRateHz")).squeeze())
+            except Exception:
+                continue
+            if np.isfinite(value) and value > 0:
+                rates.append(value)
+        return float(np.median(rates)) if rates else float("nan")
+
+    def get_dmd_cycle_rate_hz(self, dmd: int) -> float:
+        """Return the expected raw SLAP2 cycle rate ``lineRateHz/linesPerCycle``."""
+        md = self.get_dmd_metadata(dmd)
+        try:
+            rate = float(np.asarray(md.get("lineRateHz")).squeeze())
+            lines = float(np.asarray(md.get("linesPerCycle")).squeeze())
+        except Exception:
+            return float("nan")
+        if not np.isfinite(rate) or not np.isfinite(lines) or rate <= 0 or lines <= 0:
+            return float("nan")
+        return float(rate / lines)
+
     def _read_trial_table_strings(self, field_name: str) -> List[str]:
         """Best-effort decode of a MATLAB cell-string trial-table field."""
         path = f"exptSummary/trialTable/{field_name}"
@@ -746,8 +1007,7 @@ class GlutamateSummary:
                 if values.size != self.n_trials:
                     continue
                 labels = self._stable_relabel_epoch_vector(values)
-                if np.unique(labels).size > 1:
-                    return labels, f"explicit:{path}"
+                return labels, f"explicit:{path}"
             except Exception:
                 continue
 
@@ -760,8 +1020,7 @@ class GlutamateSummary:
                 prefix = re.sub(r"[_-]CYCLE[_-]?\d+.*$", "", prefix, flags=re.IGNORECASE)
                 prefixes.append(prefix or name)
             labels = self._stable_relabel_epoch_vector(np.asarray(prefixes, dtype=object))
-            if np.unique(labels).size > 1:
-                return labels, "filename_prefix:exptSummary/trialTable/filename"
+            return labels, "filename_prefix:exptSummary/trialTable/filename"
 
         return None, "unavailable"
 

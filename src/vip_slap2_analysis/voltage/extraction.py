@@ -28,6 +28,7 @@ import numpy as np
 
 from vip_slap2_analysis.common.session import SessionAssets
 from vip_slap2_analysis.common.epoch_alignment import DEFAULT_MIN_EPOCH_DURATION_SEC
+from vip_slap2_analysis.common.clock_qc import compare_slap2_harp_clock
 from vip_slap2_analysis.common.alignment import (
     EventWindows,
     ReconstructedTraceBundle,
@@ -1821,11 +1822,11 @@ def process_voltage_extraction(
     drop_discarded
         Remove samples marked by ``discardFrames`` before event extraction.
     timebase_strategy
-        Voltage behavior-time mapping for trial-based traces. ``"auto"`` scales
-        the reconstructed timebase to the behavior imaging epoch only when the
-        nominal sample-rate duration disagrees with that epoch, preventing
-        progressive event-alignment drift. Use ``"sample_rate"`` to reproduce the
-        historical fixed-rate mapping.
+        Backward-compatible timebase option. When HARP imaging epochs are present
+        (the standard processing path), reconstruction always preserves the nominal
+        SLAP2 sample interval, reconciles each source epoch independently, and clips
+        unsupported tails rather than stretching physiology to HARP. The option is
+        only consulted by the legacy no-epoch fallback.
     max_timebase_error_sec
         Duration-mismatch threshold used by ``timebase_strategy='auto'``.
     write_single_trials
@@ -1937,11 +1938,16 @@ def process_voltage_extraction(
             default_hz=default_sample_rate_hz,
         )
         tvecs = _time_vectors(windows, rate)
+        clock_qc = compare_slap2_harp_clock(
+            vs,
+            behavior_qc_dir=Path(asset.qc_dir) / "behavior",
+            harp_df_csv=asset.harp_df_csv,
+        )
 
         summary_mat = asset.get_asset("voltage", "summary_mat") if hasattr(asset, "get_asset") else None
         trace_h5 = asset.get_asset("voltage", "trace_h5") if hasattr(asset, "get_asset") else None
         base_meta: Dict[str, Any] = {
-            "schema_version": "0.1.0",
+            "schema_version": "0.1.1",
             "session_id": asset.session_id,
             "subject_id": int(asset.subject_id),
             "modality": "voltage",
@@ -1985,12 +1991,16 @@ def process_voltage_extraction(
             "voltage_summary_layout": getattr(vs, "layout", None),
             "voltage_summary_metadata": getattr(vs, "metadata", {}),
             "voltage_h5_attrs": getattr(vs, "h5_attrs", {}),
+            "source_acquisition_metadata_available": bool(
+                any(vs.get_dmd_epoch_metadata(dmd) for dmd in range(1, int(vs.n_dmds) + 1))
+            ),
+            "slap2_harp_clock_qc": clock_qc,
         }
 
         mean_pkg: Dict[str, Any] = {"metadata": base_meta, "timebase_sec": tvecs, "DMD1": {}, "DMD2": {}}
         seq_pkg: Dict[str, Any] = {"metadata": base_meta, "timebase_sec": {"image": tvecs["image"]}, "DMD1": {}, "DMD2": {}}
         qc: Dict[str, Any] = {
-            "schema_version": "0.1.0",
+            "schema_version": "0.1.1",
             "session_id": asset.session_id,
             "summary_mat": base_meta["summary_mat"],
             "trace_h5": base_meta["trace_h5"],
@@ -2009,6 +2019,8 @@ def process_voltage_extraction(
             "epoch_acquired_duration_sec": epoch_acquired_duration_sec,
             "epoch_session_span_sec": epoch_session_span_sec,
             "epoch_gap_duration_sec": epoch_gap_duration_sec,
+            "source_acquisition_metadata_available": base_meta["source_acquisition_metadata_available"],
+            "slap2_harp_clock_qc": clock_qc,
             "windows_sec": base_meta["windows_sec"],
             "event_counts": {
                 "image_total": int(sum(len(v) for v in image_times.values())),
@@ -2196,6 +2208,7 @@ def process_voltage_extraction(
                         bundle.reconstructed_duration_sec - epoch_session_span_sec
                     ),
                     "reconstruction_metadata": dict(getattr(bundle, "metadata", {}) or {}),
+                    "source_acquisition_epochs": vs.get_dmd_epoch_metadata(dmd),
                     "alignment_sample_rate_hz": float(event_rate),
                     "timebase_strategy_used": str((getattr(bundle, "metadata", {}) or {}).get("timebase_strategy_used", "unknown")),
                     "n_image_ids_extracted": int(len(image_count_by_id)),

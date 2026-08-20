@@ -487,12 +487,26 @@ def reconstruct_dmd_session_traces(
     for trial, arr in valid_trial_data.items():
         source_trial_lengths[trial - 1] = int(arr.shape[1])
 
+    if trial_epoch is None and getattr(exp, "trial_epoch", None) is not None:
+        trial_epoch = np.asarray(exp.trial_epoch, dtype=int)
+
     if epoch_df is not None and len(epoch_df) > 0:
+        if trial_epoch is None and int(getattr(exp, "n_epochs", 0) or 0) > 1 and strict_epoch_match:
+            raise ValueError(
+                "Multi-epoch glutamate reconstruction requires source trialEpoch metadata. "
+                "Re-run the patched summarize_LoCo.m before downstream processing."
+            )
+        source_epoch_durations_sec = (
+            exp.get_dmd_epoch_durations_sec(dmd)
+            if hasattr(exp, "get_dmd_epoch_durations_sec")
+            else {}
+        )
         reconciliation = reconcile_trial_epochs(
             source_trial_lengths,
             sample_rate_hz=float(im_rate_hz),
             behavior_epoch_df=epoch_df,
             source_trial_epoch=trial_epoch,
+            source_epoch_durations_sec=source_epoch_durations_sec or None,
             min_epoch_duration_sec=min_epoch_duration_sec,
             strict_epoch_match=strict_epoch_match,
         )
@@ -529,7 +543,15 @@ def reconstruct_dmd_session_traces(
         "n_samples_total": int(total_samples),
         "min_epoch_duration_sec": float(min_epoch_duration_sec),
         "source_trial_lengths_samples": source_trial_lengths.astype(int).tolist(),
+        "source_trial_epoch_source": getattr(exp, "trial_epoch_source", "unavailable"),
+        "source_acquisition_metadata_available": bool(
+            hasattr(exp, "get_dmd_epoch_metadata") and exp.get_dmd_epoch_metadata(dmd)
+        ),
     }
+    if epoch_df is not None and len(epoch_df) > 0:
+        metadata["source_epoch_durations_sec"] = {
+            str(k): float(v) for k, v in (source_epoch_durations_sec or {}).items()
+        }
 
     sample_epoch: Optional[np.ndarray] = None
     if behavior_epochs is not None and len(behavior_epochs) > 0:

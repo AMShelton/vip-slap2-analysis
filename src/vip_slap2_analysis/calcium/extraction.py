@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 
 from vip_slap2_analysis.common.session import SessionAssets
+from vip_slap2_analysis.common.clock_qc import compare_slap2_harp_clock
 from vip_slap2_analysis.common.epoch_alignment import (
     DEFAULT_MIN_EPOCH_DURATION_SEC,
     build_epoch_aware_timebase,
@@ -432,12 +433,26 @@ def _reconstruct_ca_session_traces(
         source_valid_mask[i] = bool(np.isfinite(arr).any())
 
     reconciliation = None
+    if source_trial_epoch is None and getattr(exp, "trial_epoch", None) is not None:
+        source_trial_epoch = np.asarray(exp.trial_epoch, dtype=int)
+    source_epoch_durations_sec: Dict[int, float] = {}
     if epoch_df is not None and len(epoch_df) > 0:
+        if source_trial_epoch is None and int(getattr(exp, "n_epochs", 0) or 0) > 1 and strict_epoch_match:
+            raise ValueError(
+                "Multi-epoch calcium reconstruction requires source trialEpoch metadata. "
+                "Re-run the patched summarize_LoCo.m before downstream processing."
+            )
+        source_epoch_durations_sec = (
+            exp.get_dmd_epoch_durations_sec(dmd)
+            if hasattr(exp, "get_dmd_epoch_durations_sec")
+            else {}
+        )
         reconciliation = reconcile_trial_epochs(
             source_trial_lengths,
             sample_rate_hz=float(im_rate_hz),
             behavior_epoch_df=epoch_df,
             source_trial_epoch=source_trial_epoch,
+            source_epoch_durations_sec=source_epoch_durations_sec or None,
             min_epoch_duration_sec=min_epoch_duration_sec,
             strict_epoch_match=strict_epoch_match,
         )
@@ -503,6 +518,15 @@ def _reconstruct_ca_session_traces(
             epoch_metadata["source_epoch_qc"] = reconciliation.source_epoch_qc.to_dict(orient="records")
             epoch_metadata["source_trial_epoch"] = source_epoch_labels.astype(int).tolist()
             epoch_metadata["analysis_trial_epoch"] = trial_epoch.astype(int).tolist()
+            epoch_metadata["source_epoch_durations_sec"] = {
+                str(k): float(v) for k, v in source_epoch_durations_sec.items()
+            }
+            epoch_metadata["source_trial_epoch_source"] = getattr(
+                exp, "trial_epoch_source", "unavailable"
+            )
+            epoch_metadata["source_acquisition_metadata_available"] = bool(
+                hasattr(exp, "get_dmd_epoch_metadata") and exp.get_dmd_epoch_metadata(dmd)
+            )
     else:
         offsets = np.concatenate([[0], np.cumsum(trial_lengths)])
         for i, (offset, length) in enumerate(zip(offsets[:-1], trial_lengths)):
@@ -729,10 +753,15 @@ def process_calcium_extraction(
     ordered_images_f = filter_ordered_images_to_epochs(ordered_images, epoch_df, pre_time=windows.image[0], post_time=windows.image[1])
 
     exp = GlutamateSummary(asset.summary_mat)
+    clock_qc = compare_slap2_harp_clock(
+        exp,
+        behavior_qc_dir=Path(asset.qc_dir) / "behavior",
+        harp_df_csv=asset.harp_df_csv,
+    )
     tvecs = _time_vectors(windows, im_rate_hz)
 
     base_meta = {
-        "schema_version": "0.1.2",
+        "schema_version": "0.1.3",
         "session_id": asset.session_id,
         "subject_id": int(asset.subject_id),
         "summary_mat": str(asset.summary_mat),
@@ -763,6 +792,10 @@ def process_calcium_extraction(
         "epoch_duration_qc_policy": "accept_duration_greater_than_or_equal_to_threshold",
         "source_trial_epoch_available": getattr(exp, "trial_epoch", None) is not None,
         "source_trial_epoch_source": getattr(exp, "trial_epoch_source", "unavailable"),
+        "source_acquisition_metadata_available": bool(
+            any(exp.get_dmd_epoch_metadata(dmd) for dmd in range(1, exp.n_dmds + 1))
+        ),
+        "slap2_harp_clock_qc": clock_qc,
         "epoch_acquired_duration_sec": epoch_acquired_duration_sec,
         "epoch_session_span_sec": epoch_span_sec,
         "epoch_gap_duration_sec": epoch_gap_duration_sec,
@@ -778,7 +811,7 @@ def process_calcium_extraction(
     seq_pkg: Dict[str, Any] = {"metadata": base_meta, "timebase_sec": {"image": tvecs["image"]}, "DMD1": {}, "DMD2": {}}
 
     meta_out: Dict[str, Any] = {
-        "schema_version": "0.1.2",
+        "schema_version": "0.1.3",
         "session_id": asset.session_id,
         "indicator2": indicator2,
         "motion_correct": bool(motion_correct),
@@ -793,6 +826,8 @@ def process_calcium_extraction(
         "epoch_duration_qc_policy": "accept_duration_greater_than_or_equal_to_threshold",
         "source_trial_epoch_available": getattr(exp, "trial_epoch", None) is not None,
         "source_trial_epoch_source": getattr(exp, "trial_epoch_source", "unavailable"),
+        "source_acquisition_metadata_available": base_meta["source_acquisition_metadata_available"],
+        "slap2_harp_clock_qc": clock_qc,
         "windows_sec": base_meta["windows_sec"],
         "event_counts": {
             "image_total": int(sum(len(v) for v in image_times.values())),
@@ -948,6 +983,8 @@ def process_calcium_extraction(
             "source_trial_epoch": np.asarray(bundle.get("source_trial_epoch", []), dtype=int).tolist(),
             "epoch_qc": bundle.get("epoch_metadata", {}).get("epoch_qc", {}),
             "source_epoch_qc": bundle.get("epoch_metadata", {}).get("source_epoch_qc", []),
+            "source_epoch_durations_sec": bundle.get("epoch_metadata", {}).get("source_epoch_durations_sec", {}),
+            "source_acquisition_epochs": exp.get_dmd_epoch_metadata(dmd),
             "acquired_duration_sec": float(bundle.get("epoch_metadata", {}).get("acquired_duration_sec", np.sum(bundle["trial_lengths_samples"]) / im_rate_hz)),
             "imaging_gap_duration_sec": float(bundle.get("epoch_metadata", {}).get("imaging_gap_duration_sec", epoch_gap_duration_sec)),
             "duration_error_sec_by_epoch": bundle.get("epoch_metadata", {}).get("duration_error_sec_by_epoch", {}),

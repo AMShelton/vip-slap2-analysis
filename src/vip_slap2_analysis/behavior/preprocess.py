@@ -295,6 +295,19 @@ def process_behavior_session(
 
     epochs = shift_epochs_to_photodiode_time(epochs, harp_df, photodiode_df)
     epoch_df = epochs_to_dataframe(epochs)
+    # Preserve pulse counts in the canonical imaging-epoch table when pulse-train
+    # detection is used. Counts are invariant to the small HARP->photodiode clock
+    # offset applied above and are useful for direct SLAP2 cycle-clock QC.
+    if pulse_diag:
+        accepted_pulse_rows = [
+            row for row in pulse_diag.get("candidate_epochs", [])
+            if bool(row.get("accepted", False))
+        ]
+        if len(accepted_pulse_rows) == len(epoch_df):
+            epoch_df["n_pulses"] = [int(row["n_pulses"]) for row in accepted_pulse_rows]
+            epoch_df["pulse_source_epoch_index"] = [
+                int(row["source_epoch_index"]) for row in accepted_pulse_rows
+            ]
     save_epochs_csv(epoch_df, paths.qc_dir / "imaging_epochs.csv")
 
     event_coverage = audit_event_coverage(corrected_df, epoch_df)
