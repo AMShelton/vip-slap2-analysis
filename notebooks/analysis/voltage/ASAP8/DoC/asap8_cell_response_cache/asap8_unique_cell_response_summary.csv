@@ -1,0 +1,18 @@
+subject_id,dataset_cell_key,n_sessions,tracked,depth_um,image_identity_dff_ever,change_dff_ever,omission_dff_ever,image_identity_spike_ever,change_spike_ever,omission_spike_ever,depth_group
+852835,852835:G852835_C000,6,True,55.315,True,False,False,False,False,False,<100 µm
+852835,852835:G852835_C001,6,True,55.315,True,True,False,True,False,False,<100 µm
+852835,852835:G852835_C002,6,True,55.315,True,False,False,True,False,False,<100 µm
+852835,852835:G852835_C003,6,True,55.315,True,False,False,True,True,False,<100 µm
+852835,852835:G852835_C004,6,True,127.12,True,False,False,True,False,False,100–150 µm
+852835,852835:G852835_C005,6,True,127.12,True,False,False,True,True,False,100–150 µm
+852835,852835:G852835_C006,6,True,127.12,True,False,True,True,False,False,100–150 µm
+852835,852835:G852835_C007,3,True,128.62,True,False,False,True,False,False,100–150 µm
+863774,863774:G863774_C000,4,True,123.75,True,False,False,True,True,False,100–150 µm
+863774,863774:G863774_C001,3,True,120.5,True,False,False,False,False,False,100–150 µm
+863774,863774:G863774_C002,5,True,120.5,True,True,False,True,False,False,100–150 µm
+863774,863774:G863774_C003,6,True,121.06,True,True,False,True,True,False,100–150 µm
+863774,863774:G863774_C004,6,True,121.06,False,False,False,True,False,False,100–150 µm
+863774,863774:G863774_C005,6,True,198.88,True,True,False,True,False,False,>150 µm
+863774,863774:G863774_C006,6,True,198.88,True,False,False,True,False,False,>150 µm
+863774,863774:G863774_C007,6,True,198.88,True,False,False,True,True,False,>150 µm
+863774,863774:G863774_C008,6,True,198.88,True,True,True,True,True,True,>150 µm
