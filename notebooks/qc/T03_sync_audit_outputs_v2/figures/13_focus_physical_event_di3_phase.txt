@@ -1,9 +1,0 @@
-Example recording: HARP stimulus events in SLAP2 acquisition-cycle time
-
-SOURCE: 863774_2026-08-04_08-12-47: HARP analog photodiode.pkl and HARP_df.csv/DI3, unmodified acquisition indices
-
-METHOD: Subtract nearest DI3 rising-edge time from each HARP photodiode rising-edge time within recorded epochs.
-
-INTERPRETATION: Shows the phase at which each physical display transition occurred relative to the acquisition cycles.
-
-LIMITATION: Nearest-edge phase is not a synchronization error; same-clock index origin and per-DMD line mapping remain to be verified.

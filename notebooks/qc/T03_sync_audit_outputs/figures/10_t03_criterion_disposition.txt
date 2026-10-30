@@ -1,7 +1,0 @@
-Original one-display-frame T0.3 acceptance and evidence status
-
-SOURCE: Registry cohort; independently verified imaging↔HARP error and measured display frame period if provided in separate evidence CSV
-
-MEANING: Distinguishes proven PASS/FAIL from pending independent source-clock mapping.
-
-LIMITATION: Missing evidence is pending rather than scientific failure; weak surrogate metrics never promote sessions to PASS.

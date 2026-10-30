@@ -1,4 +1,0 @@
-SOURCE: \\allen\aind\scratch\ophys\Andrew\VIP_synaptic_dynamics\ASAP8\863774\863774_2026-08-04_08-12-47\863774_2026-08-04_08-12-47\behavior\VCO1_Behavior.harp\extracted_files\HARP_df.csv; source metadata; analysis/qc/behavior/di3_pulse_train_detection.json where available.
-METHOD: Measure acquisition durations independently. Upper: nested durations under an explicitly ASSUMED common start; lower: observed DI3 epoch bounds on HARP clock.
-INTERPRETATION: Demonstrates why total source and HARP pulse counts need not match and why tail clipping is expected for longer source streams.
-LIMITATION: Absolute SLAP2 start/end in HARP time not measured. Upper nesting is a visualization of durations, not independent proof of boundary registration.

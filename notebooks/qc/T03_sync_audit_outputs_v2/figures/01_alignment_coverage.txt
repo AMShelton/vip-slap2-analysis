@@ -1,9 +1,0 @@
-Recording coverage by modality and synchronization pathway
-
-SOURCE: VIPSessionRegistry sessions + analysis/qc/behavior/alignment_meta.json + original bonsai_event_log.csv/alignment_method
-
-METHOD: Crosstab of pathway and modality; known reuse labels resolved from original event log.
-
-INTERPRETATION: Shows which alignment methods can support modern held-out versus legacy in-fit diagnostics.
-
-LIMITATION: File and method coverage is not itself proof of successful alignment.

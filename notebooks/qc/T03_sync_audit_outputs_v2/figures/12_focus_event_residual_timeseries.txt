@@ -1,9 +1,0 @@
-Example recording: timing residuals throughout acquisition
-
-SOURCE: 863774_2026-08-04_08-12-47: per-event corrected BonVision timestamps and detected HARP photodiode edges
-
-METHOD: Plot the signed residual of every matched event against corrected BonVision elapsed time.
-
-INTERPRETATION: Tests whether event timing remains accurate and stable through the recording.
-
-LIMITATION: Timing residuals are not a line-index-to-HARP drift measurement; dashed frame is a reference only.

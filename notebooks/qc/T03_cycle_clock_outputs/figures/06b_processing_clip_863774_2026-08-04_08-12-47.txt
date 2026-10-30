@@ -1,4 +1,0 @@
-SOURCE: \\allen\aind\scratch\ophys\Andrew\VIP_synaptic_dynamics\ASAP8\863774\863774_2026-08-04_08-12-47/analysis/qc/{voltage,glutamate}/*qc_metadata.json / source_epoch_qc
-METHOD: Visualize saved source epoch duration and kept_duration_s (or proportional kept samples where unavailable), with trailing discarded source duration.
-INTERPRETATION: Shows the exact per-DMD/epoch tail-clipping decisions recorded by the processing pipeline.
-LIMITATION: Processing metadata document which samples were retained; bars are source-relative, not an independently determined SLAP2 start on HARP time.

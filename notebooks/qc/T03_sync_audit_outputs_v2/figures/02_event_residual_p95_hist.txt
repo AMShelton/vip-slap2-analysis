@@ -1,9 +1,0 @@
-Per-session HARP stimulus-transition timing precision
-
-SOURCE: bonsai_event_log.csv/Frame corrected_timestamps; HARP photodiode.pkl analog transitions; pathway metadata
-
-METHOD: For each session uniquely match predicted and detected edges; histogram p95 absolute residual, including signed bias.
-
-INTERPRETATION: Left and right panels give session distributions with a one-frame visual reference.
-
-LIMITATION: Both are conditional on the existing alignment model; modern held-out predictions provide stronger evidence below.

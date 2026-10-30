@@ -1,7 +1,0 @@
-DI3 acquisition-clock cadence across sessions
-
-SOURCE: HARP_df.csv DI3 rising edges, or qc/behavior/di3_pulse_train_detection.json when raw CSV not scanned
-
-MEANING: Describes the recorded acquisition-clock period per session. Changes can reflect acquisition configuration, not failures.
-
-LIMITATION: Does not uniquely establish imaging absolute phase, line-index mapping, or DMD2 sampling rate; gaps between acquisition epochs are not dropped-pulse evidence.

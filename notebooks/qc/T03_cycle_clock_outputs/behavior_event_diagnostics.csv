@@ -1,3 +1,0 @@
-session_id,alignment_pathway,p95_abs_ms,fraction_within_reference_frame,coverage,n_matched,status
-863774_2026-08-04_08-12-47,encoded_photodiode,2.2737367544323206e-10,1.0,,1781,modern_corrected_event_vs_harp_pd_in_sample
-803496_2025-07-31_09-43-28,legacy_frame_modulo,13.619688183423229,0.9866592551417455,,1799,legacy_corrected_event_vs_harp_pd_fit_consistency

@@ -1,4 +1,0 @@
-SOURCE: Session registry; SLAP2 SummaryLoCo/dendriticVoltageSummary acquisition metadata; HARP_df DI3
-METHOD: Period from long contiguous DI3 epochs compared to linesPerCycle/lineRateHz; integer-line cadence classified separately.
-INTERPRETATION: Distribution near zero supports that DI3 measures the expected SLAP2 acquisition cadence.
-LIMITATION: A cadence match does not independently measure electrical latency or prove an absolute source start offset.

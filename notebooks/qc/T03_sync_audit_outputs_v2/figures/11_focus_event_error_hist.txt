@@ -1,9 +1,0 @@
-Example recording: physical stimulus-event timing residuals
-
-SOURCE: 863774_2026-08-04_08-12-47: corrected Bonsai event-log timestamps; HARP analog PD edges
-
-METHOD: One-to-one event matches; histogram of signed prediction-minus-detection residual.
-
-INTERPRETATION: Shows the signed lag and distribution of individual stimulus transitions for a real session.
-
-LIMITATION: Modern encoded PD samples were used to calibrate the same clock; legacy frames are model-fit checks.

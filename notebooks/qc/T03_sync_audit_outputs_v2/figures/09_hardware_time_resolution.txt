@@ -1,9 +1,0 @@
-Acquisition-event sampling resolution and DI3 interval jitter
-
-SOURCE: Native index of HARP photodiode.pkl; digital rising edges from HARP_df.csv/DI3
-
-METHOD: Histogram of analog sampling intervals and p95 DI3 inter-rise interval deviation (acquisition-on intervals only).
-
-INTERPRETATION: Characterizes the measurement resolution and regularity of the physical HARP acquisition clock.
-
-LIMITATION: Analog sample interval alone is not PD detection bias; DI3 interval jitter does not prove source-line mapping.

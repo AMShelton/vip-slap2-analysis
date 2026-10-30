@@ -1,7 +1,0 @@
-HARP photodiode event phase relative to DI3
-
-SOURCE: HARP AnalogInput0 photodiode rise indexes vs HARP DI3 digital rising-edge timestamps from HARP_df.csv (original raw index values)
-
-MEANING: Measures whether display transitions precede or follow nearest SLAP2 acquisition-clock edges within shared HARP timestamps.
-
-LIMITATION: DI3 generally tracks DMD1 cycle edges, not individual DMD1/DMD2 samples. Nearest-pulse phase is bounded/periodic, is not absolute lag, and depends on shared HARP index origin.

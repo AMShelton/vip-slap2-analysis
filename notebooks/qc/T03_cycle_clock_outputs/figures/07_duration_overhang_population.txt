@@ -1,4 +1,0 @@
-SOURCE: SLAP2 source metadata per epoch and HARP DI3 rising-edge segments, grouped by registry session_type.
-METHOD: Difference between summed source nominal duration and summed measured HARP DI3 epoch duration.
-INTERPRETATION: Reports expected additional source acquisition outside the HARP-recorded window; can identify anomalously large differences.
-LIMITATION: Not the onset offset, physical clipping position, or evidence of dropped DI3 pulses. Source durations require valid epoch metadata.

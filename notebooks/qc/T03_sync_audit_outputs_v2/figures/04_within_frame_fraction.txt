@@ -1,9 +1,0 @@
-Proportion of predicted stimulus transitions detected within one frame
-
-SOURCE: Corrected BonVision frame transitions versus HARP analog photodiode edges; estimated or assumed display frame reference
-
-METHOD: Absolute event residuals; each session supplies one fraction; only ≥75% matching-coverage sessions included.
-
-INTERPRETATION: Makes the sub-frame timing consistency claim quantitative without hiding unmatched events.
-
-LIMITATION: Frame values are estimated/assumed, not validated thresholds; fitted-model agreement is not an end-to-end T0.3 pass.

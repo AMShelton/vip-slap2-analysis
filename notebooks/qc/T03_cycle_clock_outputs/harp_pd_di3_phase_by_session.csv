@@ -1,3 +1,0 @@
-session_id,alignment_pathway,modality,n,median_phase_ms,p95_abs_phase_ms,phase_status
-863774_2026-08-04_08-12-47,encoded_photodiode,ASAP8,3562,-0.03200024366378784,9.856000542640686,conditional_shared_native_HARP_clock
-803496_2025-07-31_09-43-28,legacy_frame_modulo,iGluSnFR4,1739,0.22399984300136566,9.923200123012062,conditional_shared_native_HARP_clock

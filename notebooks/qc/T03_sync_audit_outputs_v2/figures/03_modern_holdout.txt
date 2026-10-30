@@ -1,9 +1,0 @@
-BonVision→HARP prediction on withheld photodiode edges
-
-SOURCE: Modern BV encoded transitions; original HARP photodiode detector; held-out edge interpolation from t03_session_sync.py
-
-METHOD: Withhold every fifth matched rise from interpolation; score predicted versus observed withheld rises.
-
-INTERPRETATION: Shows predictive precision and number of tests per session, labeling ambiguous periodic edge matches.
-
-LIMITATION: Matching association is still chosen upstream; low interpolation error cannot resolve a whole-period origin shift.

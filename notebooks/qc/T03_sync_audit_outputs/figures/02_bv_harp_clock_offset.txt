@@ -1,7 +1,0 @@
-BonVision-to-HARP fitted clock origin offset
-
-SOURCE: behavior/alignment_meta.json: intercept × 1000; method labels from alignment_method
-
-MEANING: Describes the relative origin of fitted BonVision and HARP coordinate systems for each session.
-
-LIMITATION: NOT imaging-to-stimulus latency; intercepts with different time-zero definitions may be incomparable.

@@ -1,4 +1,0 @@
-SOURCE: Corrected BV event timestamps and HARP photodiode threshold transitions.
-METHOD: Point-wise paired event residual versus recording time; horizontal dashed lines = nominal 60 Hz frame.
-INTERPRETATION: Reveals time-dependent misalignment, discontinuities, and outliers that a single session median would conceal.
-LIMITATION: In-sample consistency, not independent validation of absolute event correspondence.

@@ -1,9 +1,0 @@
-Example recording: measured stimulus and corrected BonVision in DI3 cycle time
-
-SOURCE: 863774_2026-08-04_08-12-47: corrected BonVision event times + physical HARP PD edges + DI3 cycle rises
-
-METHOD: For matched stimuli, compare nearest DI3 phase for each corrected BonVision prediction and each actual HARP photodiode event.
-
-INTERPRETATION: Displays whether event corrections place BonVision predictions at the same acquisition-cycle phase as the measured physical transitions.
-
-LIMITATION: Phase wraps are natural and not error. No inferred GIAnT frame_line_idx or legacy voltage sample time is shown without a validated physical anchor.

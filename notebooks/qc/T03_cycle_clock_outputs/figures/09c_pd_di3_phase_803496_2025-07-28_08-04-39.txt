@@ -1,4 +1,0 @@
-SOURCE: \\allen\aind\scratch\ophys\Andrew\VIP_synaptic_dynamics\iGluSnFR4f\803496\2025-07-28_803496\803496_2025-07-28_08-04-39\behavior\VCO1_Behavior.harp\extracted_files\HARP_df.csv; \\allen\aind\scratch\ophys\Andrew\VIP_synaptic_dynamics\iGluSnFR4f\803496\2025-07-28_803496\803496_2025-07-28_08-04-39\behavior\VCO1_Behavior.harp\extracted_files\photodiode.pkl
-METHOD: Measured HARP photodiode threshold transitions minus nearest observed HARP DI3 rise; reject transition times near acquisition-off gaps.
-INTERPRETATION: Reports the physical relationship between display onset and an SLAP2 acquisition cycle, on the HARP clock.
-LIMITATION: Nearest-cycle phase is not absolute HARP–SLAP2 lag or sync error; photodiode.pkl and DI3 native time-origin equivalence must be confirmed.

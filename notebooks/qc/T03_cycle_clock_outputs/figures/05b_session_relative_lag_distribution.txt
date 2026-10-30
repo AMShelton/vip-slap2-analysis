@@ -1,4 +1,0 @@
-SOURCE: HARP DI3 rising edges; SLAP2 source linesPerCycle and lineRateHz; registry session stage.
-METHOD: Difference between real HARP DI3 edges and SLAP2 nominal cycle ordinal prediction; set first DI3 edge to nominal index zero in each epoch.
-INTERPRETATION: Quantifies within-epoch rate agreement and accumulation across sessions; closest testable alternative to a mean electrical edge lag.
-LIMITATION: Anchoring imposes zero initial lag. Values are NOT an independently measured SLAP2-to-HARP electrical delay.
