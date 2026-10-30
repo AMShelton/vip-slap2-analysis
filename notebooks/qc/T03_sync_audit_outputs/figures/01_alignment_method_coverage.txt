@@ -1,0 +1,7 @@
+Alignment methods and coverage
+
+SOURCE: VIPSessionRegistry sessions sheet; resolved analysis/qc/behavior/alignment_meta.json
+
+MEANING: Counts show modern BV-encoded-photodiode, older frame-modulo, and unclassified sessions by modality.
+
+LIMITATION: Presence of a saved alignment method does not prove SLAP2 source-sample timing.

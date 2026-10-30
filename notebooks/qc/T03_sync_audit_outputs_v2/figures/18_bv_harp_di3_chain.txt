@@ -1,0 +1,9 @@
+Matched BonVision events and detected stimuli relative to HARP DI3 clock
+
+SOURCE: Corrected bonsai_event_log.csv event times; HARP photodiode.pkl analog edges; original HARP_df.csv/DI3 rising edges
+
+METHOD: Use the photodiode index origin to put corrected BV events and observed HARP PD events on the DI3 clock; nearest-pulse phase and same-cycle fraction.
+
+INTERPRETATION: A direct event-level linkage across all three measured data streams, indicating where predicted and actual stimulus onsets occur in acquisition cycles.
+
+LIMITATION: Source-HARP common origin is conditional; closest DI3 cycle is NOT proven source frame/line time, and the p95 phase is not synchronization error.

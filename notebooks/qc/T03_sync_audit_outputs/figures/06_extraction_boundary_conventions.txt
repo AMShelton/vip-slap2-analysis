@@ -1,0 +1,7 @@
+Source extraction boundary diagnostics
+
+SOURCE: Legacy voltage dendriticVoltageTraces HDF5 /traces/trial_* line attributes and literal boundary ROI samples; GIAnT experiment_summary.h5 /Path*/frame_info/frame_line_idxs
+
+MEANING: Documents processing timestamp conventions and possible duplicate source samples per session.
+
+LIMITATION: GIAnT line-index evidence is distinct from voltage trial edges. Duplicate samples / nominal rate ≠ demonstrated end-to-end drift; no automatic session exclusion.

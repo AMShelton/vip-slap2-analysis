@@ -1,0 +1,4 @@
+SOURCE: \\allen\aind\scratch\ophys\Andrew\VIP_synaptic_dynamics\ASAP8\863774\863774_2026-08-04_08-12-47\863774_2026-08-04_08-12-47\behavior\VCO1_Behavior.harp\extracted_files\HARP_df.csv; \\allen\aind\scratch\ophys\Andrew\VIP_synaptic_dynamics\ASAP8\863774\863774_2026-08-04_08-12-47\863774_2026-08-04_08-12-47_slap_863774_2026-08-04_08-12-47\source_extraction\dendriticVoltageExtraction\dendriticVoltageSummary-260804-114556.mat
+METHOD: Reconstruct SLAP2 cycle boundaries from nominal source lineRateHz and linesPerCycle; set epoch origin at first HARP DI3 edge; overlay pulse times over 60 s, 1 s, 200 ms.
+INTERPRETATION: Demonstrates cadence coincidence and any divergence at progressively finer time scales.
+LIMITATION: Nominal SLAP2 ticks are constructed, not a second recorded signal; zero lag at epoch start is defined by construction.

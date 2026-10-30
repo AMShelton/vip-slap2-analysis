@@ -1,0 +1,9 @@
+Event error in units of display frames: session-balanced CDF
+
+SOURCE: Per-event matched corrected BonVision and HARP photodiode times; per-session event_frame_reference_ms
+
+METHOD: Compute per-session empirical CDF then average across sessions within each pathway.
+
+INTERPRETATION: At x=1, the y value is the mean fraction of matched events within one reference frame.
+
+LIMITATION: Each session has equal weight; matching selection and fitted correction remain non-independent.

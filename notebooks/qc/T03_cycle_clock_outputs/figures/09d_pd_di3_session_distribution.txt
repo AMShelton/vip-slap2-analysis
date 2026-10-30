@@ -1,0 +1,4 @@
+SOURCE: HARP photodiode.pkl and HARP_df DI3 rising edges for sessions with available native-clock indices.
+METHOD: Median signed event-to-nearest-clock phase and its p95 magnitude per session. Focus-only subset unless full PD scan enabled.
+INTERPRETATION: Shows display-to-imaging hardware timing on a common recorded clock, with inter-session variability.
+LIMITATION: Phase is not misalignment; absent or nonoverlapping native HARP indices are excluded rather than shifted to match.

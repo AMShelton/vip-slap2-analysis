@@ -1,0 +1,7 @@
+Raw HARP clock edges and stimulus photodiode transitions
+
+SOURCE: HARP_df.csv DI3 rising-edge indexes and AnalogInput0 detected photodiode transitions; both HARP timestamp domains
+
+MEANING: Shows recorded acquisition cycles and the timing of a real display-light transition in the same time neighborhood.
+
+LIMITATION: PD transition occurs on toggled photodiode marker, not every visual stimulus; no single-sample DMD2 mapping is inferred.

@@ -1,0 +1,7 @@
+BonVision-to-HARP photodiode residuals and legacy fit consistency
+
+SOURCE: Modern: Bonsai photodiode-state transitions + HARP AnalogInput0, local detector matching repository threshold/debounce, 1-in-5 edge holdout. Legacy: frame-modulo transitions compared with HARP edges using saved affine fit.
+
+MEANING: Modern series reflects predictive mapping precision at withheld anchors; fallback series reflects fit consistency.
+
+LIMITATION: Not imaging-to-HARP accuracy. Detection/pairing is shared with processing; legacy periodic ambiguity remains. 60 Hz guide illustrative.

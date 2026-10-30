@@ -1,0 +1,9 @@
+Sub-frame fit consistency is not equivalent to independent T0.3 acceptance
+
+SOURCE: Full registry, corrected BonVision↔HARP photodiode event results, independent source-clock evidence CSV if supplied
+
+METHOD: Left: event-fit residual below/above estimated one-frame reference. Right: independent imaging↔stimulus acceptance.
+
+INTERPRETATION: Makes clear exactly which claim the currently available metadata can support.
+
+LIMITATION: Independent PASS requires verified SLAP2 source line/DI3 clock association and verified frame period.

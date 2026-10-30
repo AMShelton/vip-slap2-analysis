@@ -1,0 +1,4 @@
+SOURCE: \\allen\aind\scratch\ophys\Andrew\VIP_synaptic_dynamics\iGluSnFR4f\803496\2025-07-31_803496\803496_2025-07-31_09-43-28\behavior\VCO1_Behavior.harp\extracted_files\HARP_df.csv; source metadata in \\allen\aind\scratch\ophys\Andrew\VIP_synaptic_dynamics\iGluSnFR4f\803496\2025-07-31_803496\803496_2025-07-31_09-43-28_slap2_2026-01-20_18-34-22\source_extraction\ExperimentSummary\SummaryLoCo-260120-092825.mat
+METHOD: Anchor first DI3 rising pulse to nominal cycle #0 separately in each contiguous pulse train; preserve unfiltered raw time differences.
+INTERPRETATION: Slope and long-term displacement quantify mismatch between nominal and recorded cycle rates; interval histograms show jitter.
+LIMITATION: No independent SLAP2 electrical timestamp exists. Residuals cannot establish an absolute HARP-versus-SLAP2 latency.

@@ -1,0 +1,4 @@
+SOURCE: Same inputs as Figure 01, grouped by A0–B2 stage.
+METHOD: Long-epoch HARP edge period compared to the nominal SLAP2 DMD cycle; p95 within-epoch DI3 period jitter.
+INTERPRETATION: Identifies whether timing agreement varies systematically with experimental stage.
+LIMITATION: HARP timestamp granularity contributes to measured interval jitter; irregular/off-epoch gaps excluded.

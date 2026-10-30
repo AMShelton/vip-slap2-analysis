@@ -1,0 +1,9 @@
+Physical HARP photodiode transitions in the DI3 acquisition clock
+
+SOURCE: Original HARP photodiode.pkl index and HARP_df.csv DI3 rising-edge times in the same declared time origin
+
+METHOD: For each measured HARP PD rise within the DI3 recording, subtract its nearest HARP DI3 rise.
+
+INTERPRETATION: Demonstrates hardware clock phase coverage at stimulus events, separated by imaging modality.
+
+LIMITATION: Nearest-edge phase is bounded by half the DI3 period and is NOT an end-to-end physiology timing error; index origin remains conditional.

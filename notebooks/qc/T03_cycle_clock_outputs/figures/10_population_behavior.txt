@@ -1,0 +1,4 @@
+SOURCE: Saved analysis/qc/behavior/alignment_meta.json (left); corrected BV CSV and HARP analog photodiode.pkl (middle/right).
+METHOD: Saved HARP/BV interval RMSE shown separately from real paired-event residual p95 and within-frame fraction. Colored by original alignment method.
+INTERPRETATION: Quantifies precision of both synchronization algorithms across eligible sessions and reveals session variability.
+LIMITATION: Interval RMSE is NOT point-wise lag. Paired-event error is fitted consistency, not independent ground truth; full-event columns only cover scanned sessions.

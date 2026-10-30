@@ -1,0 +1,9 @@
+Event detection precision versus systematic signed bias
+
+SOURCE: BonVision corrected frame timestamps minus HARP photodiode analog rise/edge detections, grouped by method
+
+METHOD: Per session: signed median residual versus p95 absolute residual.
+
+INTERPRETATION: Distinguishes narrow-but-biased timing from both low-bias and low-dispersion alignment.
+
+LIMITATION: The corrected BonVision clock was calibrated using photodiode edges; these are conditional fit residuals.

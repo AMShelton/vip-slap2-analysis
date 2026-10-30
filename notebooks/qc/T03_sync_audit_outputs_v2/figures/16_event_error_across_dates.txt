@@ -1,0 +1,9 @@
+Stimulus timing consistency across recording campaigns
+
+SOURCE: Registry session IDs; corrected BonVision event times; measured HARP analog photodiode edges; session frame reference
+
+METHOD: Connect per-session p95 absolute residuals in chronological acquisition order; lines are only visual guides.
+
+INTERPRETATION: Checks for systematic changes in alignment quality between sessions or acquisition campaigns.
+
+LIMITATION: No interpolation or smoothing. The vertical metric is behavioral fit consistency, not independently validated SLAP2 timing.

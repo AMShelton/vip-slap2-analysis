@@ -1,0 +1,9 @@
+Session-scale stability of stimulus-event timing
+
+SOURCE: Matched corrected BonVision transitions and HARP photodiode edges across each recording
+
+METHOD: Median residual in final versus first quarter of each session; display distribution and dependence on event count.
+
+INTERPRETATION: Quantifies change in behavioral-event timing accuracy through the experiment.
+
+LIMITATION: Does not measure SLAP2 source-sample clock drift; discrete phase ambiguities can still exist.

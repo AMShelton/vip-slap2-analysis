@@ -1,0 +1,4 @@
+SOURCE: BonVision event log corrected_timestamps + method/phase; HARP photodiode.pkl analog transitions.
+METHOD: Monotonic nearest matched corrected predicted transitions compared to analog photodiode threshold crossings. Encoded uses rising edges; legacy uses frame-modulo edges.
+INTERPRETATION: Overlay and residual distribution quantify fit consistency; dashed lines show assumed 60-Hz frame period.
+LIMITATION: Fit-consistency is not an independent holdout; legacy periodic patterns may have cycle ambiguity; 60 Hz is a reference, not per-session verified refresh.

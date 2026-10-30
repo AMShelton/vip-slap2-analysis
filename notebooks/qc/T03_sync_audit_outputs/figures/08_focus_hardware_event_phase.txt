@@ -1,0 +1,7 @@
+Single-session HARP photodiode to DI3 pulse phase
+
+SOURCE: Raw HARP AnalogInput0 transition timestamps vs raw HARP DI3 digital pulse timestamps, using native HARP index values
+
+MEANING: Visualizes temporal phase of display transitions relative to acquired cycle edges.
+
+LIMITATION: Periodic sawtooth/wraps expected for asynchronous stimulus and acquisition clocks. Not an absolute imaging sample lag.

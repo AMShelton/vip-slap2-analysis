@@ -1,0 +1,9 @@
+Actual stimulus event versus SLAP2 acquisition pulses in HARP time
+
+SOURCE: 863774_2026-08-04_08-12-47: native HARP_df.csv/DI3 and photodiode.pkl index
+
+METHOD: Vertical tick marks locate unaltered HARP digital rising edges and analog photodiode rises over a 350-ms window.
+
+INTERPRETATION: Directly visualizes the acquisition-clock and stimulus-event relationship in HARP time.
+
+LIMITATION: Cannot show individual DMD source-sample times without a verified line-index-to-DI3 mapping.

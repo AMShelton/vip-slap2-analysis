@@ -1,0 +1,4 @@
+SOURCE: Per-session HARP DI3 rising edges and source linesPerCycle/lineRateHz; accepted acquisition epochs.
+METHOD: Absolute end-of-epoch DI3 minus nominal source-cycle displacement after first-pulse anchoring; interval departures beyond 0.5×–1.5× nominal.
+INTERPRETATION: Characterizes source-cadence plausibility, rate mismatch and unexpected pulse intervals without counting expected recording-window overhang as dropouts.
+LIMITATION: End-point displacement is affected by nominal acquisition-rate accuracy and epoch length; not a measured electrical synchronization offset.

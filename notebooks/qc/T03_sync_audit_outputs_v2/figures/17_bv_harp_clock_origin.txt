@@ -1,0 +1,9 @@
+BonVision-to-HARP model coordinate offsets, shown separately from timing errors
+
+SOURCE: analysis/qc/behavior/alignment_meta.json/intercept and slope in repository BV-to-HARP mapping
+
+METHOD: Plot saved affine clock-origin intercepts and slopes, preserving modern versus legacy pathway labels.
+
+INTERPRETATION: Documents offset and clock scale variation without confusing intercept with physiological latency.
+
+LIMITATION: Clock-origin parameters are coordinate conventions; piecewise models have additional warp parameters; absent reused metadata are missing.

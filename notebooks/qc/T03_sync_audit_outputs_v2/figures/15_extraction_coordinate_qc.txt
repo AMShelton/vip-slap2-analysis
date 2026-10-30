@@ -1,0 +1,9 @@
+Supporting QC: source extraction line-coordinate and endpoint behavior
+
+SOURCE: Voltage dendriticVoltageTraces HDF5 /traces/trial attrs and raw endpoint samples; GIAnT ExperimentSummary HDF5 Path*/frame_info/frame_line_idxs
+
+METHOD: Separate distributions of equal repeated voltage endpoints and nonincreasing GIAnT physical line-index steps.
+
+INTERPRETATION: Documents prevalence of source-processing timing conventions across sessions and modalities.
+
+LIMITATION: Neither finding alone determines absolute HARP↔SLAP2 timing error. Turn on SCAN_EXTRACTION to populate.

@@ -1,0 +1,7 @@
+Single-session behavior photodiode alignment over time
+
+SOURCE: Modern: paired BonVision encoded rises and HARP analog PD rises with 1-in-5 anchor holdout; legacy: reported modulo-frame affine fit to HARP analog PD edges
+
+MEANING: Shows residual variability, outliers and temporal structure in the behavior-clock mapping.
+
+LIMITATION: Residuals do not include SLAP2 source-line registration. Legacy method is not an independent held-out test.
