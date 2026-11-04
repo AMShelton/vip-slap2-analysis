@@ -7,7 +7,7 @@ but assigned analysis epoch ``0`` and excluded from downstream physiology.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -34,6 +34,9 @@ class EpochAwareTimebase:
     sample_epoch: np.ndarray
     epoch_df: pd.DataFrame
     metadata: Dict[str, Any]
+    # 0 = nominal/measured at an observed pulse, 1/2 = extrapolated head/tail,
+    # 3 = interpolated across dropped pulses (see cycle_registration).
+    sample_time_label: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.int8))
 
 
 @dataclass
@@ -56,6 +59,12 @@ class EpochReconciliation:
     analysis_trial_epoch: np.ndarray
     trial_keep_mask: np.ndarray
     metadata: Dict[str, Any]
+    # Number of leading source samples of each trial that are *skipped* before the
+    # retained block starts (zero unless a registered cycle offset says the first
+    # cycles of a source epoch have no HARP coverage). Retained samples of trial
+    # ``i`` are ``arr[start:start + trial_lengths_samples[i]]`` with
+    # ``start = trial_source_start_samples[i]``.
+    trial_source_start_samples: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=int))
 
 
 def normalize_epoch_dataframe(epoch_df: pd.DataFrame) -> pd.DataFrame:
@@ -291,6 +300,7 @@ def reconcile_trial_epochs(
     min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
     strict_epoch_match: bool = True,
     duration_warning_sec: float = 0.5,
+    source_epoch_leading_samples: Optional[Mapping[int, int]] = None,
 ) -> EpochReconciliation:
     """Apply the shared >=30 s QC rule and map source epochs to behavior epochs.
 
@@ -306,6 +316,14 @@ def reconcile_trial_epochs(
     behavior endpoint. When ``source_epoch_durations_sec`` is supplied, those
     acquisition-level durations determine source-epoch acceptance; retained sample
     budgets still come from trial arrays so raw samples remain the source of truth.
+
+    ``source_epoch_leading_samples`` maps a *source* epoch id to the number of
+    leading source samples that precede the first HARP-recorded cycle (from a
+    DI3 cycle registration, ``cycle_index_offset * samples_per_cycle``). Those
+    samples are skipped: they are removed from the head of the first trial(s) of
+    that epoch and recorded in ``trial_source_start_samples``. Without this
+    argument the historical behavior (first source sample placed at the first
+    observed DI3 pulse) is unchanged.
     """
     lengths = np.asarray(trial_lengths_samples, dtype=int).reshape(-1)
     if np.any(lengths < 0):
@@ -313,6 +331,14 @@ def reconcile_trial_epochs(
     fs = float(sample_rate_hz)
     if not np.isfinite(fs) or fs <= 0:
         raise ValueError("sample_rate_hz must be positive and finite")
+    leading: Dict[int, int] = {}
+    if source_epoch_leading_samples:
+        for key, value in source_epoch_leading_samples.items():
+            n_lead = int(value)
+            if n_lead < 0:
+                raise ValueError("source_epoch_leading_samples values must be non-negative")
+            if n_lead:
+                leading[int(key)] = n_lead
 
     behavior_qc = classify_epochs_by_duration(
         behavior_epoch_df, min_duration_sec=min_epoch_duration_sec
@@ -389,6 +415,7 @@ def reconcile_trial_epochs(
         dtype=int,
     )
     retained_lengths = np.zeros_like(lengths)
+    source_start_samples = np.zeros_like(lengths)
 
     source_rows: List[Dict[str, Any]] = []
     behavior_by_analysis = {
@@ -412,14 +439,34 @@ def reconcile_trial_epochs(
             behavior_source_id = int(getattr(brow, "behavior_epoch_index", analysis_id))
             keep_budget = _max_samples_inside_epoch(behavior_duration, fs)
 
+        # Leading source samples without HARP coverage (registered cycle offset)
+        # are skipped from the head of this source epoch before the budget applies.
+        lead_remaining = int(leading.get(int(source_id), 0))
+        skipped_leading = 0
         remaining = int(keep_budget)
         for trial_idx in idx:
             if analysis_id <= 0 or remaining <= 0:
                 retained_lengths[trial_idx] = 0
                 continue
-            keep = min(int(lengths[trial_idx]), remaining)
+            start = 0
+            if lead_remaining > 0:
+                start = min(int(lengths[trial_idx]), lead_remaining)
+                lead_remaining -= start
+                skipped_leading += start
+            available = int(lengths[trial_idx]) - start
+            keep = min(available, remaining)
+            if keep <= 0:
+                retained_lengths[trial_idx] = 0
+                source_start_samples[trial_idx] = 0
+                continue
             retained_lengths[trial_idx] = keep
+            source_start_samples[trial_idx] = start
             remaining -= keep
+        if lead_remaining > 0 and analysis_id > 0:
+            warnings.append(
+                f"Source epoch {source_id}: registered leading offset exceeds available samples "
+                f"by {lead_remaining}; epoch retained nothing."
+            )
 
         kept_samples = int(np.sum(retained_lengths[idx]))
         discarded_samples = int(original_samples - kept_samples)
@@ -448,6 +495,7 @@ def reconcile_trial_epochs(
         source_rows.append(
             {
                 "source_epoch_index": int(source_id),
+                "leading_samples_skipped": int(skipped_leading),
                 "source_duration_s": source_duration,
                 "source_duration_basis": (
                     "acquisition_metadata"
@@ -513,6 +561,7 @@ def reconcile_trial_epochs(
         "original_samples": int(np.sum(lengths)),
         "retained_samples": int(np.sum(retained_lengths)),
         "discarded_samples": int(np.sum(lengths) - np.sum(retained_lengths)),
+        "leading_samples_skipped_by_source_epoch": {str(k): int(v) for k, v in leading.items()},
         "warnings": warnings,
         "strict_epoch_match": bool(strict_epoch_match),
     }
@@ -526,6 +575,7 @@ def reconcile_trial_epochs(
         analysis_trial_epoch=analysis_labels.astype(int),
         trial_keep_mask=trial_keep_mask,
         metadata=metadata,
+        trial_source_start_samples=source_start_samples.astype(int),
     )
 
 
@@ -549,6 +599,10 @@ def build_epoch_aware_timebase(
     scale_each_epoch: ScaleMode = "never",
     scale_tolerance_sec: float = 0.050,
     strict_epoch_match: bool = True,
+    epoch_sample_times_sec: Optional[Mapping[int, np.ndarray]] = None,
+    epoch_sample_time_labels: Optional[Mapping[int, np.ndarray]] = None,
+    epoch_sample_times_method: str = "di3_pulse_registered",
+    sample_time_tolerance_sec: float = 0.002,
 ) -> EpochAwareTimebase:
     """Build a per-sample HARP timebase while preserving acquisition gaps.
 
@@ -556,6 +610,17 @@ def build_epoch_aware_timebase(
     spacing is preserved, and :func:`reconcile_trial_epochs` clips excess samples
     to the common interval. ``'auto'`` and ``'always'`` remain available only for
     backward compatibility with older analyses.
+
+    ``epoch_sample_times_sec`` optionally supplies *measured* HARP times for the
+    retained samples of an analysis epoch (one array per epoch id, length equal to
+    the retained sample count), typically derived from DI3 pulse times through
+    :func:`vip_slap2_analysis.common.cycle_registration.source_lines_to_harp_time`.
+    When present for an epoch they replace the nominal-rate ramp; their first
+    sample must lie within ``sample_time_tolerance_sec`` of the behavior epoch
+    start (the first DI3 rise) or a ``ValueError`` is raised, so a registration
+    built on a different HARP origin can never be applied silently.
+    ``epoch_sample_time_labels`` carries the matching per-sample coverage labels
+    (0 measured, 1 extrapolated head, 2 extrapolated tail, 3 interpolated gap).
     """
     lengths = np.asarray(trial_lengths_samples, dtype=int).reshape(-1)
     if np.any(lengths < 0):
@@ -608,6 +673,11 @@ def build_epoch_aware_timebase(
     nominal_durations: Dict[str, float] = {}
     duration_errors: Dict[str, float] = {}
     scaled_by_epoch: Dict[str, bool] = {}
+    timebase_method_by_epoch: Dict[str, str] = {}
+    measured_times = {int(k): np.asarray(v, dtype=float).reshape(-1) for k, v in (epoch_sample_times_sec or {}).items()}
+    measured_labels = {int(k): np.asarray(v).reshape(-1) for k, v in (epoch_sample_time_labels or {}).items()}
+    sample_time_label = np.zeros((total_samples,), dtype=np.int8)
+    measured_start_offset_by_epoch: Dict[str, float] = {}
 
     trial_offsets = np.concatenate([[0], np.cumsum(lengths)])
     for epoch_id, start, stop in slices:
@@ -615,12 +685,38 @@ def build_epoch_aware_timebase(
         n_epoch = int(stop - start)
         nominal_duration = float(n_epoch / float(sample_rate_hz))
         duration_error = float(nominal_duration - float(row.duration_s))
-        do_scale = mode == "always" or (mode == "auto" and abs(duration_error) > float(scale_tolerance_sec))
-        dt = float(row.duration_s) / float(n_epoch) if do_scale else 1.0 / float(sample_rate_hz)
-        timebase[start:stop] = float(row.start_time) + np.arange(n_epoch, dtype=float) * dt
+        if int(epoch_id) in measured_times:
+            t_meas = measured_times[int(epoch_id)]
+            if t_meas.size != n_epoch:
+                raise ValueError(
+                    f"epoch_sample_times_sec for epoch {epoch_id} has {t_meas.size} samples; "
+                    f"{n_epoch} retained samples expected"
+                )
+            if not np.all(np.isfinite(t_meas)) or (t_meas.size > 1 and np.any(np.diff(t_meas) <= 0)):
+                raise ValueError(f"epoch_sample_times_sec for epoch {epoch_id} must be finite and strictly increasing")
+            start_offset = float(t_meas[0] - float(row.start_time))
+            if abs(start_offset) > float(sample_time_tolerance_sec):
+                raise ValueError(
+                    f"Measured sample times for epoch {epoch_id} start {start_offset * 1e3:.3f} ms from the "
+                    f"behavior epoch start; registration and behavior QC do not share a HARP origin"
+                )
+            timebase[start:stop] = t_meas
+            measured_start_offset_by_epoch[str(epoch_id)] = start_offset
+            if int(epoch_id) in measured_labels and measured_labels[int(epoch_id)].size == n_epoch:
+                sample_time_label[start:stop] = measured_labels[int(epoch_id)].astype(np.int8)
+            dt = float((t_meas[-1] - t_meas[0]) / max(n_epoch - 1, 1)) if n_epoch > 1 else 1.0 / float(sample_rate_hz)
+            do_scale = False
+            timebase_method_by_epoch[str(epoch_id)] = str(epoch_sample_times_method)
+        else:
+            do_scale = mode == "always" or (mode == "auto" and abs(duration_error) > float(scale_tolerance_sec))
+            dt = float(row.duration_s) / float(n_epoch) if do_scale else 1.0 / float(sample_rate_hz)
+            timebase[start:stop] = float(row.start_time) + np.arange(n_epoch, dtype=float) * dt
+            timebase_method_by_epoch[str(epoch_id)] = (
+                "behavior_epoch_scaled" if do_scale else "nominal_rate_anchored_first_pulse"
+            )
         sample_epoch[start:stop] = int(epoch_id)
         samples_per_epoch[str(epoch_id)] = n_epoch
-        effective_rates[str(epoch_id)] = float(1.0 / dt)
+        effective_rates[str(epoch_id)] = float(1.0 / dt) if dt > 0 else float("nan")
         nominal_durations[str(epoch_id)] = nominal_duration
         duration_errors[str(epoch_id)] = duration_error
         scaled_by_epoch[str(epoch_id)] = bool(do_scale)
@@ -650,6 +746,10 @@ def build_epoch_aware_timebase(
         "nominal_acquired_duration_sec_by_epoch": nominal_durations,
         "duration_error_sec_by_epoch": duration_errors,
         "scaled_by_epoch": scaled_by_epoch,
+        "timebase_method_by_epoch": timebase_method_by_epoch,
+        "measured_sample_times_used": bool(measured_times),
+        "measured_start_offset_sec_by_epoch": measured_start_offset_by_epoch,
+        "n_samples_extrapolated_or_interpolated": int(np.sum(sample_time_label > 0)),
         "epoch_start_time": epochs["start_time"].astype(float).tolist(),
         "epoch_end_time": epochs["end_time"].astype(float).tolist(),
         "epoch_gap_before_sec": epochs["gap_before_s"].astype(float).tolist(),
@@ -667,4 +767,5 @@ def build_epoch_aware_timebase(
         sample_epoch=sample_epoch,
         epoch_df=epochs,
         metadata=metadata,
+        sample_time_label=sample_time_label,
     )

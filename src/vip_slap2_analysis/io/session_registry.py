@@ -43,6 +43,26 @@ PREFERRED_VOLTAGE_PARTS = (
     ("dendriticVoltageExtraction",),
 )
 
+# Modern (HDF5) products. GIAnT writes ``source_extraction/<method>/experiment_summary.h5``
+# with ``<method>`` in {summarize_LoCo, SILo}; the voltage extractor writes
+# ``<processed>/Voltage/VoltageSummary.h5`` (pilot sessions used ``voltage_summary.h5``).
+# ``summarize_LoCo`` is listed first because it is the like-for-like successor of the
+# legacy ``SummaryLoCo-*.mat`` product; SILo output is still kept as a candidate.
+PREFERRED_GIANT_PARTS = (
+    ("source_extraction", "summarize_LoCo"),
+    ("source_extraction", "SILo"),
+    ("source_extraction",),
+)
+PREFERRED_VOLTEX_PARTS = (
+    ("source_extraction", "Voltage"),
+    ("Voltage",),
+)
+
+# Which summary family extraction should load when both exist.
+#   "modern" : validated HDF5 product first, legacy MAT as fallback (default)
+#   "legacy" : legacy MAT first (modern still discovered and recorded)
+SUMMARY_PREFERENCE_DEFAULT = "modern"
+
 
 def _coerce_path(x) -> Optional[Path]:
     """Convert a spreadsheet path-like value to ``Path`` or ``None``.
@@ -162,43 +182,141 @@ def _find_voltage_trace_h5(session_dir: Path, summary_mat: Optional[Path]) -> Op
     )
 
 
+def _find_trial_table_for(summary_h5: Optional[Path]) -> Optional[Path]:
+    """Locate ``trial_table.h5`` next to or one level above a modern summary file."""
+    if summary_h5 is None:
+        return None
+    # GIAnT: <processed>/trial_table.h5 with the summary at
+    # <processed>/source_extraction/<method>/experiment_summary.h5 (or one level less);
+    # Voltex: <processed>/trial_table.h5 with <processed>/Voltage/VoltageSummary.h5.
+    base = summary_h5.parent
+    for _ in range(3):
+        cand = base / "trial_table.h5"
+        if cand.exists():
+            return cand
+        base = base.parent
+    return None
+
+
+def _find_dynamic_data_dir(session_dir: Path) -> Optional[Path]:
+    """Locate the raw SLAP2 ``dynamic_data`` directory (holds ``.dat``/``.meta`` files).
+
+    Only directories that actually contain a ``.meta`` or ``.dat`` file are
+    accepted; the newest match wins when several exist (nested layouts can
+    duplicate the session folder).
+    """
+    hits = []
+    for p in _find_matches(session_dir, "dynamic_data"):
+        if p.is_dir() and (any(p.glob("*.meta")) or any(p.glob("*.dat"))):
+            hits.append(p)
+    if not hits:
+        return None
+    return max(hits, key=lambda p: (len(list(p.glob("*.meta"))), os.path.getmtime(p)))
+
+
+def _select_summary(
+    *,
+    modern: Optional[Path],
+    legacy: Optional[Path],
+    modern_format: str,
+    legacy_format: str,
+    prefer: str,
+) -> dict[str, Optional[object]]:
+    """Apply the modern -> legacy precedence and record the decision.
+
+    Existence is all that is known at registry time; schema validation happens in
+    the reader (``validate_*_schema``) and extraction falls back to the legacy
+    product -- with the reason recorded in QC -- when the modern file is
+    incompatible. Nothing is silently merged across formats.
+    """
+    prefer = str(prefer or SUMMARY_PREFERENCE_DEFAULT).lower()
+    if prefer not in ("modern", "legacy"):
+        raise ValueError("summary preference must be 'modern' or 'legacy'")
+    order = [(modern, modern_format), (legacy, legacy_format)]
+    if prefer == "legacy":
+        order.reverse()
+    selected, fmt = next(((p, f) for p, f in order if p is not None), (None, None))
+    return {
+        "summary_path": selected,
+        "summary_format": fmt,
+        "summary_preference": prefer,
+        "summary_candidates": {
+            modern_format: str(modern) if modern is not None else None,
+            legacy_format: str(legacy) if legacy is not None else None,
+        },
+    }
+
+
 def _build_modality_assets(
     *,
     summary_mat: Optional[Path],
     voltage_summary_mat: Optional[Path],
     voltage_trace_h5: Optional[Path],
-) -> dict[str, dict[str, Optional[Path]]]:
-    """Build generic modality asset mappings for a session."""
-    modality_assets: dict[str, dict[str, Optional[Path]]] = {}
+    giant_summary_h5: Optional[Path] = None,
+    giant_trial_table_h5: Optional[Path] = None,
+    voltex_summary_h5: Optional[Path] = None,
+    voltex_trial_table_h5: Optional[Path] = None,
+    dynamic_data_dir: Optional[Path] = None,
+    summary_preference: str = SUMMARY_PREFERENCE_DEFAULT,
+) -> dict[str, dict[str, Optional[object]]]:
+    """Build generic modality asset mappings for a session.
 
-    if summary_mat is not None:
+    Legacy keys (``summary_mat``, ``trace_h5``, ``extraction_dir``) are unchanged.
+    New keys: ``summary_h5`` (modern product), ``trial_table_h5``,
+    ``summary_path``/``summary_format`` (the product extraction should load under
+    the current precedence), ``summary_candidates`` and ``summary_preference``.
+    ``slap2`` additionally exposes ``dynamic_data_dir`` for raw-header access.
+    """
+    modality_assets: dict[str, dict[str, Optional[object]]] = {}
+
+    if summary_mat is not None or giant_summary_h5 is not None:
         # Existing glutamate and soma-calcium code both use SummaryLoCo-derived
         # ExperimentSummary files. Store both keys explicitly so modality-aware
         # downstream code can be generic without changing legacy asset.summary_mat.
-        modality_assets["glutamate"] = {
-            "summary_mat": summary_mat,
-            "extraction_dir": summary_mat.parent,
-        }
-        modality_assets["calcium"] = {
-            "summary_mat": summary_mat,
-            "extraction_dir": summary_mat.parent,
-        }
-        modality_assets["slap2"] = {
-            "summary_mat": summary_mat,
-            "extraction_dir": summary_mat.parent,
-        }
+        selection = _select_summary(
+            modern=giant_summary_h5, legacy=summary_mat,
+            modern_format="giant_experiment_summary_h5", legacy_format="legacy_summary_loco_mat",
+            prefer=summary_preference,
+        )
+        extraction_dir = (
+            summary_mat.parent if summary_mat is not None else giant_summary_h5.parent  # type: ignore[union-attr]
+        )
+        for key in ("glutamate", "calcium", "slap2"):
+            modality_assets[key] = {
+                "summary_mat": summary_mat,
+                "summary_h5": giant_summary_h5,
+                "trial_table_h5": giant_trial_table_h5,
+                "extraction_dir": extraction_dir,
+                **selection,
+            }
 
-    if voltage_summary_mat is not None or voltage_trace_h5 is not None:
+    if voltage_summary_mat is not None or voltage_trace_h5 is not None or voltex_summary_h5 is not None:
         extraction_dir = None
         if voltage_summary_mat is not None:
             extraction_dir = voltage_summary_mat.parent
         elif voltage_trace_h5 is not None:
             extraction_dir = voltage_trace_h5.parent
+        elif voltex_summary_h5 is not None:
+            extraction_dir = voltex_summary_h5.parent
+        legacy_voltage = voltage_summary_mat if (voltage_summary_mat is not None and voltage_trace_h5 is not None) else None
+        selection = _select_summary(
+            modern=voltex_summary_h5, legacy=legacy_voltage,
+            modern_format="voltex_voltage_summary_h5", legacy_format="legacy_dendritic_voltage_mat_h5",
+            prefer=summary_preference,
+        )
         modality_assets["voltage"] = {
             "summary_mat": voltage_summary_mat,
             "trace_h5": voltage_trace_h5,
+            "summary_h5": voltex_summary_h5,
+            "trial_table_h5": voltex_trial_table_h5,
             "extraction_dir": extraction_dir,
+            **selection,
         }
+
+    if dynamic_data_dir is not None:
+        modality_assets.setdefault("slap2", {})
+        modality_assets["slap2"]["dynamic_data_dir"] = dynamic_data_dir
+        modality_assets["slap2"]["meta_files"] = sorted(dynamic_data_dir.glob("*.meta"))
 
     return modality_assets
 
@@ -367,13 +485,23 @@ class VIPSessionRegistry:
             raise ValueError(f"Multiple rows found for session_id={session_id}")
         return df.iloc[0]
 
-    def resolve_assets(self, session: pd.Series | str) -> SessionAssets:
+    def resolve_assets(
+        self,
+        session: pd.Series | str,
+        *,
+        summary_preference: str = SUMMARY_PREFERENCE_DEFAULT,
+    ) -> SessionAssets:
         """Resolve filesystem assets for a session row or session ID.
 
         Parameters
         ----------
         session:
             Either a session ID or a row from ``sessions_df``.
+        summary_preference:
+            ``"modern"`` (default) selects GIAnT ``experiment_summary.h5`` /
+            Voltex ``VoltageSummary.h5`` as the product extraction should load,
+            with the legacy MAT products as fallback; ``"legacy"`` reverses the
+            order. Both families are always discovered and recorded.
 
         Returns
         -------
@@ -395,6 +523,16 @@ class VIPSessionRegistry:
             preferred_parts=PREFERRED_VOLTAGE_PARTS,
         )
         voltage_trace_h5 = _find_voltage_trace_h5(session_dir, voltage_summary_mat)
+
+        giant_summary_h5 = _find_one(
+            session_dir,
+            "experiment_summary.h5",
+            preferred_parts=PREFERRED_GIANT_PARTS,
+        )
+        voltex_summary_h5 = _find_one(session_dir, "VoltageSummary.h5", preferred_parts=PREFERRED_VOLTEX_PARTS)
+        if voltex_summary_h5 is None:
+            voltex_summary_h5 = _find_one(session_dir, "voltage_summary.h5", preferred_parts=PREFERRED_VOLTEX_PARTS)
+        dynamic_data_dir = _find_dynamic_data_dir(session_dir)
 
         bonsai_csv = _find_one(session_dir, "bonsai_event_log*.csv")
         harp_dir = _find_one(session_dir, "*Behavior.harp")
@@ -424,6 +562,12 @@ class VIPSessionRegistry:
                 summary_mat=summary_mat,
                 voltage_summary_mat=voltage_summary_mat,
                 voltage_trace_h5=voltage_trace_h5,
+                giant_summary_h5=giant_summary_h5,
+                giant_trial_table_h5=_find_trial_table_for(giant_summary_h5),
+                voltex_summary_h5=voltex_summary_h5,
+                voltex_trial_table_h5=_find_trial_table_for(voltex_summary_h5),
+                dynamic_data_dir=dynamic_data_dir,
+                summary_preference=summary_preference,
             ),
             metadata=row.to_dict(),
         )

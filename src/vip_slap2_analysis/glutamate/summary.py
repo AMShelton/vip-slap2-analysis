@@ -407,6 +407,7 @@ class GlutamateSummary:
 
         self.n_trials: int = 0
         self.n_dmds: int = 0
+        self.summary_format: str = "legacy_summary_loco_mat"
         self.keep_trials: np.ndarray
         self.valid_trials: List[List[int]] = []
         self.trials_to_analyze: List[int] = []
@@ -2456,6 +2457,30 @@ class GlutamateSummary:
 
         return centroids
     # ----------------- convenience -----------------
+
+    def get_trial_source_lines(self, dmd: int, trial: int) -> Optional[np.ndarray]:
+        """Return the 1-based SLAP2 source line index of every frame of one trial.
+
+        ``E.frameLines`` is written by ``processAllTrials_Async`` as
+        ``ceil(firstLine:dt:lastLine)`` in *global acquisition line numbers* of the
+        trial's source epoch. It is the only per-sample link between extracted
+        frames and raw acquisition cycles (``cycle = (line - 1) // linesPerCycle``),
+        which cycle registration needs. Returns ``None`` when the file predates
+        ``frameLines``.
+        """
+        dmd0, trial0 = int(dmd) - 1, int(trial) - 1
+        if not self.keep_trials[dmd0, trial0]:
+            raise ValueError(f"Trial {trial} is invalid in DMD {dmd}")
+        g = self._E_group(dmd0, trial0)
+        if "frameLines" not in g:
+            return None
+        try:
+            lines = np.asarray(g["frameLines"][()], dtype=float).reshape(-1)
+        except Exception:
+            return None
+        if lines.size == 0 or not np.all(np.isfinite(lines)):
+            return None
+        return np.rint(lines).astype(np.int64)
 
     def timebase(self, dmd: int, trial: int, hz_key: str = "analyzeHz") -> np.ndarray:
         """Return a per-sample timebase for one DMD/trial.

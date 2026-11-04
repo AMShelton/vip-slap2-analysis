@@ -414,6 +414,7 @@ def reconstruct_voltage_dmd_session_traces(
     max_timebase_error_sec: float = 0.5,
     strict_epoch_match: bool = True,
     min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
+    cycle_registration: Optional[Any] = None,
 ) -> ReconstructedTraceBundle:
     """Reconstruct one DMD's voltage traces under the shared epoch-QC policy.
 
@@ -422,6 +423,14 @@ def reconstruct_voltage_dmd_session_traces(
     epochs are mapped chronologically to accepted behavior epochs. Short source
     fragments are discarded and overlong source epochs are clipped at the paired
     behavior endpoint while preserving the nominal voltage sampling interval.
+
+    ``cycle_registration`` (see
+    :mod:`vip_slap2_analysis.common.cycle_registration`) optionally supplies the
+    DI3 <-> source-cycle registration of this DMD. When identified, samples whose
+    source cycle precedes the first HARP-recorded pulse are skipped and retained
+    samples receive measured HARP times from the pulse train (through
+    ``vs.get_trial_source_lines``). Otherwise the historical first-pulse anchoring
+    is used and the reason is recorded in ``metadata['cycle_registration']``.
     """
     sample_rate_hz = float(sample_rate_hz)
     if not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
@@ -434,9 +443,11 @@ def reconstruct_voltage_dmd_session_traces(
     valid_trials = set(_valid_trials_for_dmd(vs, dmd))
     valid_lengths_by_trial: Dict[int, int] = {}
     valid_lengths: List[int] = []
+    trial_source_lines: Dict[int, np.ndarray] = {}
 
     for trial in sorted(valid_trials):
         n_raw = _trace_time_len_for_trial(vs, dmd=dmd, trial=trial, trace_mode=trace_mode)
+        discard = None
         if drop_discarded:
             discard = _discard_mask_for_trace(vs, dmd=dmd, trial=trial, n_samples=n_raw)
             n_kept = int(np.sum(~discard))
@@ -444,6 +455,17 @@ def reconstruct_voltage_dmd_session_traces(
             n_kept = int(n_raw)
         valid_lengths_by_trial[int(trial)] = n_kept
         valid_lengths.append(n_kept)
+        if cycle_registration is not None and hasattr(vs, "get_trial_source_lines"):
+            try:
+                lines = vs.get_trial_source_lines(dmd, trial)
+            except Exception:
+                lines = None
+            if lines is not None:
+                lines = np.asarray(lines, dtype=np.int64).reshape(-1)
+                if lines.size == int(n_raw):
+                    if discard is not None:
+                        lines = lines[~discard[: lines.size]]
+                    trial_source_lines[int(trial)] = lines
 
     if not valid_lengths:
         return ReconstructedTraceBundle(
@@ -484,6 +506,19 @@ def reconstruct_voltage_dmd_session_traces(
             if hasattr(vs, "get_dmd_epoch_durations_sec")
             else {}
         )
+        registration_plan = None
+        registration_info: Dict[str, Any] = {"applied": False}
+        if cycle_registration is not None:
+            from vip_slap2_analysis.common.alignment import _plan_from_registration
+
+            registration_plan, registration_info = _plan_from_registration(
+                cycle_registration,
+                trial_source_lines=trial_source_lines,
+                source_trial_epoch=(
+                    np.asarray(trial_epoch, dtype=int) if trial_epoch is not None else np.ones((n_trials,), dtype=int)
+                ),
+                n_valid_trials=len(valid_lengths_by_trial),
+            )
         reconciliation = reconcile_trial_epochs(
             source_trial_lengths,
             sample_rate_hz=sample_rate_hz,
@@ -493,11 +528,31 @@ def reconstruct_voltage_dmd_session_traces(
             min_epoch_duration_sec=min_epoch_duration_sec,
             strict_epoch_match=strict_epoch_match,
             duration_warning_sec=max_timebase_error_sec,
+            source_epoch_leading_samples=(
+                registration_plan.source_epoch_leading_samples if registration_plan is not None else None
+            ),
         )
         trial_lengths = reconciliation.trial_lengths_samples
+        trial_starts_src = reconciliation.trial_source_start_samples
         analysis_trial_epoch = reconciliation.analysis_trial_epoch
         source_trial_epoch_arr = reconciliation.source_trial_epoch
         behavior_epochs = reconciliation.behavior_epoch_df
+        measured_times = None
+        measured_labels = None
+        if registration_plan is not None:
+            from vip_slap2_analysis.common.cycle_registration import registered_epoch_sample_times
+
+            measured_times, measured_labels, timing_info = registered_epoch_sample_times(
+                cycle_registration,
+                registration_plan,
+                trial_source_lines=trial_source_lines,
+                source_trial_epoch=source_trial_epoch_arr,
+                analysis_trial_epoch=analysis_trial_epoch,
+                trial_lengths_samples=trial_lengths,
+                trial_source_start_samples=trial_starts_src,
+            )
+            registration_info.update(timing_info)
+            registration_info["applied"] = bool(measured_times)
         epoch_tb = build_epoch_aware_timebase(
             trial_lengths,
             sample_rate_hz=sample_rate_hz,
@@ -505,23 +560,31 @@ def reconstruct_voltage_dmd_session_traces(
             trial_epoch=analysis_trial_epoch,
             scale_each_epoch="never",
             strict_epoch_match=strict_epoch_match,
+            epoch_sample_times_sec=measured_times or None,
+            epoch_sample_time_labels=measured_labels or None,
         )
         timebase_sec = epoch_tb.timebase_sec
         trial_starts_sec = epoch_tb.trial_starts_sec
         sample_epoch = epoch_tb.sample_epoch
+        sample_time_label = epoch_tb.sample_time_label
         alignment_rate_hz = sample_rate_hz
         timebase_meta = dict(epoch_tb.metadata)
         timebase_meta.update(
             {
                 "timebase_strategy_requested": str(timebase_strategy),
-                "timebase_strategy_used": "nominal_rate_epoch_qc_clipped",
+                "timebase_strategy_used": (
+                    "di3_pulse_registered" if registration_info.get("applied") else "nominal_rate_epoch_qc_clipped"
+                ),
                 "epoch_qc": reconciliation.metadata,
                 "source_epoch_qc": reconciliation.source_epoch_qc.to_dict(orient="records"),
                 "source_trial_epoch": source_trial_epoch_arr.astype(int).tolist(),
                 "analysis_trial_epoch": analysis_trial_epoch.astype(int).tolist(),
+                "trial_source_start_samples": trial_starts_src.astype(int).tolist(),
+                "cycle_registration": registration_info,
             }
         )
     else:
+        trial_starts_src = np.zeros((n_trials,), dtype=int)
         trial_lengths = source_trial_lengths
         source_trial_epoch_arr = (
             np.asarray(trial_epoch, dtype=int).reshape(-1)
@@ -544,6 +607,7 @@ def reconstruct_voltage_dmd_session_traces(
             if length > 0 and offset < timebase_sec.size:
                 trial_starts_sec[i] = float(timebase_sec[offset])
         sample_epoch = np.ones((int(np.sum(trial_lengths)),), dtype=int)
+        sample_time_label = np.zeros((int(np.sum(trial_lengths)),), dtype=np.int8)
 
     total_samples = int(np.sum(trial_lengths))
     traces = _allocate_roi_time_array(shape=(n_rois, total_samples), dtype=dtype)
@@ -562,6 +626,9 @@ def reconstruct_voltage_dmd_session_traces(
             else:
                 discard = None
 
+            # Leading (kept, non-discarded) samples to skip for this trial, from the
+            # registered cycle offset. Counted in post-discard sample space.
+            skip_remaining = int(trial_starts_src[trial - 1]) if trial_starts_src.size >= trial else 0
             dst_cursor = 0
             chunk_samples = 262_144
             for src_start in range(0, int(n_raw), chunk_samples):
@@ -583,6 +650,10 @@ def reconstruct_voltage_dmd_session_traces(
                         aligned_keep[:n_copy] = keep[:n_copy]
                         keep = aligned_keep
                     x = x[keep, :]
+                if skip_remaining > 0:
+                    n_skip = min(skip_remaining, int(x.shape[0]))
+                    x = x[n_skip:, :]
+                    skip_remaining -= n_skip
                 if x.size == 0:
                     continue
                 n_time = min(int(x.shape[0]), keep_length - dst_cursor)
@@ -633,6 +704,7 @@ def reconstruct_voltage_dmd_session_traces(
         reconstructed_duration_sec=reconstructed_duration_sec,
         metadata=metadata,
         sample_epoch=sample_epoch,
+        sample_time_label=sample_time_label,
     )
 
 
@@ -641,38 +713,51 @@ def load_voltage_summary_from_asset(
     *,
     keep_open: bool = True,
     swap_xy_images: bool = True,
-) -> VoltageSummary:
-    """Load a :class:`VoltageSummary` from generic session assets.
+    summary_preference: Optional[str] = None,
+    trace_kind: str = "raw_f",
+    apply_motion_censor: bool = False,
+):
+    """Load the voltage summary reader for generic session assets.
 
-    The voltage session asset model stores the split extraction outputs as
-    ``asset.modality_assets["voltage"]`` rather than as voltage-specific
-    dataclass fields.  This helper is the canonical bridge between the generic
-    asset resolver and the voltage reader.
-
-    Parameters
-    ----------
-    asset
-        Session asset bundle returned by ``VIPSessionRegistry.resolve_assets``.
-    keep_open
-        Keep the underlying MAT/H5 file handles open between reader calls.
-    swap_xy_images
-        Passed through to :class:`VoltageSummary` for display-oriented image and
-        mask access.
-
-    Returns
-    -------
-    VoltageSummary
-        Reader initialized with the required voltage summary MAT file and, when
-        available, the paired trace H5 file resolved by the session registry.
+    Delegates to :func:`vip_slap2_analysis.io.summary_loader.load_voltage_summary`,
+    which applies the modern (``VoltageSummary.h5``) -> legacy
+    (``dendriticVoltageSummary*.mat`` + ``dendriticVoltageTraces*.h5``) precedence
+    with schema validation. The returned object is either a
+    :class:`~vip_slap2_analysis.voltage.voltex_summary.VoltexSummary` or a
+    :class:`VoltageSummary`; both expose the same reader API. Use
+    :func:`load_voltage_summary_with_provenance` when the selection record is
+    needed for QC output.
     """
-    summary_mat = asset.require_asset("voltage", "summary_mat")
-    trace_h5 = asset.get_asset("voltage", "trace_h5")
-    return VoltageSummary(
-        summary_mat,
-        trace_path=trace_h5,
-        keep_open=keep_open,
-        swap_xy_images=swap_xy_images,
+    reader, _ = load_voltage_summary_with_provenance(
+        asset, keep_open=keep_open, swap_xy_images=swap_xy_images,
+        summary_preference=summary_preference, trace_kind=trace_kind, apply_motion_censor=apply_motion_censor,
     )
+    return reader
+
+
+def load_voltage_summary_with_provenance(
+    asset: SessionAssets,
+    *,
+    keep_open: bool = True,
+    swap_xy_images: bool = True,
+    summary_preference: Optional[str] = None,
+    trace_kind: str = "raw_f",
+    apply_motion_censor: bool = False,
+):
+    """Return ``(reader, provenance)`` for the voltage summary of ``asset``."""
+    from vip_slap2_analysis.io.summary_loader import load_voltage_summary
+
+    return load_voltage_summary(
+        asset, prefer=summary_preference, keep_open=keep_open, swap_xy_images=swap_xy_images,
+        trace_kind=trace_kind, apply_motion_censor=apply_motion_censor,
+    )
+
+
+# Re-exported for callers that historically imported voltage helpers only.
+from vip_slap2_analysis.common.cycle_registration import (  # noqa: E402
+    require_identified_registration,
+    resolve_cycle_registration,
+)
 
 
 def resolve_voltage_sample_rate_hz(
@@ -828,6 +913,8 @@ def reconstruct_voltage_dmd_session_traces_from_asset(
     max_timebase_error_sec: float = 0.5,
     strict_epoch_match: bool = True,
     min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
+    cycle_registration: Any = "auto",
+    summary_preference: Optional[str] = None,
 ) -> ReconstructedTraceBundle:
     """Load voltage assets and reconstruct one DMD as an alignment bundle.
 
@@ -835,8 +922,11 @@ def reconstruct_voltage_dmd_session_traces_from_asset(
     call after ``VIPSessionRegistry.resolve_assets``.  It keeps all path discovery
     in the common/io asset framework while delegating trace orientation and
     concatenation to :func:`reconstruct_voltage_dmd_session_traces`.
+    ``cycle_registration='auto'`` applies a saved identified DI3 registration when
+    one exists under ``qc/sync``; pass ``None`` to force the historical anchoring.
     """
-    with load_voltage_summary_from_asset(asset, keep_open=True) as vs:
+    reg, _reg_info = resolve_cycle_registration(asset, dmd, cycle_registration)
+    with load_voltage_summary_from_asset(asset, keep_open=True, summary_preference=summary_preference) as vs:
         rate = resolve_voltage_sample_rate_hz(
             asset=asset,
             vs=vs,
@@ -871,4 +961,5 @@ def reconstruct_voltage_dmd_session_traces_from_asset(
             max_timebase_error_sec=max_timebase_error_sec,
             strict_epoch_match=strict_epoch_match,
             min_epoch_duration_sec=min_epoch_duration_sec,
+            cycle_registration=reg,
         )

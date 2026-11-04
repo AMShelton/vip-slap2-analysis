@@ -20,6 +20,10 @@ import pandas as pd
 
 from vip_slap2_analysis.common.session import SessionAssets
 from vip_slap2_analysis.common.clock_qc import compare_slap2_harp_clock
+from vip_slap2_analysis.common.cycle_registration import (
+    require_identified_registration,
+    resolve_cycle_registration,
+)
 from vip_slap2_analysis.common.epoch_alignment import (
     DEFAULT_MIN_EPOCH_DURATION_SEC,
     build_epoch_aware_timebase,
@@ -324,8 +328,13 @@ def _reconstruct_ca_session_traces(
     strict_epoch_match: bool = True,
     epoch_scale_mode: str = "never",
     min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
+    cycle_registration: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Reconstruct session-wide soma calcium traces under shared epoch QC.
+
+    ``cycle_registration`` (optional, identified DI3 registration for this DMD)
+    skips frames before HARP coverage and uses measured pulse-train times, as in
+    :func:`vip_slap2_analysis.common.alignment.reconstruct_dmd_session_traces`.
 
     Behavior epochs shorter than the minimum are excluded before reconstruction.
     When source epoch labels are supplied, short source fragments are also rejected.
@@ -436,6 +445,20 @@ def _reconstruct_ca_session_traces(
     if source_trial_epoch is None and getattr(exp, "trial_epoch", None) is not None:
         source_trial_epoch = np.asarray(exp.trial_epoch, dtype=int)
     source_epoch_durations_sec: Dict[int, float] = {}
+    registration_plan = None
+    registration_info: Dict[str, Any] = {"applied": False}
+    trial_source_lines: Dict[int, np.ndarray] = {}
+    trial_starts_src = np.zeros((n_trials,), dtype=int)
+    if cycle_registration is not None and hasattr(exp, "get_trial_source_lines"):
+        for i, arr in enumerate(trial_list):
+            if arr is None:
+                continue
+            try:
+                lines = exp.get_trial_source_lines(dmd, i + 1)
+            except Exception:
+                lines = None
+            if lines is not None and np.asarray(lines).size == arr.shape[1]:
+                trial_source_lines[i + 1] = np.asarray(lines, dtype=np.int64)
     if epoch_df is not None and len(epoch_df) > 0:
         if source_trial_epoch is None and int(getattr(exp, "n_epochs", 0) or 0) > 1 and strict_epoch_match:
             raise ValueError(
@@ -447,6 +470,17 @@ def _reconstruct_ca_session_traces(
             if hasattr(exp, "get_dmd_epoch_durations_sec")
             else {}
         )
+        if cycle_registration is not None:
+            from vip_slap2_analysis.common.alignment import _plan_from_registration
+
+            registration_plan, registration_info = _plan_from_registration(
+                cycle_registration,
+                trial_source_lines=trial_source_lines,
+                source_trial_epoch=(
+                    np.asarray(source_trial_epoch, dtype=int) if source_trial_epoch is not None else np.ones((n_trials,), dtype=int)
+                ),
+                n_valid_trials=int(sum(1 for a in trial_list if a is not None)),
+            )
         reconciliation = reconcile_trial_epochs(
             source_trial_lengths,
             sample_rate_hz=float(im_rate_hz),
@@ -455,8 +489,12 @@ def _reconstruct_ca_session_traces(
             source_epoch_durations_sec=source_epoch_durations_sec or None,
             min_epoch_duration_sec=min_epoch_duration_sec,
             strict_epoch_match=strict_epoch_match,
+            source_epoch_leading_samples=(
+                registration_plan.source_epoch_leading_samples if registration_plan is not None else None
+            ),
         )
         trial_lengths = reconciliation.trial_lengths_samples
+        trial_starts_src = reconciliation.trial_source_start_samples
         trial_epoch = reconciliation.analysis_trial_epoch
         source_epoch_labels = reconciliation.source_trial_epoch
         behavior_epochs = reconciliation.behavior_epoch_df
@@ -483,10 +521,11 @@ def _reconstruct_ca_session_traces(
         if keep_len <= 0:
             continue
         if arr is not None:
+            src0 = int(trial_starts_src[i]) if trial_starts_src.size > i else 0
             rcopy = min(n_rois, arr.shape[0])
-            tcopy = min(keep_len, arr.shape[1])
-            traces[:rcopy, pos:pos + tcopy] = arr[:rcopy, :tcopy]
-            trial_valid_mask[i] = bool(tcopy > 0 and np.isfinite(arr[:rcopy, :tcopy]).any())
+            tcopy = min(keep_len, max(0, arr.shape[1] - src0))
+            traces[:rcopy, pos:pos + tcopy] = arr[:rcopy, src0:src0 + tcopy]
+            trial_valid_mask[i] = bool(tcopy > 0 and np.isfinite(arr[:rcopy, src0:src0 + tcopy]).any())
         pos += keep_len
 
     nominal_timebase_sec = (
@@ -500,6 +539,22 @@ def _reconstruct_ca_session_traces(
     timebase_mode = "nominal_fixed_rate"
 
     if behavior_epochs is not None and len(behavior_epochs) > 0:
+        measured_times = None
+        measured_labels = None
+        if registration_plan is not None and reconciliation is not None:
+            from vip_slap2_analysis.common.cycle_registration import registered_epoch_sample_times
+
+            measured_times, measured_labels, timing_info = registered_epoch_sample_times(
+                cycle_registration,
+                registration_plan,
+                trial_source_lines=trial_source_lines,
+                source_trial_epoch=source_epoch_labels,
+                analysis_trial_epoch=trial_epoch,
+                trial_lengths_samples=trial_lengths,
+                trial_source_start_samples=trial_starts_src,
+            )
+            registration_info.update(timing_info)
+            registration_info["applied"] = bool(measured_times)
         epoch_tb = build_epoch_aware_timebase(
             trial_lengths,
             sample_rate_hz=float(im_rate_hz),
@@ -507,13 +562,17 @@ def _reconstruct_ca_session_traces(
             trial_epoch=trial_epoch,
             scale_each_epoch="never",
             strict_epoch_match=strict_epoch_match,
+            epoch_sample_times_sec=measured_times or None,
+            epoch_sample_time_labels=measured_labels or None,
         )
         timebase_sec = epoch_tb.timebase_sec
         trial_starts_sec = epoch_tb.trial_starts_sec
         sample_epoch = epoch_tb.sample_epoch
         epoch_metadata = dict(epoch_tb.metadata)
-        timebase_mode = "nominal_rate_epoch_qc_clipped"
+        epoch_metadata["cycle_registration"] = registration_info
+        timebase_mode = "di3_pulse_registered" if registration_info.get("applied") else "nominal_rate_epoch_qc_clipped"
         if reconciliation is not None:
+            epoch_metadata["trial_source_start_samples"] = reconciliation.trial_source_start_samples.astype(int).tolist()
             epoch_metadata["epoch_qc"] = reconciliation.metadata
             epoch_metadata["source_epoch_qc"] = reconciliation.source_epoch_qc.to_dict(orient="records")
             epoch_metadata["source_trial_epoch"] = source_epoch_labels.astype(int).tolist()
@@ -664,8 +723,16 @@ def process_calcium_extraction(
     epoch_scale_mode: str = "never",
     min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
     overwrite: bool = False,
+    cycle_registration: Any = "auto",
+    require_identified_cycle_alignment: bool = False,
 ) -> Dict[str, Any]:
     """Extract event-aligned soma calcium datasets for one session.
+
+    Calcium processing uses the legacy ``SummaryLoCo`` reader (the soma-calcium
+    F0/unmixing code is implemented on ``exptSummary/E``); a GIAnT-only session is
+    reported as unsupported for calcium rather than approximated.
+    ``cycle_registration`` / ``require_identified_cycle_alignment`` behave as in
+    :func:`vip_slap2_analysis.voltage.extraction.process_voltage_extraction`.
 
     This function loads corrected stimulus events and imaging epochs, reconstructs
     continuous DMD-specific calcium traces, optionally applies soma-QC masks, aligns
@@ -753,6 +820,21 @@ def process_calcium_extraction(
     ordered_images_f = filter_ordered_images_to_epochs(ordered_images, epoch_df, pre_time=windows.image[0], post_time=windows.image[1])
 
     exp = GlutamateSummary(asset.summary_mat)
+    summary_provenance = {
+        "modality": "calcium",
+        "selected_format": "legacy_summary_loco_mat",
+        "selected_path": str(asset.summary_mat),
+        "note": "soma-calcium processing requires exptSummary/E (user ROI Fsvd + glutamate regressors); GIAnT experiment_summary.h5 is not used for calcium",
+        "giant_summary_h5_present": asset.get_asset("glutamate", "summary_h5") is not None,
+    }
+    registrations: Dict[int, Any] = {}
+    registration_info: Dict[str, Any] = {}
+    for dmd in (1, 2):
+        reg, info = resolve_cycle_registration(asset, dmd, cycle_registration)
+        if require_identified_cycle_alignment and dmd <= int(exp.n_dmds):
+            require_identified_registration(reg, info, dmd=dmd, session_id=str(asset.session_id))
+        registrations[dmd] = reg
+        registration_info[f"DMD{dmd}"] = info
     clock_qc = compare_slap2_harp_clock(
         exp,
         behavior_qc_dir=Path(asset.qc_dir) / "behavior",
@@ -761,10 +843,14 @@ def process_calcium_extraction(
     tvecs = _time_vectors(windows, im_rate_hz)
 
     base_meta = {
-        "schema_version": "0.1.3",
+        "schema_version": "0.2.0",
         "session_id": asset.session_id,
         "subject_id": int(asset.subject_id),
         "summary_mat": str(asset.summary_mat),
+        "summary_provenance": summary_provenance,
+        "summary_format": summary_provenance["selected_format"],
+        "cycle_registration": registration_info,
+        "require_identified_cycle_alignment": bool(require_identified_cycle_alignment),
         "bonsai_event_log_csv": str(asset.bonsai_event_log_csv),
         "indicator2": indicator2,
         "im_rate_hz": float(im_rate_hz),
@@ -811,8 +897,12 @@ def process_calcium_extraction(
     seq_pkg: Dict[str, Any] = {"metadata": base_meta, "timebase_sec": {"image": tvecs["image"]}, "DMD1": {}, "DMD2": {}}
 
     meta_out: Dict[str, Any] = {
-        "schema_version": "0.1.3",
+        "schema_version": "0.2.0",
         "session_id": asset.session_id,
+        "summary_provenance": summary_provenance,
+        "summary_format": summary_provenance["selected_format"],
+        "cycle_registration": registration_info,
+        "require_identified_cycle_alignment": bool(require_identified_cycle_alignment),
         "indicator2": indicator2,
         "motion_correct": bool(motion_correct),
         "use_soma_qc": bool(use_soma_qc),
@@ -879,7 +969,15 @@ def process_calcium_extraction(
             strict_epoch_match=strict_epoch_match,
             epoch_scale_mode=epoch_scale_mode,
             min_epoch_duration_sec=min_epoch_duration_sec,
+            cycle_registration=registrations.get(dmd),
         )
+        if require_identified_cycle_alignment and bundle.get("traces") is not None and np.asarray(bundle["traces"]).size and not (
+            (bundle.get("epoch_metadata") or {}).get("cycle_registration", {}).get("applied", False)
+        ):
+            raise RuntimeError(
+                f"{asset.session_id} DMD{dmd}: identified cycle registration could not be applied to calcium: "
+                f"{(bundle.get('epoch_metadata') or {}).get('cycle_registration', {}).get('reason', 'unknown reason')}"
+            )
         if bundle["traces"].size == 0:
             meta_out["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no calcium traces"}
             continue

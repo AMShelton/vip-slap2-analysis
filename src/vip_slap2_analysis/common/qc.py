@@ -678,7 +678,11 @@ def run_session_synapse_qc(
     min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
 ) -> SessionQCResult:
     """
-    Compute behavior-independent synapse QC from SummaryLoCo*.mat alone.
+    Compute behavior-independent synapse QC from a SummaryLoCo*.mat or a GIAnT
+    ``experiment_summary.h5`` alone. The file type is selected by extension;
+    ``.h5`` files are opened with
+    :class:`vip_slap2_analysis.io.giant_summary.GiantExperimentSummary`, which
+    exposes the same ``get_traces``/``valid_trials``/``n_synapses`` API.
     """
     summary_mat_path = Path(summary_mat_path)
 
@@ -701,7 +705,12 @@ def run_session_synapse_qc(
         output_dir = summary_mat_path.parent / "analysis" /  "qc" / "slap2"
     output_dir = Path(output_dir)
 
-    exp = GlutamateSummary(summary_mat_path)
+    if summary_mat_path.suffix.lower() == ".h5":
+        from vip_slap2_analysis.io.giant_summary import GiantExperimentSummary
+
+        exp = GiantExperimentSummary(summary_mat_path)
+    else:
+        exp = GlutamateSummary(summary_mat_path)
 
     if fs_hz is None:
         fs_hz = float(exp.metadata.get("analyzeHz", np.nan))

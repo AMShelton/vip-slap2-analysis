@@ -44,8 +44,13 @@ from vip_slap2_analysis.common.alignment import (
 )
 from vip_slap2_analysis.voltage.postprocess import (
     load_voltage_summary_from_asset,
+    load_voltage_summary_with_provenance,
     reconstruct_voltage_dmd_session_traces,
     resolve_voltage_sample_rate_hz,
+)
+from vip_slap2_analysis.common.cycle_registration import (
+    require_identified_registration,
+    resolve_cycle_registration,
 )
 
 
@@ -1158,6 +1163,9 @@ def _write_session_transform_group(
     grp.create_dataset("trial_starts_sec", data=np.asarray(bundle.trial_starts_sec, dtype=np.float64))
     if getattr(bundle, "sample_epoch", None) is not None:
         grp.create_dataset("sample_epoch", data=np.asarray(bundle.sample_epoch, dtype=np.int16))
+    if getattr(bundle, "sample_time_label", None) is not None:
+        grp.create_dataset("sample_time_label", data=np.asarray(bundle.sample_time_label, dtype=np.int8))
+        grp["sample_time_label"].attrs["legend"] = "0=measured/nominal,1=extrapolated_head,2=extrapolated_tail,3=interpolated_gap"
     trial_epoch = (getattr(bundle, "metadata", {}) or {}).get("trial_epoch", None)
     if trial_epoch is not None:
         grp.create_dataset("trial_epoch", data=np.asarray(trial_epoch, dtype=np.int16))
@@ -1232,6 +1240,8 @@ def load_voltage_roi_transform_h5(
         out["timebase_sec"] = grp["timebase_sec"][:]
         if "sample_epoch" in grp:
             out["sample_epoch"] = grp["sample_epoch"][:]
+        if "sample_time_label" in grp:
+            out["sample_time_label"] = grp["sample_time_label"][:]
         for key in ("raw_f", "f0", "dff"):
             if key in grp:
                 out[key] = grp[key][int(roi_index), :]
@@ -1264,12 +1274,15 @@ def compute_voltage_roi_transform_from_asset(
     voltage_indicator: Optional[str] = None,
     dff_polarity: str = "auto",
     strict_epoch_match: bool = True,
+    cycle_registration: Any = "auto",
+    summary_preference: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute raw/F0/dFF for one ROI directly from a session asset.
 
     This helper is meant for interactive inspection.  It reconstructs the full
     DMD session trace using the same code path as batch extraction, selects one
     ROI, and computes static or robust F0 plus indicator-polarity-corrected dF/F.
+    ``cycle_registration`` follows :func:`process_voltage_extraction`.
     """
     # Always load all behavior-derived imaging epochs. Even when callers supply
     # outer session bounds, epoch-scoped F0 and strict alignment require the
@@ -1283,7 +1296,8 @@ def compute_voltage_roi_transform_from_asset(
     if epoch_end_sec is None and "end_time" in epoch_df.columns:
         epoch_end_sec = float(epoch_df.iloc[-1]["end_time"])
 
-    with load_voltage_summary_from_asset(asset, keep_open=True) as vs:
+    reg, _reg_info = resolve_cycle_registration(asset, int(dmd), cycle_registration)
+    with load_voltage_summary_from_asset(asset, keep_open=True, summary_preference=summary_preference) as vs:
         rate = resolve_voltage_sample_rate_hz(
             asset=asset,
             vs=vs,
@@ -1304,6 +1318,7 @@ def compute_voltage_roi_transform_from_asset(
             max_timebase_error_sec=max_timebase_error_sec,
             strict_epoch_match=strict_epoch_match,
             min_epoch_duration_sec=min_epoch_duration_sec,
+            cycle_registration=reg,
         )
 
     if roi_index < 0 or roi_index >= bundle.traces.shape[0]:
@@ -1774,6 +1789,11 @@ def process_voltage_extraction(
     write_session_traces: bool = True,
     compression: Optional[str] = "gzip",
     compression_opts: Optional[int] = 4,
+    cycle_registration: Any = "auto",
+    require_identified_cycle_alignment: bool = False,
+    summary_preference: Optional[str] = None,
+    voltex_trace_kind: str = "raw_f",
+    apply_motion_censor: bool = False,
 ) -> Dict[str, Any]:
     """Extract voltage image/change/omission packages for one session asset.
 
@@ -1781,8 +1801,26 @@ def process_voltage_extraction(
     ----------
     asset
         Session asset bundle returned by ``VIPSessionRegistry.resolve_assets``.
-        It must contain ``asset.modality_assets['voltage']['summary_mat']`` and,
-        for split-H5 outputs, ``trace_h5``.
+        The voltage summary is resolved through
+        :func:`vip_slap2_analysis.io.summary_loader.load_voltage_summary`
+        (modern ``VoltageSummary.h5`` first, legacy MAT + trace H5 fallback).
+    cycle_registration
+        ``"auto"`` (default) applies the saved DI3 cycle registration
+        (``qc/sync/cycle_registration_DMD<n>.json``) when it is identified: samples
+        before HARP coverage are skipped and sample times come from the measured
+        pulse train. ``None`` disables it. A ``CycleRegistration`` or
+        ``{dmd: CycleRegistration}`` may be passed explicitly.
+    require_identified_cycle_alignment
+        When True, extraction is refused (``RuntimeError``) for any DMD whose
+        registration is missing or not identified, instead of falling back to the
+        historical first-pulse anchoring. Use this for SLAP2-first sessions.
+    summary_preference
+        ``"modern"``/``"legacy"`` override of the registry precedence.
+    voltex_trace_kind, apply_motion_censor
+        Passed to :class:`~vip_slap2_analysis.voltage.voltex_summary.VoltexSummary`
+        when a modern summary is selected. ``raw_f`` keeps the historical
+        behavior of computing dF/F here; ``apply_motion_censor`` treats Voltex's
+        ``motion_censor`` samples like discard frames.
     metadata
         Optional caller metadata.  ``metadata['prepost_sec']`` can override event
         windows with keys ``image``/``image_identity``, ``change``, and
@@ -1930,7 +1968,19 @@ def process_voltage_extraction(
     )
     seq_events = build_change_locked_sequences(ordered_images_f)
 
-    with load_voltage_summary_from_asset(asset, keep_open=True) as vs:
+    vs, summary_provenance = load_voltage_summary_with_provenance(
+        asset, keep_open=True, summary_preference=summary_preference,
+        trace_kind=voltex_trace_kind, apply_motion_censor=apply_motion_censor,
+    )
+    registrations: Dict[int, Any] = {}
+    registration_info: Dict[str, Any] = {}
+    for dmd in range(1, int(vs.n_dmds) + 1):
+        reg, info = resolve_cycle_registration(asset, dmd, cycle_registration)
+        if require_identified_cycle_alignment:
+            require_identified_registration(reg, info, dmd=dmd, session_id=str(asset.session_id))
+        registrations[dmd] = reg
+        registration_info[f"DMD{dmd}"] = info
+    with vs:
         rate = resolve_voltage_sample_rate_hz(
             asset=asset,
             vs=vs,
@@ -1947,12 +1997,17 @@ def process_voltage_extraction(
         summary_mat = asset.get_asset("voltage", "summary_mat") if hasattr(asset, "get_asset") else None
         trace_h5 = asset.get_asset("voltage", "trace_h5") if hasattr(asset, "get_asset") else None
         base_meta: Dict[str, Any] = {
-            "schema_version": "0.1.1",
+            "schema_version": "0.2.0",
             "session_id": asset.session_id,
             "subject_id": int(asset.subject_id),
             "modality": "voltage",
             "summary_mat": str(summary_mat) if summary_mat is not None else None,
             "trace_h5": str(trace_h5) if trace_h5 is not None else None,
+            "summary_provenance": summary_provenance,
+            "summary_format": summary_provenance.get("selected_format"),
+            "summary_path": summary_provenance.get("selected_path"),
+            "cycle_registration": registration_info,
+            "require_identified_cycle_alignment": bool(require_identified_cycle_alignment),
             "bonsai_event_log_csv": str(asset.bonsai_event_log_csv),
             "sample_rate_hz": float(rate),
             "default_sample_rate_hz": float(default_sample_rate_hz),
@@ -2000,10 +2055,14 @@ def process_voltage_extraction(
         mean_pkg: Dict[str, Any] = {"metadata": base_meta, "timebase_sec": tvecs, "DMD1": {}, "DMD2": {}}
         seq_pkg: Dict[str, Any] = {"metadata": base_meta, "timebase_sec": {"image": tvecs["image"]}, "DMD1": {}, "DMD2": {}}
         qc: Dict[str, Any] = {
-            "schema_version": "0.1.1",
+            "schema_version": "0.2.0",
             "session_id": asset.session_id,
             "summary_mat": base_meta["summary_mat"],
             "trace_h5": base_meta["trace_h5"],
+            "summary_provenance": summary_provenance,
+            "summary_format": base_meta["summary_format"],
+            "cycle_registration": registration_info,
+            "require_identified_cycle_alignment": bool(require_identified_cycle_alignment),
             "bonsai_event_log_csv": str(asset.bonsai_event_log_csv),
             "sample_rate_hz": float(rate),
             "trace_signal": str(trace_signal),
@@ -2065,10 +2124,18 @@ def process_voltage_extraction(
                     max_timebase_error_sec=max_timebase_error_sec,
                     strict_epoch_match=strict_epoch_match,
                     min_epoch_duration_sec=min_epoch_duration_sec,
+                    cycle_registration=registrations.get(dmd),
                 )
                 if bundle.traces.size == 0:
                     qc["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no valid traces"}
                     continue
+                if require_identified_cycle_alignment and not (
+                    (getattr(bundle, "metadata", {}) or {}).get("cycle_registration", {}).get("applied", False)
+                ):
+                    raise RuntimeError(
+                        f"{asset.session_id} DMD{dmd}: identified cycle registration could not be applied: "
+                        f"{(bundle.metadata or {}).get('cycle_registration', {}).get('reason', 'unknown reason')}"
+                    )
 
                 bundle, transform_meta, transform_payload = _transform_voltage_bundle(
                     bundle,

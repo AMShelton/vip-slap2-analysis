@@ -77,6 +77,9 @@ class ReconstructedTraceBundle:
     reconstructed_duration_sec: float
     metadata: Optional[Dict[str, Any]] = None
     sample_epoch: Optional[np.ndarray] = None
+    # Per-sample timing provenance (see cycle_registration): 0 = nominal/measured,
+    # 1 = extrapolated before first recorded pulse, 2 = after last, 3 = interpolated gap.
+    sample_time_label: Optional[np.ndarray] = None
 
 
 # -----------------------------------------------------------------------------
@@ -366,6 +369,67 @@ def filter_ordered_images_to_epochs(
 
 
 # -----------------------------------------------------------------------------
+# Cycle registration support
+# -----------------------------------------------------------------------------
+
+def _plan_from_registration(
+    cycle_registration: Any,
+    *,
+    trial_source_lines: Dict[int, np.ndarray],
+    source_trial_epoch: np.ndarray,
+    n_valid_trials: int,
+) -> Tuple[Optional[Any], Dict[str, Any]]:
+    """Build a :class:`RegisteredSamplePlan` or explain why registration is not applied.
+
+    Shared by the glutamate/calcium and voltage reconstruction paths. The plan is
+    refused (``None``) when the registration is not identified, lacks a behavior
+    time origin, or when source line indices are missing for retained trials.
+    Nothing is guessed: refusal leaves the historical first-pulse anchoring and the
+    reason is recorded in the bundle metadata.
+    """
+    from vip_slap2_analysis.common.cycle_registration import plan_registered_samples
+
+    info: Dict[str, Any] = {
+        "applied": False,
+        "status": getattr(cycle_registration, "status", None),
+        "acquisition_start_order": getattr(cycle_registration, "acquisition_start_order", None),
+        "relationship": getattr(cycle_registration, "relationship", None),
+        "offsets_by_source_epoch": {
+            str(e.source_epoch_index): e.cycle_index_offset for e in getattr(cycle_registration, "epochs", [])
+        },
+        "candidate_offset_ranges": {
+            str(e.source_epoch_index): list(e.candidate_offset_range) for e in getattr(cycle_registration, "epochs", [])
+        },
+        "period_error_ppm": getattr(cycle_registration, "period_error_ppm", None),
+    }
+    if not getattr(cycle_registration, "identified", False):
+        info["reason"] = f"registration status is {info['status']!r}; historical first-pulse anchoring kept"
+        return None, info
+    origin = getattr(cycle_registration, "behavior_time_origin_harp_s", None)
+    if origin is None:
+        info["reason"] = "registration lacks behavior_time_origin_harp_s (HARP analog stream start)"
+        return None, info
+    if len(trial_source_lines) < int(n_valid_trials):
+        info["reason"] = (
+            f"source line indices available for {len(trial_source_lines)}/{n_valid_trials} valid trials; "
+            "measured timing requires all of them"
+        )
+        return None, info
+    plan = plan_registered_samples(
+        cycle_registration,
+        trial_source_lines=trial_source_lines,
+        trial_source_epoch=source_trial_epoch,
+        behavior_time_origin_harp_s=float(origin),
+    )
+    info.update({
+        "leading_samples_by_source_epoch": {str(k): int(v) for k, v in plan.source_epoch_leading_samples.items()},
+        "skipped_source_epochs": {str(k): v for k, v in plan.skipped_source_epochs.items()},
+        "notes": list(plan.notes),
+    })
+    return plan, info
+
+
+# -----------------------------------------------------------------------------
 # Trace reconstruction
 # -----------------------------------------------------------------------------
 
@@ -433,6 +497,7 @@ def reconstruct_dmd_session_traces(
     scale_epochs: Union[bool, str] = "never",
     strict_epoch_match: bool = True,
     min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
+    cycle_registration: Optional[Any] = None,
 ) -> ReconstructedTraceBundle:
     """Reconstruct a session-wide glutamate trace from trial-wise outputs.
 
@@ -441,6 +506,14 @@ def reconstruct_dmd_session_traces(
     accepted source epochs are mapped chronologically to accepted behavior epochs,
     and excess source samples are clipped at the behavior endpoint without changing
     the nominal imaging rate.
+
+    ``cycle_registration`` (a
+    :class:`vip_slap2_analysis.common.cycle_registration.CycleRegistration` for
+    this DMD) is optional. When supplied and identified, frames whose source cycle
+    precedes the first HARP-recorded DI3 pulse are skipped and every retained frame
+    receives a measured HARP time from the registered pulse train (via
+    ``exp.get_trial_source_lines``) instead of the nominal-rate ramp anchored at
+    the first observed pulse. Without it the historical behavior is unchanged.
     """
     n_trials = int(exp.n_trials)
     valid_set = set(int(t) for t in exp.valid_trials[dmd - 1])
@@ -448,6 +521,7 @@ def reconstruct_dmd_session_traces(
     valid_trial_data: Dict[int, np.ndarray] = {}
     valid_lengths: List[int] = []
     n_syn_expected = int(exp.n_synapses[dmd - 1]) if len(exp.n_synapses) >= dmd else None
+    trial_source_lines: Dict[int, np.ndarray] = {}
 
     for trial in range(1, n_trials + 1):
         if trial not in valid_set:
@@ -464,6 +538,13 @@ def reconstruct_dmd_session_traces(
         valid_lengths.append(arr.shape[1])
         if n_syn_expected is None:
             n_syn_expected = arr.shape[0]
+        if cycle_registration is not None and hasattr(exp, "get_trial_source_lines"):
+            try:
+                lines = exp.get_trial_source_lines(dmd, trial)
+            except Exception:
+                lines = None
+            if lines is not None and np.asarray(lines).size == arr.shape[1]:
+                trial_source_lines[trial] = np.asarray(lines, dtype=np.int64)
 
     if not valid_trial_data:
         return ReconstructedTraceBundle(
@@ -501,6 +582,18 @@ def reconstruct_dmd_session_traces(
             if hasattr(exp, "get_dmd_epoch_durations_sec")
             else {}
         )
+        registration_plan = None
+        registration_info: Dict[str, Any] = {"applied": False}
+        source_labels_for_plan = (
+            np.asarray(trial_epoch, dtype=int) if trial_epoch is not None else np.ones((n_trials,), dtype=int)
+        )
+        if cycle_registration is not None:
+            registration_plan, registration_info = _plan_from_registration(
+                cycle_registration,
+                trial_source_lines=trial_source_lines,
+                source_trial_epoch=source_labels_for_plan,
+                n_valid_trials=len(valid_trial_data),
+            )
         reconciliation = reconcile_trial_epochs(
             source_trial_lengths,
             sample_rate_hz=float(im_rate_hz),
@@ -509,13 +602,20 @@ def reconstruct_dmd_session_traces(
             source_epoch_durations_sec=source_epoch_durations_sec or None,
             min_epoch_duration_sec=min_epoch_duration_sec,
             strict_epoch_match=strict_epoch_match,
+            source_epoch_leading_samples=(
+                registration_plan.source_epoch_leading_samples if registration_plan is not None else None
+            ),
         )
         trial_lengths = reconciliation.trial_lengths_samples
+        trial_starts_src = reconciliation.trial_source_start_samples
         analysis_trial_epoch = reconciliation.analysis_trial_epoch
         behavior_epochs = reconciliation.behavior_epoch_df
     else:
         reconciliation = None
+        registration_plan = None
+        registration_info = {"applied": False, "reason": "no behavior epochs supplied"}
         trial_lengths = source_trial_lengths
+        trial_starts_src = np.zeros((n_trials,), dtype=int)
         analysis_trial_epoch = np.ones((n_trials,), dtype=int)
         behavior_epochs = None
 
@@ -530,10 +630,11 @@ def reconstruct_dmd_session_traces(
             continue
         if trial in valid_trial_data:
             arr = valid_trial_data[trial]
+            src_start = int(trial_starts_src[trial - 1]) if trial_starts_src.size >= trial else 0
             s = min(n_syn_expected, arr.shape[0])
-            ll = min(keep_len, arr.shape[1])
-            traces[:s, pos:pos + ll] = arr[:s, :ll]
-            trial_valid_mask[trial - 1] = bool(ll > 0 and np.isfinite(arr[:s, :ll]).any())
+            ll = min(keep_len, max(0, arr.shape[1] - src_start))
+            traces[:s, pos:pos + ll] = arr[:s, src_start:src_start + ll]
+            trial_valid_mask[trial - 1] = bool(ll > 0 and np.isfinite(arr[:s, src_start:src_start + ll]).any())
         pos += keep_len
 
     metadata: Dict[str, Any] = {
@@ -557,6 +658,22 @@ def reconstruct_dmd_session_traces(
     if behavior_epochs is not None and len(behavior_epochs) > 0:
         # Current policy preserves nominal sample spacing. ``scale_epochs`` remains
         # in the signature for compatibility but is intentionally ignored here.
+        measured_times = None
+        measured_labels = None
+        if registration_plan is not None and reconciliation is not None:
+            from vip_slap2_analysis.common.cycle_registration import registered_epoch_sample_times
+
+            measured_times, measured_labels, timing_info = registered_epoch_sample_times(
+                cycle_registration,
+                registration_plan,
+                trial_source_lines=trial_source_lines,
+                source_trial_epoch=reconciliation.source_trial_epoch,
+                analysis_trial_epoch=analysis_trial_epoch,
+                trial_lengths_samples=trial_lengths,
+                trial_source_start_samples=trial_starts_src,
+            )
+            registration_info.update(timing_info)
+            registration_info["applied"] = bool(measured_times)
         epoch_tb = build_epoch_aware_timebase(
             trial_lengths,
             sample_rate_hz=float(im_rate_hz),
@@ -564,16 +681,21 @@ def reconstruct_dmd_session_traces(
             trial_epoch=analysis_trial_epoch,
             scale_each_epoch="never",
             strict_epoch_match=strict_epoch_match,
+            epoch_sample_times_sec=measured_times or None,
+            epoch_sample_time_labels=measured_labels or None,
         )
         timebase_sec = epoch_tb.timebase_sec
         trial_starts_sec = epoch_tb.trial_starts_sec
         metadata.update(epoch_tb.metadata)
         sample_epoch = epoch_tb.sample_epoch
+        sample_time_label = epoch_tb.sample_time_label
+        metadata["cycle_registration"] = registration_info
         if reconciliation is not None:
             metadata["epoch_qc"] = reconciliation.metadata
             metadata["source_trial_epoch"] = reconciliation.source_trial_epoch.astype(int).tolist()
             metadata["analysis_trial_epoch"] = reconciliation.analysis_trial_epoch.astype(int).tolist()
             metadata["source_epoch_qc"] = reconciliation.source_epoch_qc.to_dict(orient="records")
+            metadata["trial_source_start_samples"] = reconciliation.trial_source_start_samples.astype(int).tolist()
     else:
         timebase_sec = epoch_start_sec + np.arange(total_samples, dtype=float) / float(im_rate_hz)
         trial_offsets = np.concatenate([[0], np.cumsum(trial_lengths)])
@@ -582,6 +704,7 @@ def reconstruct_dmd_session_traces(
             if length > 0:
                 trial_starts_sec[i] = float(epoch_start_sec + offset / float(im_rate_hz))
         sample_epoch = np.ones((total_samples,), dtype=int)
+        sample_time_label = np.zeros((total_samples,), dtype=np.int8)
 
     session_start = float(timebase_sec[0]) if total_samples else float(epoch_start_sec)
     session_end = float(timebase_sec[-1]) if total_samples else float(epoch_start_sec)
@@ -596,6 +719,7 @@ def reconstruct_dmd_session_traces(
         reconstructed_duration_sec=float(session_end - session_start) if total_samples > 1 else 0.0,
         metadata=metadata,
         sample_epoch=sample_epoch,
+        sample_time_label=sample_time_label,
     )
 
 
