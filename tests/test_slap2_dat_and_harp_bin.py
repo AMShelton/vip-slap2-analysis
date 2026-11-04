@@ -95,3 +95,25 @@ def test_reference_session_dmd1_cycles_match_di3_pulses():
     resid = rec.rise_times_s - (a * t1.cycle_start_s + b)
     assert np.sqrt(np.mean(resid**2)) < 50e-6
     assert 0 < (a - 1) * 1e6 < 20  # HARP runs a few ppm fast relative to the FPGA
+
+
+@pytest.mark.skipif(not REFERENCE_DIR, reason="SLAP2_REFERENCE_DIR not set")
+def test_reference_dmd2_registration_transferred_through_shared_fpga():
+    from vip_slap2_analysis.common.cycle_registration import (
+        register_di3_to_source_cycles, source_epochs_from_raw_dat, transfer_registration_via_fpga,
+    )
+    root = Path(REFERENCE_DIR)
+    dd = root / "slap2" / "dynamic_data"
+    harp = root / "behavior" / "VCO1_Behavior.harp"
+    rec = read_digital_input_edges(harp / "Behavior_32.bin", record_end_from=harp / "Behavior_44.bin")
+    s1 = source_epochs_from_raw_dat(dd, 1); s2 = source_epochs_from_raw_dat(dd, 2)
+    reg1 = register_di3_to_source_cycles(rise_times_s=rec.rise_times_s, record_start_s=rec.record_start_s,
+                                         record_end_s=rec.record_end_s, source_epochs=s1, dmd=1)
+    assert reg1.status == "identified" and reg1.epochs[0].cycle_index_offset == 0
+    reg2 = transfer_registration_via_fpga(reg1, src_cycle_start_s={1: s1[0].cycle_start_s}, dst_cycle_start_s={1: s2[0].cycle_start_s},
+                                          dst_lines_per_cycle={1: s2[0].lines_per_cycle}, dst_line_rate_hz={1: s2[0].line_rate_hz}, dst_dmd=2)
+    e = reg2.epochs[0]
+    assert reg2.status == "identified" and e.cycle_index_offset == 0 and e.n_source_cycles == 10232
+    t, lab = e.cycle_times_harp_s()
+    assert abs(t[0] - rec.rise_times_s[0]) < 1e-4     # both DMDs start on the same FPGA tick
+    assert np.all(lab == 0)

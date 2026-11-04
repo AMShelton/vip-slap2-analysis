@@ -54,6 +54,7 @@ STATUS_UNAVAILABLE = "unavailable"
 RELATIONSHIP_DIRECT = "direct_dmd_cycle_clock"
 RELATIONSHIP_INTEGER_LINE = "integer_line_cadence_not_dmd_cycle"
 RELATIONSHIP_UNRESOLVED = "noninteger_or_unresolved_cadence"
+RELATIONSHIP_TRANSFERRED = "transferred_from_other_dmd_shared_fpga"
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +188,12 @@ class EpochCycleRegistration:
     notes: List[str] = field(default_factory=list)
     lines_per_cycle: Optional[int] = None
     line_rate_hz: Optional[float] = None
+    # how the HARP time of each cycle was obtained: 'di3_pulses' (measured rises) or
+    # 'transferred_from_dmd<k>_shared_fpga' (FPGA timestamps mapped through another DMD's pulses)
+    timing_source: str = "di3_pulses"
+    # tolerance for the origin-consistency anchor (None -> caller default, 2 ms). Transferred
+    # registrations need one cycle period because this DMD's cycle boundaries are not the DI3 edges.
+    anchor_tolerance_s: Optional[float] = None
     # not serialized by default (large)
     pulse_times_harp_s: Optional[np.ndarray] = field(default=None, repr=False)
 
@@ -351,10 +358,20 @@ def _register_epoch(
 
     N = int(src.n_cycles)
     n_eff = n_obs + missing_internal
-    if src.has_partial_trailing_cycle and relationship == RELATIONSHIP_DIRECT and n_eff == N + 1 and tail:
-        # The acquisition ended inside a cycle that was not saved to the .dat but did emit a pulse.
+    trailing_pulse_assumed = False
+    if relationship == RELATIONSHIP_DIRECT and ((tail and src.has_partial_trailing_cycle) or (n_eff == N + 1 and (tail or head))):
+        # The acquisition stops inside a cycle: that cycle emits its DI3 pulse but is not written to
+        # the .dat (the reader floors the cycle count). Seen on real data as +1 pulse per interior
+        # epoch (863774_2026-08-07: 23750 pulses vs 23749 saved cycles). With tail coverage, or one
+        # pulse too many under a head anchor, the last observed pulse is the unsaved cycle's pulse
+        # and is excluded from the count.
         n_eff -= 1
-        notes.append("One trailing pulse attributed to the unsaved partial final cycle (file size remainder).")
+        if src.has_partial_trailing_cycle:
+            notes.append("Last observed pulse attributed to the unsaved partial final cycle (file-size remainder present).")
+        else:
+            trailing_pulse_assumed = True
+            notes.append("One more pulse than saved cycles with tail coverage: last pulse attributed to the cycle during "
+                         "which the acquisition stopped (no file-size remainder to confirm; assumed).")
     offset: Optional[int] = None
     rng: Tuple[int, int]
     status = STATUS_AMBIGUOUS
@@ -386,7 +403,7 @@ def _register_epoch(
         notes.append(f"More DI3 pulses ({n_eff}, incl. {missing_internal} inferred dropped) than source cycles ({N}).")
     elif n_eff == N:
         if head or tail:
-            offset = 0; status = STATUS_IDENTIFIED; rng = (0, 0)
+            offset = 0; status = STATUS_IDENTIFIED_ASSUMED if trailing_pulse_assumed else STATUS_IDENTIFIED; rng = (0, 0)
             missing_initial = 0; missing_terminal = 0
             if not (head and tail):
                 notes.append("Pulse count equals source cycle count; single anchor used, other end at recording limit.")
@@ -405,9 +422,13 @@ def _register_epoch(
             offset = 0; status = STATUS_IDENTIFIED; rng = (0, 0)
             missing_initial = 0; missing_terminal = deficit
         elif tail:
-            offset = deficit; status = STATUS_IDENTIFIED; rng = (deficit, deficit)
+            offset = deficit; rng = (deficit, deficit)
+            status = STATUS_IDENTIFIED_ASSUMED if trailing_pulse_assumed else STATUS_IDENTIFIED
             missing_initial = deficit; missing_terminal = 0
-            notes.append("Tail anchor: HARP recorded past the last pulse; first observed pulse is cycle N - n_observed.")
+            notes.append("Tail anchor: HARP recorded past the last pulse; first observed pulse is cycle N - n_observed"
+                         + (" (after excluding the unsaved-cycle pulse)." if src.has_partial_trailing_cycle else
+                            "; if the acquisition stopped inside an unsaved cycle this is low by exactly one cycle "
+                            "(no file-size remainder found)."))
         else:
             rng = (0, deficit)
             notes.append(f"Neither recording boundary has margin: offset in [0, {deficit}] is not identifiable from DI3 alone.")
@@ -525,16 +546,32 @@ def register_di3_to_source_cycles(
         order, evidence = "unknown", "no DI3 pulse train"
 
     epochs: List[EpochCycleRegistration] = []
+    unmatched_di3: List[Dict[str, Any]] = []
+    unmatched_source: List[int] = []
+    pairs: List[Tuple[SourceEpochCycles, Di3PulseEpoch]] = []
     if not src_list or not di3_epochs:
         status = STATUS_UNAVAILABLE
         limitations.append("Missing source epochs or DI3 pulse trains.")
-    elif len(src_list) != len(di3_epochs):
-        status = STATUS_INCONSISTENT
-        limitations.append(
-            f"{len(src_list)} source epoch(s) vs {len(di3_epochs)} DI3 pulse-train epoch(s); chronological pairing refused."
-        )
     else:
-        for s, e in zip(src_list, di3_epochs):
+        pairs, unmatched_di3, unmatched_source = pair_source_and_di3_epochs(
+            src_list, di3_epochs, relationship=relationship,
+        )
+        if unmatched_di3:
+            limitations.append(
+                f"{len(unmatched_di3)} DI3 pulse train(s) without a saved acquisition (aborted/preview acquisitions?): "
+                + ", ".join(f"{u['n_pulses']} pulses / {u['duration_s']:.1f} s at +{u['start_s']:.1f} s" for u in unmatched_di3)
+            )
+        if unmatched_source:
+            limitations.append(
+                f"Source epoch(s) {unmatched_source} have no matching DI3 pulse train (acquired outside the HARP recording?)."
+            )
+        if not pairs:
+            status = STATUS_INCONSISTENT
+            limitations.append(
+                f"{len(src_list)} source epoch(s) vs {len(di3_epochs)} DI3 pulse-train epoch(s); no count-consistent pairing found."
+            )
+    if pairs:
+        for s, e in pairs:
             reg = _register_epoch(
                 s, e, relationship=relationship, nominal_period_s=s.nominal_cycle_period_s,
                 min_anchor_cycles=min_anchor_cycles, min_anchor_s=min_anchor_s,
@@ -544,6 +581,21 @@ def register_di3_to_source_cycles(
             if s.n_source_gaps:
                 reg.notes.append(f"Source .dat headers show {s.n_source_gaps} cycle-timing gap(s) inside this epoch.")
             epochs.append(reg)
+        for sid in unmatched_source:
+            # keep an explicit record so downstream code sees the epoch as unregistered, not missing
+            src_u = next(x for x in src_list if int(x.epoch_index) == int(sid))
+            epochs.append(EpochCycleRegistration(
+                source_epoch_index=int(sid), di3_epoch_index=0, n_source_cycles=int(src_u.n_cycles), n_observed_pulses=0,
+                n_internal_missing_pulses=0, internal_gaps=[], head_covered=False, tail_covered=False, lead_s=float("nan"),
+                tail_s=float("nan"), anchor="none", status=STATUS_UNAVAILABLE, cycle_index_offset=None,
+                candidate_offset_range=(0, int(src_u.n_cycles)), missing_initial_cycles=None, missing_terminal_cycles=None,
+                nominal_cycle_period_s=float(src_u.nominal_cycle_period_s), observed_cycle_period_s=float("nan"),
+                rate_ratio_harp_over_source=float("nan"), period_error_ppm=float("nan"), residual_rms_s=float("nan"),
+                residual_max_s=float("nan"), first_pulse_harp_s=float("nan"), last_pulse_harp_s=float("nan"),
+                notes=["No DI3 pulse train matched this acquisition; no HARP coverage."],
+                lines_per_cycle=int(src_u.lines_per_cycle), line_rate_hz=float(src_u.line_rate_hz),
+            ))
+        epochs.sort(key=lambda e: e.source_epoch_index)
         statuses = {e.status for e in epochs}
         if statuses <= {STATUS_IDENTIFIED}:
             status = STATUS_IDENTIFIED
@@ -551,6 +603,9 @@ def register_di3_to_source_cycles(
             status = STATUS_IDENTIFIED_ASSUMED
         elif STATUS_INCONSISTENT in statuses:
             status = STATUS_INCONSISTENT
+        elif statuses <= {STATUS_IDENTIFIED, STATUS_IDENTIFIED_ASSUMED, STATUS_UNAVAILABLE}:
+            # identified where HARP covered anything; epochs without coverage carry no stimuli anyway
+            status = STATUS_IDENTIFIED_ASSUMED if STATUS_IDENTIFIED_ASSUMED in statuses else STATUS_IDENTIFIED
         else:
             status = STATUS_AMBIGUOUS
     distinct_lpc = {int(s.lines_per_cycle) for s in src_list}
@@ -590,8 +645,183 @@ def register_di3_to_source_cycles(
         n_di3_epochs=len(di3_epochs),
         epochs=epochs,
         limitations=limitations,
-        inputs=dict(inputs or {}),
+        inputs={**dict(inputs or {}), "unmatched_di3_trains": unmatched_di3, "unmatched_source_epochs": list(unmatched_source)},
         wall_clock_evidence=dict(wall_clock_evidence or {}),
+    )
+
+
+def pair_source_and_di3_epochs(
+    source_epochs: Sequence[SourceEpochCycles],
+    di3_epochs: Sequence[Di3PulseEpoch],
+    *,
+    relationship: str,
+    count_tolerance: float = 0.5,
+) -> Tuple[List[Tuple[SourceEpochCycles, Di3PulseEpoch]], List[Dict[str, Any]], List[int]]:
+    """Pair saved acquisitions with DI3 pulse trains chronologically, by pulse/cycle count.
+
+    Both lists are chronological. For each source epoch the next DI3 train whose
+    pulse count is at most ``N + 1`` (one trailing pulse for the unsaved final
+    cycle) and at least ``count_tolerance * N`` is taken; trains skipped on the way
+    are DI3 activity without a saved ``.dat`` (aborted or preview acquisitions).
+    Source epochs left over have no HARP coverage. For a non-direct cadence the
+    comparison uses durations instead of counts. Nothing is matched by position
+    alone, so a 7-vs-11 mismatch pairs the 7 real acquisitions and reports 4
+    unmatched trains instead of refusing (863774_2026-08-07).
+    """
+    pairs: List[Tuple[SourceEpochCycles, Di3PulseEpoch]] = []
+    unmatched: List[Dict[str, Any]] = []
+    leftover_source: List[int] = []
+    j = 0
+    trains = list(di3_epochs)
+    for src in source_epochs:
+        matched = None
+        while j < len(trains):
+            tr = trains[j]
+            if relationship == RELATIONSHIP_DIRECT:
+                n = tr.n_pulses
+                ok = (n <= src.n_cycles + 1) and (n >= count_tolerance * src.n_cycles)
+            else:
+                dur = tr.duration_s
+                nominal = src.nominal_duration_s
+                ok = (dur <= nominal * 1.02 + 1.0) and (dur >= count_tolerance * nominal)
+            j += 1
+            if ok:
+                matched = tr
+                break
+            unmatched.append({"di3_epoch_index": int(tr.epoch_index), "n_pulses": int(tr.n_pulses),
+                              "duration_s": float(tr.duration_s), "start_s": float(tr.rise_times_s[0])})
+        if matched is None:
+            leftover_source.append(int(src.epoch_index))
+        else:
+            pairs.append((src, matched))
+    for tr in trains[j:]:
+        unmatched.append({"di3_epoch_index": int(tr.epoch_index), "n_pulses": int(tr.n_pulses),
+                          "duration_s": float(tr.duration_s), "start_s": float(tr.rise_times_s[0])})
+    return pairs, unmatched, leftover_source
+
+
+def transfer_registration_via_fpga(
+    reg_src: CycleRegistration,
+    *,
+    src_cycle_start_s: Dict[int, np.ndarray],
+    dst_cycle_start_s: Dict[int, np.ndarray],
+    dst_lines_per_cycle: Dict[int, int],
+    dst_line_rate_hz: Dict[int, float],
+    dst_dmd: int,
+    max_fit_residual_s: float = 2e-4,
+) -> CycleRegistration:
+    """Register a DMD that has no DI3 clock through the FPGA timestamps shared with ``reg_src``.
+
+    Both DMDs' ``.dat`` line headers carry timestamps on the same 200 MHz FPGA
+    clock (same ``referenceTimestamp``; verified on the 2026-10-27 reference
+    where DMD1 and DMD2 start on the same tick). For each identified source
+    epoch the affine map HARP = a * FPGA + b is fitted on the observed DI3 pulses
+    of the source DMD against its FPGA cycle starts (residual ~ HARP tick), then
+    applied to every cycle start of the destination DMD. The destination
+    registration holds synthesized per-cycle HARP times for the cycles inside
+    the HARP-covered window; its ``cycle_index_offset`` is the first destination
+    cycle starting at or after the first source pulse (earlier cycles have no
+    HARP coverage), and its anchor tolerance is one destination cycle period.
+
+    ``*_cycle_start_s`` map source-epoch index -> FPGA cycle start times (s,
+    relative to the acquisition reference) for each DMD.
+    """
+    epochs: List[EpochCycleRegistration] = []
+    limitations = list(reg_src.limitations)
+    notes_all: List[str] = []
+    for e in reg_src.epochs:
+        sid = int(e.source_epoch_index)
+        ts_src = src_cycle_start_s.get(sid)
+        ts_dst = dst_cycle_start_s.get(sid)
+        lpc = int(dst_lines_per_cycle.get(sid, 0))
+        lr = float(dst_line_rate_hz.get(sid, float("nan")))
+        base = dict(
+            source_epoch_index=sid, di3_epoch_index=int(e.di3_epoch_index), n_internal_missing_pulses=0, internal_gaps=[],
+            head_covered=e.head_covered, tail_covered=e.tail_covered, lead_s=e.lead_s, tail_s=e.tail_s, anchor=e.anchor,
+            nominal_cycle_period_s=(lpc / lr if lpc and np.isfinite(lr) and lr > 0 else float("nan")),
+            lines_per_cycle=lpc or None, line_rate_hz=lr if np.isfinite(lr) else None,
+            timing_source=f"transferred_from_dmd{reg_src.dmd}_shared_fpga",
+        )
+        if e.cycle_index_offset is None or e.pulse_times_harp_s is None or ts_src is None or ts_dst is None or not lpc:
+            epochs.append(EpochCycleRegistration(
+                **base, n_source_cycles=int(ts_dst.size) if ts_dst is not None else 0, n_observed_pulses=0,
+                status=STATUS_UNAVAILABLE if e.cycle_index_offset is not None else e.status,
+                cycle_index_offset=None, candidate_offset_range=(0, int(ts_dst.size) if ts_dst is not None else 0),
+                missing_initial_cycles=None, missing_terminal_cycles=None, observed_cycle_period_s=float("nan"),
+                rate_ratio_harp_over_source=float("nan"), period_error_ppm=float("nan"), residual_rms_s=float("nan"),
+                residual_max_s=float("nan"), first_pulse_harp_s=float("nan"), last_pulse_harp_s=float("nan"),
+                notes=[f"Source DMD{reg_src.dmd} epoch is {e.status}; nothing to transfer."] if e.cycle_index_offset is None
+                else ["FPGA cycle timestamps for one of the DMDs are unavailable."],
+            ))
+            continue
+        # observed source pulses -> source cycle indices (same rule as cycle_times_harp_s)
+        pulses = np.asarray(e.pulse_times_harp_s, dtype=float)
+        k0 = int(e.cycle_index_offset)
+        idx = np.empty(pulses.size, dtype=int); idx[0] = k0
+        if pulses.size > 1:
+            steps = np.rint(np.diff(pulses) / float(e.observed_cycle_period_s)).astype(int); steps[steps < 1] = 1
+            idx[1:] = k0 + np.cumsum(steps)
+        ok = idx < ts_src.size
+        x = ts_src[idx[ok]]; y = pulses[ok]
+        a, b = np.polyfit(x, y, 1)
+        resid = y - (a * x + b)
+        rms = float(np.sqrt(np.mean(resid ** 2))); rmax = float(np.max(np.abs(resid)))
+        dst_t = a * np.asarray(ts_dst, dtype=float) + b
+        t_first = float(pulses[0]); t_last = float(pulses[-1])
+        # coverage window with a tolerance for HARP quantization / fit noise (a destination cycle that
+        # starts on the same FPGA tick as the first source pulse must count as covered)
+        tol = max(2e-4, 5.0 * rms)
+        inside = np.flatnonzero((dst_t >= t_first - tol) & (dst_t <= t_last + float(e.observed_cycle_period_s)))
+        if rms > max_fit_residual_s or inside.size == 0:
+            epochs.append(EpochCycleRegistration(
+                **base, n_source_cycles=int(ts_dst.size), n_observed_pulses=0, status=STATUS_INCONSISTENT,
+                cycle_index_offset=None, candidate_offset_range=(0, int(ts_dst.size)), missing_initial_cycles=None,
+                missing_terminal_cycles=None, observed_cycle_period_s=float("nan"), rate_ratio_harp_over_source=float(a),
+                period_error_ppm=float((a - 1) * 1e6), residual_rms_s=rms, residual_max_s=rmax,
+                first_pulse_harp_s=float("nan"), last_pulse_harp_s=float("nan"),
+                notes=[f"HARP~FPGA fit residual {rms*1e6:.1f} us RMS exceeds {max_fit_residual_s*1e6:.0f} us, or no destination cycle inside coverage."],
+            ))
+            continue
+        k0d, k1d = int(inside[0]), int(inside[-1])
+        dst_period = float(np.median(np.diff(ts_dst))) * a if ts_dst.size > 1 else base["nominal_cycle_period_s"]
+        epochs.append(EpochCycleRegistration(
+            **base, n_source_cycles=int(ts_dst.size), n_observed_pulses=int(k1d - k0d + 1), status=e.status,
+            cycle_index_offset=k0d, candidate_offset_range=(k0d, k0d), missing_initial_cycles=k0d,
+            missing_terminal_cycles=int(ts_dst.size - 1 - k1d), observed_cycle_period_s=float(dst_period),
+            rate_ratio_harp_over_source=float(a), period_error_ppm=float((a - 1) * 1e6), residual_rms_s=rms,
+            residual_max_s=rmax, first_pulse_harp_s=float(dst_t[k0d]), last_pulse_harp_s=float(dst_t[k1d]),
+            notes=[f"Transferred from DMD{reg_src.dmd}: HARP = {a:.9f}*FPGA + b fitted on {int(ok.sum())} pulses "
+                   f"(residual {rms*1e6:.1f} us RMS); destination cycles {k0d}..{k1d} lie inside HARP coverage."],
+            anchor_tolerance_s=float(dst_period) + 0.002,
+            pulse_times_harp_s=dst_t[k0d:k1d + 1],
+        ))
+        notes_all.append(f"epoch {sid}: fit residual {rms*1e6:.1f} us")
+    statuses = {x.status for x in epochs}
+    if statuses <= {STATUS_IDENTIFIED}:
+        status = STATUS_IDENTIFIED
+    elif statuses <= {STATUS_IDENTIFIED, STATUS_IDENTIFIED_ASSUMED, STATUS_UNAVAILABLE} and (statuses & {STATUS_IDENTIFIED, STATUS_IDENTIFIED_ASSUMED}):
+        status = STATUS_IDENTIFIED_ASSUMED if STATUS_IDENTIFIED_ASSUMED in statuses else STATUS_IDENTIFIED
+    elif STATUS_INCONSISTENT in statuses:
+        status = STATUS_INCONSISTENT
+    else:
+        status = STATUS_AMBIGUOUS if STATUS_AMBIGUOUS in statuses else STATUS_UNAVAILABLE
+    lpc0 = next((x.lines_per_cycle for x in epochs if x.lines_per_cycle), None)
+    lr0 = next((x.line_rate_hz for x in epochs if x.line_rate_hz), None)
+    ratios = [x.rate_ratio_harp_over_source for x in epochs if np.isfinite(x.rate_ratio_harp_over_source)]
+    ratio = float(np.mean(ratios)) if ratios else None
+    return CycleRegistration(
+        schema_version=SCHEMA_VERSION, session_id=reg_src.session_id, dmd=int(dst_dmd),
+        relationship=RELATIONSHIP_TRANSFERRED, acquisition_start_order=reg_src.acquisition_start_order,
+        start_order_evidence=reg_src.start_order_evidence + f" [DI3 is DMD{reg_src.dmd}'s clock; transferred]",
+        status=status, safe_for_physiology=status in (STATUS_IDENTIFIED, STATUS_IDENTIFIED_ASSUMED),
+        lines_per_cycle=lpc0, line_rate_hz=lr0,
+        nominal_cycle_period_s=(lpc0 / lr0 if lpc0 and lr0 else None),
+        observed_cycle_period_s=(float(np.mean([x.observed_cycle_period_s for x in epochs if np.isfinite(x.observed_cycle_period_s)])) if any(np.isfinite(x.observed_cycle_period_s) for x in epochs) else None),
+        rate_ratio_harp_over_source=ratio, period_error_ppm=((ratio - 1) * 1e6 if ratio else None),
+        effective_lines_per_pulse=None, harp_record_start_s=reg_src.harp_record_start_s, harp_record_end_s=reg_src.harp_record_end_s,
+        harp_n_rising_edges=reg_src.harp_n_rising_edges, n_source_epochs=len(epochs), n_di3_epochs=reg_src.n_di3_epochs,
+        epochs=epochs, limitations=limitations + [f"Timing transferred from DMD{reg_src.dmd} through shared FPGA timestamps; " + "; ".join(notes_all)],
+        inputs={**reg_src.inputs, "transferred_from_dmd": int(reg_src.dmd)}, wall_clock_evidence=dict(reg_src.wall_clock_evidence),
     )
 
 
@@ -783,6 +1013,7 @@ def registered_epoch_sample_times(
     times: Dict[int, List[np.ndarray]] = {}
     labels: Dict[int, List[np.ndarray]] = {}
     anchors: Dict[int, float] = {}
+    tolerances: Dict[int, float] = {}
     unusable: Dict[int, str] = {}
     for t0, (s_id, a_id, n, st) in enumerate(zip(src, ana, lengths, starts)):
         if n <= 0 or a_id <= 0:
@@ -798,6 +1029,9 @@ def registered_epoch_sample_times(
             tt, lab = plan.lines_to_behavior_time(reg, int(s_id), np.asarray(lines)[st:st + n])
             if int(a_id) not in anchors:
                 anchors[int(a_id)] = plan.first_retained_cycle_start_behavior_s(reg, int(s_id), int(np.asarray(lines)[st]))
+                ereg = reg.epoch_by_source_index(int(s_id))
+                if ereg is not None and ereg.anchor_tolerance_s:
+                    tolerances[int(a_id)] = float(ereg.anchor_tolerance_s)
         except ValueError as exc:
             unusable[int(a_id)] = f"trial {t0 + 1}: {exc}"
             continue
@@ -812,6 +1046,8 @@ def registered_epoch_sample_times(
         "epochs_without_measured_times": {str(k): v for k, v in unusable.items()},
         "behavior_time_origin_harp_s": plan.behavior_time_origin_harp_s,
         "epoch_anchor_cycle_start_sec": {str(k): float(v) for k, v in out_a.items()},
+        "epoch_anchor_tolerance_sec": {str(k): float(v) for k, v in tolerances.items() if k in out_t},
+        "timing_source_by_source_epoch": {str(e.source_epoch_index): e.timing_source for e in reg.epochs},
     }
     return out_t, out_l, info, out_a
 
@@ -938,6 +1174,101 @@ def require_identified_registration(
 
 
 # ---------------------------------------------------------------------------
+# Wall-clock evidence (bounds only; never selects an offset)
+# ---------------------------------------------------------------------------
+
+def wall_clock_evidence_for_asset(asset: Any, dynamic_data_dir: Optional[PathLike]) -> Dict[str, Any]:
+    """Collect PC wall-clock stamps of the SLAP2 acquisition start and the HARP recording start.
+
+    SLAP2: ``.meta`` ``fpgaTimeReference`` (SLAP2 PC clock at FPGA tick 0) plus
+    ``referenceTimestamp / fpgaSystemClock_Hz`` from the first ``.dat`` header.
+    HARP: the Bonsai launcher log (``behavior/launcher_metadata/launcher.log``,
+    'Selected harp folder ... <YYYYMMDDTHHMMSS>') on the behavior PC. The two PCs
+    are not synchronised to better than seconds, so the difference is reported
+    with an explicit +/- ``assumed_pc_clock_offset_s`` and only *bounds* the
+    candidate offset range; it never picks the offset.
+    """
+    import re
+    from datetime import datetime
+
+    out: Dict[str, Any] = {"available": False}
+    try:
+        if dynamic_data_dir is None or not Path(dynamic_data_dir).exists():
+            return out
+        from vip_slap2_analysis.io.slap2_dat import (
+            find_meta_file, list_acquisition_prefixes, read_dat_file_header, find_dmd_dat_files, read_meta_summary,
+        )
+        prefixes = list_acquisition_prefixes(dynamic_data_dir)
+        if not prefixes:
+            return out
+        starts = []
+        for prefix in prefixes:
+            meta = find_meta_file(dynamic_data_dir, 1, prefix=prefix)
+            files = find_dmd_dat_files(dynamic_data_dir, 1, prefix=prefix)
+            if meta is None or not files:
+                continue
+            m = read_meta_summary(meta)
+            h = read_dat_file_header(files[0])
+            if m.get("fpgaTimeReference_epoch_ms") is None:
+                continue
+            # fpgaTimeReference is a naive local-time datetime; keep it as local seconds since epoch
+            t0 = float(m["fpgaTimeReference_epoch_ms"]) / 1000.0 + h.referenceTimestamp / float(h.fpgaSystemClock_Hz)
+            starts.append({"prefix": prefix, "slap2_acq_start_local_epoch_s": t0,
+                           "slap2_acq_start_iso_local": datetime.utcfromtimestamp(t0).isoformat()})
+        out["slap2_acquisitions"] = starts
+        harp_dir = getattr(asset, "harp_dir", None)
+        log = None
+        if harp_dir is not None:
+            cand = Path(harp_dir).parent / "launcher_metadata" / "launcher.log"
+            if cand.exists():
+                log = cand
+        if log is not None:
+            txt = log.read_text(encoding="utf-8", errors="replace")
+            m = re.search(r"Selected harp folder:.*?(\d{8}T\d{6})", txt)
+            if m:
+                dt = datetime.strptime(m.group(1), "%Y%m%dT%H%M%S")
+                out["harp_folder_stamp_iso_local"] = dt.isoformat()
+                out["harp_folder_local_epoch_s"] = (dt - datetime(1970, 1, 1)).total_seconds()
+            m2 = re.search(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*Starting Bonsai workflow attempt", txt, re.M)
+            if m2:
+                out["bonsai_workflow_start_iso_local"] = m2.group(1)
+        out["assumed_pc_clock_offset_s"] = 5.0
+        out["available"] = bool(starts and out.get("harp_folder_local_epoch_s") is not None)
+    except Exception as exc:  # evidence only; never fail registration on it
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def _apply_wall_clock_bound(reg: CycleRegistration) -> None:
+    """Narrow ambiguous candidate ranges with wall-clock evidence (status unchanged)."""
+    w = reg.wall_clock_evidence or {}
+    if not w.get("available"):
+        return
+    acqs = w.get("slap2_acquisitions") or []
+    harp_t = w.get("harp_folder_local_epoch_s")
+    tol = float(w.get("assumed_pc_clock_offset_s", 5.0))
+    for e in reg.epochs:
+        if e.status != STATUS_AMBIGUOUS or e.pulse_times_harp_s is None or not acqs:
+            continue
+        i = int(e.source_epoch_index) - 1
+        if i >= len(acqs):
+            continue
+        period = float(e.observed_cycle_period_s)
+        # HARP folder stamp ~ HARP recording start; first pulse follows it by lead_s
+        est_k = (harp_t + float(e.lead_s) - float(acqs[i]["slap2_acq_start_local_epoch_s"])) / period
+        lo, hi = e.candidate_offset_range
+        lo2 = max(lo, int(np.floor(est_k - tol / period)))
+        hi2 = min(hi, int(np.ceil(est_k + tol / period)))
+        e.notes.append(
+            f"Wall-clock evidence (SLAP2 PC .meta vs behavior PC HARP folder stamp, +/-{tol:.0f} s assumed clock offset) "
+            f"suggests offset ~{est_k:.0f} cycles, i.e. [{lo2}, {hi2}] of the count-consistent range [{lo}, {hi}]. "
+            "Evidence only; status remains ambiguous."
+        )
+        reg.wall_clock_evidence.setdefault("epoch_offset_estimates", {})[str(e.source_epoch_index)] = {
+            "estimated_offset_cycles": float(est_k), "bounded_range": [int(lo2), int(hi2)]}
+
+
+# ---------------------------------------------------------------------------
 # Session driver
 # ---------------------------------------------------------------------------
 
@@ -1016,9 +1347,15 @@ def run_cycle_registration(
     summary: Any = None,
     dynamic_data_dir: Optional[PathLike] = None,
     save: bool = True,
+    transfer_from: Optional[CycleRegistration] = None,
     **kwargs: Any,
 ) -> CycleRegistration:
     """Compute (and optionally save) the DI3 -> source-cycle registration for one DMD.
+
+    ``transfer_from`` (an identified registration of another DMD of the same
+    session) switches to :func:`transfer_registration_via_fpga`, which needs the
+    raw ``.dat`` headers of both DMDs (``dynamic_data_dir``). It is used for the
+    DMD that does not drive DI3 (normally DMD2).
 
     DI3 is read from the raw HARP ``Behavior_32.bin`` (recording bounds tightened
     by ``Behavior_44.bin``) when ``asset.harp_dir`` exists, else from the cached
@@ -1098,11 +1435,26 @@ def run_cycle_registration(
     else:
         raise ValueError("Either dynamic_data_dir or a summary reader is required for source cycle counts")
 
+    wall = wall_clock_evidence_for_asset(asset, dynamic_data_dir)
+    if transfer_from is not None:
+        if dynamic_data_dir is None or not Path(dynamic_data_dir).exists():
+            raise ValueError("transfer_from requires dynamic_data_dir (raw .dat headers of both DMDs)")
+        src_ts = {e.epoch_index: e.cycle_start_s for e in source_epochs_from_raw_dat(dynamic_data_dir, int(transfer_from.dmd))}
+        reg = transfer_registration_via_fpga(
+            transfer_from, src_cycle_start_s=src_ts, dst_cycle_start_s={e.epoch_index: e.cycle_start_s for e in src},
+            dst_lines_per_cycle={e.epoch_index: e.lines_per_cycle for e in src},
+            dst_line_rate_hz={e.epoch_index: e.line_rate_hz for e in src}, dst_dmd=dmd,
+        )
+        reg.inputs.update(inputs)
+        if save and getattr(asset, "qc_dir", None) is not None:
+            save_cycle_registration(reg, asset.qc_dir)
+        return reg
     reg = register_di3_to_source_cycles(
         rise_times_s=rec.rise_times_s, record_start_s=record_start, record_end_s=rec.record_end_s,
         source_epochs=src, dmd=dmd, session_id=getattr(asset, "session_id", None),
-        inputs={**inputs, "harp_recording": rec.to_dict()}, **kwargs,
+        inputs={**inputs, "harp_recording": rec.to_dict()}, wall_clock_evidence=wall, **kwargs,
     )
+    _apply_wall_clock_bound(reg)
     if extra_limitations:
         reg.limitations.extend(extra_limitations)
         reg.status = STATUS_INCONSISTENT

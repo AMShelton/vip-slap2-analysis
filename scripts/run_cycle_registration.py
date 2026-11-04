@@ -34,6 +34,8 @@ def registration_row(reg, session_id: str, dmd: int) -> dict:
         "status": reg.status,
         "safe_for_physiology": reg.safe_for_physiology,
         "relationship": reg.relationship,
+        "unmatched_di3_trains": len(reg.inputs.get("unmatched_di3_trains", []) or []),
+        "wall_clock_offset_estimates": str(reg.wall_clock_evidence.get("epoch_offset_estimates", "")),
         "acquisition_start_order": reg.acquisition_start_order,
         "start_order_evidence": reg.start_order_evidence,
         "harp_n_rising_edges": reg.harp_n_rising_edges,
@@ -83,7 +85,8 @@ def main(argv=None) -> int:
             rows.append({"session_id": sid, "status": "registry_error", "limitations": f"{type(exc).__name__}: {exc}"})
             continue
         dyn = None if args.no_raw else asset.get_asset("slap2", "dynamic_data_dir")
-        for dmd in args.dmd:
+        done = {}
+        for dmd in sorted(args.dmd):
             try:
                 summary = None
                 if dyn is None:
@@ -93,11 +96,23 @@ def main(argv=None) -> int:
                     except Exception:
                         summary, _ = load_glutamate_summary(asset)
                 out = run_cycle_registration(asset, dmd=dmd, summary=summary, dynamic_data_dir=dyn, save=not args.dry_run)
+                # A DMD whose DI3 cadence is not its own cycle clock is registered through the FPGA
+                # timestamps shared with an already-identified DMD (normally DMD2 via DMD1).
+                if out.relationship != "direct_dmd_cycle_clock" and dyn is not None:
+                    donor = next((r for r in done.values() if r.identified and r.relationship == "direct_dmd_cycle_clock"), None)
+                    if donor is not None:
+                        out = run_cycle_registration(asset, dmd=dmd, dynamic_data_dir=dyn, save=not args.dry_run, transfer_from=donor)
+                done[dmd] = out
                 if summary is not None and hasattr(summary, "close"):
                     summary.close()
                 rows.append(registration_row(out, sid, dmd))
-                print(f"{sid} DMD{dmd}: {out.status} ({out.acquisition_start_order}) "
+                print(f"{sid} DMD{dmd}: {out.status} ({out.acquisition_start_order}; {out.relationship}) "
                       f"offsets={[e.cycle_index_offset for e in out.epochs]} ranges={[e.candidate_offset_range for e in out.epochs]}")
+                for e in out.epochs:
+                    for n in e.notes:
+                        print(f"    epoch {e.source_epoch_index}: {n}")
+                for l in out.limitations:
+                    print(f"    ! {l}")
             except Exception as exc:
                 rows.append({"session_id": sid, "dmd": dmd, "status": "error", "limitations": f"{type(exc).__name__}: {exc}"})
                 print(f"{sid} DMD{dmd}: ERROR {type(exc).__name__}: {exc}")

@@ -232,3 +232,69 @@ def test_source_side_gaps_refuse_count_registration():
     reg = _reg(truth, truth[0] - 5, truth[-1] + 5, [src])
     assert reg.status == STATUS_INCONSISTENT
     assert any("discontinuous" in n for n in reg.epochs[0].notes)
+
+
+def test_count_based_pairing_with_unmatched_di3_fragments_and_trailing_pulse():
+    """863774_2026-08-07 pattern: 7 saved acquisitions, 11 DI3 trains, +1 pulse per interior acquisition."""
+    from vip_slap2_analysis.common.cycle_registration import STATUS_UNAVAILABLE
+    t = 1000.0
+    srcs, trains = [], []
+    gap = 40.0
+    for i, n in enumerate([3000, 2000, 2500], start=1):
+        srcs.append(SourceEpochCycles(epoch_index=i, n_cycles=n, lines_per_cycle=LPC, line_rate_hz=LINE_RATE,
+                                      has_partial_trailing_cycle=True))
+        # a short unmatched preview train (40 pulses) before each real acquisition
+        trains.append(t + np.arange(40) * PERIOD); t += 40 * PERIOD + gap
+        cyc = t + np.arange(n + 1) * PERIOD * (1 + HARP_PPM * 1e-6)  # +1 pulse: acquisition stopped inside cycle n
+        trains.append(cyc); t = cyc[-1] + gap
+    rises = np.concatenate(trains)
+    # HARP started late in acquisition 1 (missing 25 cycles) and stopped right after acquisition 3's last pulse
+    first_real = trains[1]
+    rises = rises[(rises >= first_real[25] - 1e-9)]
+    reg = _reg(rises, first_real[25] - 0.002, rises[-1] + 0.002, srcs)
+    assert reg.n_di3_epochs == 5  # the first preview train fell before the recording start
+    assert len(reg.inputs["unmatched_di3_trains"]) == 2
+    a, b, c = reg.epochs
+    assert a.status == STATUS_IDENTIFIED and a.anchor == "tail" and a.cycle_index_offset == 25
+    assert b.status == STATUS_IDENTIFIED and b.anchor == "both" and b.cycle_index_offset == 0
+    assert any("unsaved partial final cycle" in n for n in b.notes)
+    # last acquisition: head covered by the gap, tail not (HARP stopped at the last pulse) -> head anchor
+    assert c.status == STATUS_IDENTIFIED and c.anchor == "head" and c.cycle_index_offset == 0
+    assert reg.status == STATUS_IDENTIFIED
+
+
+def test_source_epoch_without_di3_train_is_reported_unavailable():
+    from vip_slap2_analysis.common.cycle_registration import STATUS_UNAVAILABLE
+    truth = _truth(n=2000)
+    srcs = [_src(n=2000, epoch=1), _src(n=1500, epoch=2)]   # second acquisition after HARP stopped
+    reg = _reg(truth, truth[0] - 5, truth[-1] + 5, srcs)
+    assert [e.status for e in reg.epochs] == [STATUS_IDENTIFIED, STATUS_UNAVAILABLE]
+    assert reg.inputs["unmatched_source_epochs"] == [2]
+    assert reg.status == STATUS_IDENTIFIED  # identified wherever HARP recorded; epoch 2 carries no stimuli
+
+
+def test_transfer_registration_to_second_dmd_via_shared_fpga():
+    from vip_slap2_analysis.common.cycle_registration import RELATIONSHIP_TRANSFERRED, transfer_registration_via_fpga
+    # DMD1: 227 lines/cycle, DMD2: 135 lines/cycle, same FPGA clock, same start tick
+    LR = LINE_RATE
+    N1, N2 = 4000, int(4000 * 227 / 135)
+    fpga1 = np.arange(N1) * 227 / LR
+    fpga2 = np.arange(N2) * 135 / LR
+    harp_of = lambda fp: 1000.0 + fp * (1 + HARP_PPM * 1e-6)
+    k = 80
+    pulses = harp_of(fpga1)[k:]
+    reg1 = _reg(pulses, pulses[0] - 0.002, pulses[-1] + 5, [_src(n=N1)])
+    assert reg1.epochs[0].cycle_index_offset == k
+    reg2 = transfer_registration_via_fpga(
+        reg1, src_cycle_start_s={1: fpga1}, dst_cycle_start_s={1: fpga2},
+        dst_lines_per_cycle={1: 135}, dst_line_rate_hz={1: LR}, dst_dmd=2,
+    )
+    assert reg2.relationship == RELATIONSHIP_TRANSFERRED and reg2.status == STATUS_IDENTIFIED and reg2.dmd == 2
+    e = reg2.epochs[0]
+    truth2 = harp_of(fpga2)
+    k2 = int(np.flatnonzero(truth2 >= pulses[0] - 1e-6)[0])
+    assert e.cycle_index_offset == k2 and e.anchor_tolerance_s > 135 / LR
+    times, labels = e.cycle_times_harp_s()
+    np.testing.assert_allclose(times, truth2, atol=5e-6)
+    assert np.all(labels[k2:] == 0) and np.all(labels[:k2] == 1)
+    assert e.timing_source == "transferred_from_dmd1_shared_fpga"

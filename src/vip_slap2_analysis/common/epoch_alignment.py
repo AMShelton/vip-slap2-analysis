@@ -626,6 +626,7 @@ def build_epoch_aware_timebase(
     epoch_sample_times_method: str = "di3_pulse_registered",
     sample_time_tolerance_sec: float = 0.002,
     epoch_anchor_sec: Optional[Mapping[int, float]] = None,
+    epoch_anchor_tolerance_sec: Optional[Mapping[int, float]] = None,
 ) -> EpochAwareTimebase:
     """Build a per-sample HARP timebase while preserving acquisition gaps.
 
@@ -721,7 +722,8 @@ def build_epoch_aware_timebase(
                 raise ValueError(f"epoch_sample_times_sec for epoch {epoch_id} must be finite and strictly increasing")
             anchor = float((epoch_anchor_sec or {}).get(int(epoch_id), t_meas[0]))
             start_offset = float(anchor - float(row.start_time))
-            if abs(start_offset) > float(sample_time_tolerance_sec):
+            tol = float((epoch_anchor_tolerance_sec or {}).get(int(epoch_id), sample_time_tolerance_sec))
+            if abs(start_offset) > tol:
                 raise ValueError(
                     f"Registered cycle start for epoch {epoch_id} is {start_offset * 1e3:.3f} ms from the "
                     f"behavior epoch start; registration and behavior QC do not share a HARP origin"

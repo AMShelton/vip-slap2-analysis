@@ -568,6 +568,10 @@ def reconstruct_voltage_dmd_session_traces(
             epoch_sample_times_sec=measured_times or None,
             epoch_sample_time_labels=measured_labels or None,
             epoch_anchor_sec=measured_anchors if measured_times else None,
+            epoch_anchor_tolerance_sec=(
+                {int(k): float(v) for k, v in registration_info.get("epoch_anchor_tolerance_sec", {}).items()}
+                if measured_times else None
+            ),
         )
         timebase_sec = epoch_tb.timebase_sec
         trial_starts_sec = epoch_tb.trial_starts_sec
