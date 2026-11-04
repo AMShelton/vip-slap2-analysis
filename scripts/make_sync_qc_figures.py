@@ -104,11 +104,11 @@ def synthetic_before_after(out: Path) -> None:
     tb_legacy = build_epoch_aware_timebase(rec.trial_lengths_samples, sample_rate_hz=FS, epoch_df=rec.behavior_epoch_df, trial_epoch=rec.analysis_trial_epoch)
     plan = plan_registered_samples(reg, trial_source_lines={1: lines}, trial_source_epoch=[1], behavior_time_origin_harp_s=origin)
     rec2 = reconcile_trial_epochs(lengths, sample_rate_hz=FS, behavior_epoch_df=epoch_df, source_trial_epoch=[1],
-                                  source_epoch_leading_samples=plan.source_epoch_leading_samples)
-    times, labels, _ = registered_epoch_sample_times(reg, plan, trial_source_lines={1: lines}, source_trial_epoch=[1], analysis_trial_epoch=[1],
-                                                    trial_lengths_samples=rec2.trial_lengths_samples, trial_source_start_samples=rec2.trial_source_start_samples)
+                                  trial_leading_samples=plan.trial_leading_samples)
+    times, labels, _, anchors = registered_epoch_sample_times(reg, plan, trial_source_lines={1: lines}, source_trial_epoch=[1], analysis_trial_epoch=[1],
+                                                             trial_lengths_samples=rec2.trial_lengths_samples, trial_source_start_samples=rec2.trial_source_start_samples)
     tb_reg = build_epoch_aware_timebase(rec2.trial_lengths_samples, sample_rate_hz=FS, epoch_df=rec2.behavior_epoch_df, trial_epoch=rec2.analysis_trial_epoch,
-                                        epoch_sample_times_sec=times, epoch_sample_time_labels=labels)
+                                        epoch_sample_times_sec=times, epoch_sample_time_labels=labels, epoch_anchor_sec=anchors)
     n_pre, n_post = int(0.25 * FS), int(0.75 * FS)
     t_rel = (np.arange(n_pre + n_post) - n_pre) / FS
 
