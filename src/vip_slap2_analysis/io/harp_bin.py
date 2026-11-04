@@ -170,7 +170,9 @@ def read_digital_input_edges(
     order = np.argsort(t, kind="stable")
     t = t[order]
     state = (vals[order, 0].astype(np.int64) & int(bit_mask)) > 0
-    prev = np.r_[False, state[:-1]]
+    # The first message is the initial state, not a transition: a recording that starts
+    # with DI3 already high is mid-pulse, and that partial pulse is not a cycle start.
+    prev = np.r_[state[0], state[:-1]]
     rises = t[state & ~prev]
     falls = t[~state & prev]
     start = float(t[0])

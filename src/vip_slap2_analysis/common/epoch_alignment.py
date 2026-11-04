@@ -301,6 +301,7 @@ def reconcile_trial_epochs(
     strict_epoch_match: bool = True,
     duration_warning_sec: float = 0.5,
     source_epoch_leading_samples: Optional[Mapping[int, int]] = None,
+    trial_leading_samples: Optional[Mapping[int, int]] = None,
 ) -> EpochReconciliation:
     """Apply the shared >=30 s QC rule and map source epochs to behavior epochs.
 
@@ -321,7 +322,10 @@ def reconcile_trial_epochs(
     leading source samples that precede the first HARP-recorded cycle (from a
     DI3 cycle registration, ``cycle_index_offset * samples_per_cycle``). Those
     samples are skipped: they are removed from the head of the first trial(s) of
-    that epoch and recorded in ``trial_source_start_samples``. Without this
+    that epoch and recorded in ``trial_source_start_samples``.
+    ``trial_leading_samples`` is the preferred, exact form: ``{trial_index_1based:
+    n_leading}`` per trial (from ``cycle_registration.plan_registered_samples``);
+    when given it takes precedence over the per-epoch aggregate. Without either
     argument the historical behavior (first source sample placed at the first
     observed DI3 pulse) is unchanged.
     """
@@ -339,6 +343,18 @@ def reconcile_trial_epochs(
                 raise ValueError("source_epoch_leading_samples values must be non-negative")
             if n_lead:
                 leading[int(key)] = n_lead
+    per_trial_lead: Dict[int, int] = {}
+    if trial_leading_samples:
+        for key, value in trial_leading_samples.items():
+            n_lead = int(value)
+            if n_lead < 0:
+                raise ValueError("trial_leading_samples values must be non-negative")
+            t0 = int(key) - 1
+            if t0 < 0 or t0 >= lengths.size:
+                raise ValueError(f"trial_leading_samples refers to trial {key} outside 1..{lengths.size}")
+            if n_lead > int(lengths[t0]):
+                raise ValueError(f"trial {key}: leading samples {n_lead} exceed trial length {int(lengths[t0])}")
+            per_trial_lead[t0] = n_lead
 
     behavior_qc = classify_epochs_by_duration(
         behavior_epoch_df, min_duration_sec=min_epoch_duration_sec
@@ -441,7 +457,7 @@ def reconcile_trial_epochs(
 
         # Leading source samples without HARP coverage (registered cycle offset)
         # are skipped from the head of this source epoch before the budget applies.
-        lead_remaining = int(leading.get(int(source_id), 0))
+        lead_remaining = 0 if per_trial_lead else int(leading.get(int(source_id), 0))
         skipped_leading = 0
         remaining = int(keep_budget)
         for trial_idx in idx:
@@ -449,7 +465,10 @@ def reconcile_trial_epochs(
                 retained_lengths[trial_idx] = 0
                 continue
             start = 0
-            if lead_remaining > 0:
+            if per_trial_lead:
+                start = int(per_trial_lead.get(int(trial_idx), 0))
+                skipped_leading += start
+            elif lead_remaining > 0:
                 start = min(int(lengths[trial_idx]), lead_remaining)
                 lead_remaining -= start
                 skipped_leading += start
@@ -561,7 +580,10 @@ def reconcile_trial_epochs(
         "original_samples": int(np.sum(lengths)),
         "retained_samples": int(np.sum(retained_lengths)),
         "discarded_samples": int(np.sum(lengths) - np.sum(retained_lengths)),
-        "leading_samples_skipped_by_source_epoch": {str(k): int(v) for k, v in leading.items()},
+        "leading_samples_skipped_by_source_epoch": {
+            str(int(r["source_epoch_index"])): int(r["leading_samples_skipped"]) for r in source_rows if r["leading_samples_skipped"]
+        },
+        "leading_samples_mode": "per_trial" if per_trial_lead else ("per_source_epoch" if leading else "none"),
         "warnings": warnings,
         "strict_epoch_match": bool(strict_epoch_match),
     }
@@ -603,6 +625,7 @@ def build_epoch_aware_timebase(
     epoch_sample_time_labels: Optional[Mapping[int, np.ndarray]] = None,
     epoch_sample_times_method: str = "di3_pulse_registered",
     sample_time_tolerance_sec: float = 0.002,
+    epoch_anchor_sec: Optional[Mapping[int, float]] = None,
 ) -> EpochAwareTimebase:
     """Build a per-sample HARP timebase while preserving acquisition gaps.
 
@@ -615,10 +638,12 @@ def build_epoch_aware_timebase(
     retained samples of an analysis epoch (one array per epoch id, length equal to
     the retained sample count), typically derived from DI3 pulse times through
     :func:`vip_slap2_analysis.common.cycle_registration.source_lines_to_harp_time`.
-    When present for an epoch they replace the nominal-rate ramp; their first
-    sample must lie within ``sample_time_tolerance_sec`` of the behavior epoch
-    start (the first DI3 rise) or a ``ValueError`` is raised, so a registration
-    built on a different HARP origin can never be applied silently.
+    When present for an epoch they replace the nominal-rate ramp. The origin is
+    cross-checked: ``epoch_anchor_sec[epoch]`` (behavior-relative start of the
+    source cycle holding the first retained sample; falls back to the first
+    measured sample time) must lie within ``sample_time_tolerance_sec`` of the
+    behavior epoch start (the first DI3 rise) or a ``ValueError`` is raised, so a
+    registration built on a different HARP origin can never be applied silently.
     ``epoch_sample_time_labels`` carries the matching per-sample coverage labels
     (0 measured, 1 extrapolated head, 2 extrapolated tail, 3 interpolated gap).
     """
@@ -694,15 +719,22 @@ def build_epoch_aware_timebase(
                 )
             if not np.all(np.isfinite(t_meas)) or (t_meas.size > 1 and np.any(np.diff(t_meas) <= 0)):
                 raise ValueError(f"epoch_sample_times_sec for epoch {epoch_id} must be finite and strictly increasing")
-            start_offset = float(t_meas[0] - float(row.start_time))
+            anchor = float((epoch_anchor_sec or {}).get(int(epoch_id), t_meas[0]))
+            start_offset = float(anchor - float(row.start_time))
             if abs(start_offset) > float(sample_time_tolerance_sec):
                 raise ValueError(
-                    f"Measured sample times for epoch {epoch_id} start {start_offset * 1e3:.3f} ms from the "
+                    f"Registered cycle start for epoch {epoch_id} is {start_offset * 1e3:.3f} ms from the "
                     f"behavior epoch start; registration and behavior QC do not share a HARP origin"
+                )
+            if t_meas[0] < float(row.start_time) - float(sample_time_tolerance_sec):
+                raise ValueError(
+                    f"Measured sample times for epoch {epoch_id} begin before the behavior epoch start"
                 )
             timebase[start:stop] = t_meas
             measured_start_offset_by_epoch[str(epoch_id)] = start_offset
-            if int(epoch_id) in measured_labels and measured_labels[int(epoch_id)].size == n_epoch:
+            if int(epoch_id) in measured_labels:
+                if measured_labels[int(epoch_id)].size != n_epoch:
+                    raise ValueError(f"epoch_sample_time_labels for epoch {epoch_id} has the wrong length")
                 sample_time_label[start:stop] = measured_labels[int(epoch_id)].astype(np.int8)
             dt = float((t_meas[-1] - t_meas[0]) / max(n_epoch - 1, 1)) if n_epoch > 1 else 1.0 / float(sample_rate_hz)
             do_scale = False

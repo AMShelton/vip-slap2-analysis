@@ -514,11 +514,13 @@ def reconstruct_voltage_dmd_session_traces(
             registration_plan, registration_info = _plan_from_registration(
                 cycle_registration,
                 trial_source_lines=trial_source_lines,
-                source_trial_epoch=(
-                    np.asarray(trial_epoch, dtype=int) if trial_epoch is not None else np.ones((n_trials,), dtype=int)
-                ),
+                source_trial_epoch=(np.asarray(trial_epoch, dtype=int) if trial_epoch is not None else None),
                 n_valid_trials=len(valid_lengths_by_trial),
+                n_trials=n_trials,
             )
+            if registration_plan is not None:
+                from vip_slap2_analysis.common.alignment import _drop_placeholder_trials
+                source_trial_lengths = _drop_placeholder_trials(source_trial_lengths, registration_plan)
         reconciliation = reconcile_trial_epochs(
             source_trial_lengths,
             sample_rate_hz=sample_rate_hz,
@@ -531,6 +533,9 @@ def reconstruct_voltage_dmd_session_traces(
             source_epoch_leading_samples=(
                 registration_plan.source_epoch_leading_samples if registration_plan is not None else None
             ),
+            trial_leading_samples=(
+                registration_plan.trial_leading_samples if registration_plan is not None else None
+            ),
         )
         trial_lengths = reconciliation.trial_lengths_samples
         trial_starts_src = reconciliation.trial_source_start_samples
@@ -542,7 +547,7 @@ def reconstruct_voltage_dmd_session_traces(
         if registration_plan is not None:
             from vip_slap2_analysis.common.cycle_registration import registered_epoch_sample_times
 
-            measured_times, measured_labels, timing_info = registered_epoch_sample_times(
+            measured_times, measured_labels, timing_info, measured_anchors = registered_epoch_sample_times(
                 cycle_registration,
                 registration_plan,
                 trial_source_lines=trial_source_lines,
@@ -562,6 +567,7 @@ def reconstruct_voltage_dmd_session_traces(
             strict_epoch_match=strict_epoch_match,
             epoch_sample_times_sec=measured_times or None,
             epoch_sample_time_labels=measured_labels or None,
+            epoch_anchor_sec=measured_anchors if measured_times else None,
         )
         timebase_sec = epoch_tb.timebase_sec
         trial_starts_sec = epoch_tb.trial_starts_sec
@@ -569,6 +575,9 @@ def reconstruct_voltage_dmd_session_traces(
         sample_time_label = epoch_tb.sample_time_label
         alignment_rate_hz = sample_rate_hz
         timebase_meta = dict(epoch_tb.metadata)
+        if cycle_registration is not None:
+            from vip_slap2_analysis.common.alignment import warn_if_registration_not_applied
+            warn_if_registration_not_applied(cycle_registration, registration_info, context=f"DMD{dmd} voltage reconstruction")
         timebase_meta.update(
             {
                 "timebase_strategy_requested": str(timebase_strategy),
@@ -614,6 +623,7 @@ def reconstruct_voltage_dmd_session_traces(
     trial_valid_mask = np.zeros((n_trials,), dtype=bool)
 
     pos = 0
+    underfilled_trials: List[Dict[str, int]] = []
     for trial in range(1, n_trials + 1):
         keep_length = int(trial_lengths[trial - 1])
         if keep_length <= 0:
@@ -663,6 +673,8 @@ def reconstruct_voltage_dmd_session_traces(
                 traces[:n_roi, pos + dst_cursor:pos + dst_cursor + n_time] = x[:n_time, :n_roi].T
                 dst_cursor += n_time
             trial_valid_mask[trial - 1] = bool(dst_cursor > 0)
+            if dst_cursor != keep_length:
+                underfilled_trials.append({"trial": int(trial), "expected": int(keep_length), "copied": int(dst_cursor)})
 
         pos += keep_length
 
@@ -672,6 +684,9 @@ def reconstruct_voltage_dmd_session_traces(
         float(session_end_sec - session_start_sec) if total_samples > 1 else 0.0
     )
 
+    if underfilled_trials:
+        import warnings as _warnings
+        _warnings.warn(f"DMD{dmd}: {len(underfilled_trials)} trial(s) copied fewer samples than retained length; tails are NaN", RuntimeWarning)
     metadata: Dict[str, Any] = dict(timebase_meta)
     metadata.update(
         {
@@ -688,6 +703,7 @@ def reconstruct_voltage_dmd_session_traces(
             "strict_epoch_match": bool(strict_epoch_match),
             "min_epoch_duration_sec": float(min_epoch_duration_sec),
             "invalid_trial_length_source": "summary_line_ranges_then_median_fallback",
+            "underfilled_trials": underfilled_trials,
             "traces_storage": "memmap" if isinstance(traces, np.memmap) else "memory",
             "traces_memmap_path": str(getattr(traces, "filename", "")) if isinstance(traces, np.memmap) else None,
         }

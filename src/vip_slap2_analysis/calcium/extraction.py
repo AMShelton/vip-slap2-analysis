@@ -477,11 +477,13 @@ def _reconstruct_ca_session_traces(
             registration_plan, registration_info = _plan_from_registration(
                 cycle_registration,
                 trial_source_lines=trial_source_lines,
-                source_trial_epoch=(
-                    np.asarray(source_trial_epoch, dtype=int) if source_trial_epoch is not None else np.ones((n_trials,), dtype=int)
-                ),
+                source_trial_epoch=(np.asarray(source_trial_epoch, dtype=int) if source_trial_epoch is not None else None),
                 n_valid_trials=int(sum(1 for a in trial_list if a is not None)),
+                n_trials=n_trials,
             )
+            if registration_plan is not None:
+                from vip_slap2_analysis.common.alignment import _drop_placeholder_trials
+                source_trial_lengths = _drop_placeholder_trials(source_trial_lengths, registration_plan)
         reconciliation = reconcile_trial_epochs(
             source_trial_lengths,
             sample_rate_hz=float(im_rate_hz),
@@ -492,6 +494,9 @@ def _reconstruct_ca_session_traces(
             strict_epoch_match=strict_epoch_match,
             source_epoch_leading_samples=(
                 registration_plan.source_epoch_leading_samples if registration_plan is not None else None
+            ),
+            trial_leading_samples=(
+                registration_plan.trial_leading_samples if registration_plan is not None else None
             ),
         )
         trial_lengths = reconciliation.trial_lengths_samples
@@ -545,7 +550,7 @@ def _reconstruct_ca_session_traces(
         if registration_plan is not None and reconciliation is not None:
             from vip_slap2_analysis.common.cycle_registration import registered_epoch_sample_times
 
-            measured_times, measured_labels, timing_info = registered_epoch_sample_times(
+            measured_times, measured_labels, timing_info, measured_anchors = registered_epoch_sample_times(
                 cycle_registration,
                 registration_plan,
                 trial_source_lines=trial_source_lines,
@@ -565,12 +570,16 @@ def _reconstruct_ca_session_traces(
             strict_epoch_match=strict_epoch_match,
             epoch_sample_times_sec=measured_times or None,
             epoch_sample_time_labels=measured_labels or None,
+            epoch_anchor_sec=measured_anchors if measured_times else None,
         )
         timebase_sec = epoch_tb.timebase_sec
         trial_starts_sec = epoch_tb.trial_starts_sec
         sample_epoch = epoch_tb.sample_epoch
         epoch_metadata = dict(epoch_tb.metadata)
         epoch_metadata["cycle_registration"] = registration_info
+        if cycle_registration is not None:
+            from vip_slap2_analysis.common.alignment import warn_if_registration_not_applied
+            warn_if_registration_not_applied(cycle_registration, registration_info, context=f"DMD{dmd} calcium reconstruction")
         timebase_mode = "di3_pulse_registered" if registration_info.get("applied") else "nominal_rate_epoch_qc_clipped"
         if reconciliation is not None:
             epoch_metadata["trial_source_start_samples"] = reconciliation.trial_source_start_samples.astype(int).tolist()

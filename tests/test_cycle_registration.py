@@ -174,13 +174,61 @@ def test_plan_and_sample_times_skip_leading_frames():
     lengths = [len(t) for t in thirds]
     starts = [expected_lead, 0, 0]
     lengths[0] -= expected_lead
-    times, labels, info = registered_epoch_sample_times(
+    times, labels, info, anchors = registered_epoch_sample_times(
         reg, plan, trial_source_lines=trial_lines, source_trial_epoch=[1, 1, 1], analysis_trial_epoch=[1, 1, 1],
         trial_lengths_samples=lengths, trial_source_start_samples=starts,
     )
+    assert plan.trial_leading_samples == {1: expected_lead, 2: 0, 3: 0}
+    # the anchor is the start of the first HARP-recorded cycle (= behavior epoch start), independent of frame phase
+    assert anchors[1] == pytest.approx(truth[k] - 900.0, abs=1e-9)
     t = times[1]
     assert t.size == sum(lengths) and np.all(np.diff(t) > 0)
     first_line = thirds[0][expected_lead]
     expected_first = truth[(first_line - 1) // LPC] + ((first_line - 1) % LPC) / LINE_RATE * (1 + HARP_PPM * 1e-6) - 900.0
     assert t[0] == pytest.approx(expected_first, abs=1e-9)
     assert np.all(labels[1] == 0)
+
+
+def test_anchor_guard_independent_of_frame_phase():
+    """B1 regression: frames (5 ms) rarely start at a cycle boundary; the origin guard must use the cycle start."""
+    from vip_slap2_analysis.common.epoch_alignment import build_epoch_aware_timebase, reconcile_trial_epochs
+    import pandas as pd
+
+    truth = _truth()
+    for k in (100, 121, 123, 130, 150):
+        reg = _reg(truth[k:], truth[k] - 0.002, truth[-1] + 5, inputs={"behavior_time_origin_harp_s": 900.0})
+        dt = LINE_RATE / 200.0
+        lines = np.ceil(np.arange(1, N * LPC, dt)).astype(int)
+        plan = plan_registered_samples(reg, trial_source_lines={1: lines}, trial_source_epoch=[1], behavior_time_origin_harp_s=900.0)
+        epoch_df = pd.DataFrame([{"epoch_index": 1, "start_time": truth[k] - 900.0, "end_time": truth[-1] - 900.0}])
+        rec = reconcile_trial_epochs([lines.size], sample_rate_hz=200.0, behavior_epoch_df=epoch_df, source_trial_epoch=[1],
+                                     trial_leading_samples=plan.trial_leading_samples)
+        times, labels, info, anchors = registered_epoch_sample_times(
+            reg, plan, trial_source_lines={1: lines}, source_trial_epoch=[1], analysis_trial_epoch=rec.analysis_trial_epoch,
+            trial_lengths_samples=rec.trial_lengths_samples, trial_source_start_samples=rec.trial_source_start_samples)
+        tb = build_epoch_aware_timebase(rec.trial_lengths_samples, sample_rate_hz=200.0, epoch_df=rec.behavior_epoch_df,
+                                        trial_epoch=rec.analysis_trial_epoch, epoch_sample_times_sec=times,
+                                        epoch_sample_time_labels=labels, epoch_anchor_sec=anchors)
+        assert tb.metadata["timebase_method_by_epoch"] == {"1": "di3_pulse_registered"}
+        first_line = lines[int(rec.trial_source_start_samples[0])]
+        assert (first_line - 1) // LPC == k                      # first retained frame is in the first recorded cycle
+        assert tb.timebase_sec[0] >= truth[k] - 900.0 - 1e-9     # and never before the first recorded pulse
+
+
+def test_placeholder_trials_without_lines_are_dropped_not_guessed():
+    truth = _truth()
+    reg = _reg(truth[50:], truth[50] - 0.002, truth[-1] + 5, inputs={"behavior_time_origin_harp_s": 900.0})
+    lines = np.arange(1, N * LPC, 53)
+    a, b, c = np.array_split(lines, 3)
+    plan = plan_registered_samples(reg, trial_source_lines={2: b, 3: c}, trial_source_epoch=[1, 1, 1], behavior_time_origin_harp_s=900.0)
+    assert plan.applied_source_epochs == [1]
+    assert plan.trials_without_lines == {1: [1]}
+    assert plan.trial_leading_samples == {2: 0, 3: 0}   # trial 2 starts after the unrecorded cycles
+
+
+def test_source_side_gaps_refuse_count_registration():
+    truth = _truth()
+    src = SourceEpochCycles(epoch_index=1, n_cycles=N, lines_per_cycle=LPC, line_rate_hz=LINE_RATE, n_source_gaps=2)
+    reg = _reg(truth, truth[0] - 5, truth[-1] + 5, [src])
+    assert reg.status == STATUS_INCONSISTENT
+    assert any("discontinuous" in n for n in reg.epochs[0].notes)

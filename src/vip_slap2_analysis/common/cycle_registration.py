@@ -77,6 +77,7 @@ class SourceEpochCycles:
     cycle_start_s: Optional[np.ndarray] = None
     n_source_gaps: int = 0
     source: str = "summary_metadata"
+    has_partial_trailing_cycle: bool = False
 
     @property
     def nominal_cycle_period_s(self) -> float:
@@ -184,6 +185,8 @@ class EpochCycleRegistration:
     first_pulse_harp_s: float
     last_pulse_harp_s: float
     notes: List[str] = field(default_factory=list)
+    lines_per_cycle: Optional[int] = None
+    line_rate_hz: Optional[float] = None
     # not serialized by default (large)
     pulse_times_harp_s: Optional[np.ndarray] = field(default=None, repr=False)
 
@@ -219,6 +222,11 @@ class EpochCycleRegistration:
         times = np.full((N,), np.nan)
         label = np.full((N,), 3, dtype=np.int8)
         valid = (idx >= 0) & (idx < N)
+        if not valid.any():
+            raise ValueError("no observed pulse maps inside the source cycle range")
+        if not valid.all():
+            # pulses beyond the saved cycles (e.g. a partial trailing cycle) are ignored, never silently remapped
+            pass
         times[idx[valid]] = pulses[valid]
         label[idx[valid]] = 0
         all_idx = np.arange(N)
@@ -343,13 +351,24 @@ def _register_epoch(
 
     N = int(src.n_cycles)
     n_eff = n_obs + missing_internal
+    if src.has_partial_trailing_cycle and relationship == RELATIONSHIP_DIRECT and n_eff == N + 1 and tail:
+        # The acquisition ended inside a cycle that was not saved to the .dat but did emit a pulse.
+        n_eff -= 1
+        notes.append("One trailing pulse attributed to the unsaved partial final cycle (file size remainder).")
     offset: Optional[int] = None
     rng: Tuple[int, int]
     status = STATUS_AMBIGUOUS
     missing_initial: Optional[int] = None
     missing_terminal: Optional[int] = None
 
-    if relationship != RELATIONSHIP_DIRECT:
+    if int(src.n_source_gaps) > 0 and relationship == RELATIONSHIP_DIRECT:
+        # Source-side cycle timing gaps mean cycles without pulses *and* DI3 gaps that are not
+        # dropped pulses; count-based registration is not defined for a discontinuous acquisition.
+        status = STATUS_INCONSISTENT
+        rng = (0, max(0, N - n_eff))
+        notes.append(f"Raw .dat headers show {int(src.n_source_gaps)} source-side cycle gap(s); "
+                     "count-based registration refused (discontinuous acquisition).")
+    elif relationship != RELATIONSHIP_DIRECT:
         notes.append(
             f"DI3 cadence is '{relationship}', not one pulse per DMD cycle; integer cycle registration by "
             "pulse counting is not defined. Only coverage anchors are reported."
@@ -419,6 +438,8 @@ def _register_epoch(
         first_pulse_harp_s=float(pulses[0]),
         last_pulse_harp_s=float(pulses[-1]),
         notes=notes,
+        lines_per_cycle=int(src.lines_per_cycle),
+        line_rate_hz=float(src.line_rate_hz),
         pulse_times_harp_s=pulses,
     )
 
@@ -532,6 +553,9 @@ def register_di3_to_source_cycles(
             status = STATUS_INCONSISTENT
         else:
             status = STATUS_AMBIGUOUS
+    distinct_lpc = {int(s.lines_per_cycle) for s in src_list}
+    if len(distinct_lpc) > 1:
+        limitations.append(f"Source epochs have different linesPerCycle {sorted(distinct_lpc)}; per-epoch values are used.")
     if relationship != RELATIONSHIP_DIRECT:
         limitations.append(f"DI3 cadence relationship '{relationship}': pulse counting cannot give integer cycle offsets.")
     if any(not e.head_covered for e in epochs):
@@ -617,6 +641,20 @@ class RegisteredSamplePlan:
     behavior_time_origin_harp_s: float
     method: str
     notes: List[str] = field(default_factory=list)
+    # per-trial (1-based trial number) leading samples to skip; preferred over the aggregate
+    trial_leading_samples: Dict[int, int] = field(default_factory=dict)
+    # trials (1-based) of applied epochs that have no source lines (invalid/placeholder trials):
+    # they carry no data and must be dropped (length 0) when the registration is applied, because
+    # their nominal placeholder length cannot be placed on the measured timebase.
+    trials_without_lines: Dict[int, List[int]] = field(default_factory=dict)
+
+    @staticmethod
+    def _epoch_lpc_rate(reg: "CycleRegistration", ereg: EpochCycleRegistration) -> Tuple[int, float]:
+        lpc = ereg.lines_per_cycle if ereg.lines_per_cycle else reg.lines_per_cycle
+        lr = ereg.line_rate_hz if ereg.line_rate_hz else reg.line_rate_hz
+        if not lpc or not lr:
+            raise ValueError("registration lacks lines_per_cycle / line_rate_hz")
+        return int(lpc), float(lr)
 
     def lines_to_behavior_time(
         self, reg: "CycleRegistration", source_epoch_index: int, lines_1based: np.ndarray
@@ -624,10 +662,26 @@ class RegisteredSamplePlan:
         ereg = reg.epoch_by_source_index(source_epoch_index)
         if ereg is None or ereg.cycle_index_offset is None:
             raise ValueError(f"source epoch {source_epoch_index} is not identified in the registration")
-        t, lab = source_lines_to_harp_time(
-            lines_1based, ereg, lines_per_cycle=int(reg.lines_per_cycle), line_rate_hz=float(reg.line_rate_hz)
-        )
+        lpc, lr = self._epoch_lpc_rate(reg, ereg)
+        t, lab = source_lines_to_harp_time(lines_1based, ereg, lines_per_cycle=lpc, line_rate_hz=lr)
         return t - float(self.behavior_time_origin_harp_s), lab
+
+    def first_retained_cycle_start_behavior_s(
+        self, reg: "CycleRegistration", source_epoch_index: int, first_retained_line_1based: int
+    ) -> float:
+        """Behavior-relative HARP time of the start of the cycle holding ``first_retained_line_1based``.
+
+        Used as the origin-consistency anchor: it must coincide (within HARP
+        quantization) with the behavior epoch start when the first retained
+        sample lies in the first HARP-recorded cycle.
+        """
+        ereg = reg.epoch_by_source_index(source_epoch_index)
+        if ereg is None or ereg.cycle_index_offset is None:
+            raise ValueError(f"source epoch {source_epoch_index} is not identified in the registration")
+        lpc, _lr = self._epoch_lpc_rate(reg, ereg)
+        cyc = (int(first_retained_line_1based) - 1) // lpc
+        times, _labels = ereg.cycle_times_harp_s()
+        return float(times[cyc] - float(self.behavior_time_origin_harp_s))
 
 
 def plan_registered_samples(
@@ -646,11 +700,10 @@ def plan_registered_samples(
     epoch's ``cycle_index_offset``. Epochs that are not identified are skipped
     (reported in ``skipped_source_epochs``) and keep the historical placement.
     """
-    if reg.lines_per_cycle is None:
-        raise ValueError("registration lacks lines_per_cycle")
-    lpc = int(reg.lines_per_cycle)
     labels = np.asarray(trial_source_epoch, dtype=int).reshape(-1)
     leading: Dict[int, int] = {}
+    per_trial: Dict[int, int] = {}
+    without_lines: Dict[int, List[int]] = {}
     applied: List[int] = []
     skipped: Dict[int, str] = {}
     notes: List[str] = []
@@ -659,15 +712,32 @@ def plan_registered_samples(
         if ereg.cycle_index_offset is None:
             skipped[sid] = f"status={ereg.status}; offset range {list(ereg.candidate_offset_range)}"
             continue
+        if ereg.pulse_times_harp_s is None:
+            skipped[sid] = "registration record has no pulse times (missing _pulses.npz); re-run registration"
+            continue
+        lpc = int(ereg.lines_per_cycle or reg.lines_per_cycle or 0)
+        if lpc <= 0:
+            skipped[sid] = "registration lacks lines_per_cycle"
+            continue
         k0 = int(ereg.cycle_index_offset)
         trials = [t for t in range(1, labels.size + 1) if labels[t - 1] == sid]
+        missing_lines = [t for t in trials if trial_source_lines.get(t) is None]
+        with_lines = [t for t in trials if t not in missing_lines]
+        if not with_lines:
+            skipped[sid] = "no trial of this epoch has source line indices"
+            continue
+        if missing_lines:
+            # Trials without source lines carry no data (invalid/placeholder trials). Every retained
+            # sample is timed by its own source line, so these placeholders are dropped rather than
+            # placed by a nominal length that cannot be located on the registered cycles.
+            without_lines[sid] = missing_lines
+            notes.append(f"Source epoch {sid}: trials {missing_lines} have no source lines and are dropped (no data).")
         n_lead = 0
-        for t in trials:
-            lines = trial_source_lines.get(t)
-            if lines is None:
-                continue
-            cyc = (np.asarray(lines, dtype=np.int64) - 1) // lpc
-            n_lead += int(np.sum(cyc < k0))
+        for t in with_lines:
+            cyc = (np.asarray(trial_source_lines[t], dtype=np.int64) - 1) // lpc
+            n_t = int(np.sum(cyc < k0))
+            per_trial[t] = n_t
+            n_lead += n_t
         leading[sid] = n_lead
         applied.append(sid)
         if k0 > 0:
@@ -679,6 +749,8 @@ def plan_registered_samples(
         behavior_time_origin_harp_s=float(behavior_time_origin_harp_s),
         method="di3_pulse_registered",
         notes=notes,
+        trial_leading_samples=per_trial,
+        trials_without_lines=without_lines,
     )
 
 
@@ -691,10 +763,12 @@ def registered_epoch_sample_times(
     analysis_trial_epoch: Sequence[int],
     trial_lengths_samples: Sequence[int],
     trial_source_start_samples: Sequence[int],
-) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray], Dict[str, Any]]:
+) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray], Dict[str, Any], Dict[int, float]]:
     """Measured behavior-time of every retained sample, grouped by analysis epoch.
 
-    Returns ``(epoch_sample_times, epoch_sample_labels, info)`` suitable for
+    Returns ``(epoch_sample_times, epoch_sample_labels, info, epoch_anchor_sec)``;
+    ``epoch_anchor_sec`` is the behavior-relative start time of the cycle holding
+    the first retained sample of each epoch (the origin-consistency anchor), all suitable for
     :func:`vip_slap2_analysis.common.epoch_alignment.build_epoch_aware_timebase`.
     Analysis epochs whose source epoch is not identified, or whose trials lack
     source lines, are omitted (they keep the nominal-rate placement) and listed
@@ -708,6 +782,7 @@ def registered_epoch_sample_times(
         starts = np.zeros_like(lengths)
     times: Dict[int, List[np.ndarray]] = {}
     labels: Dict[int, List[np.ndarray]] = {}
+    anchors: Dict[int, float] = {}
     unusable: Dict[int, str] = {}
     for t0, (s_id, a_id, n, st) in enumerate(zip(src, ana, lengths, starts)):
         if n <= 0 or a_id <= 0:
@@ -719,18 +794,26 @@ def registered_epoch_sample_times(
         if lines is None or lines.size < st + n:
             unusable[int(a_id)] = f"trial {t0 + 1} lacks source line indices"
             continue
-        tt, lab = plan.lines_to_behavior_time(reg, int(s_id), np.asarray(lines)[st:st + n])
+        try:
+            tt, lab = plan.lines_to_behavior_time(reg, int(s_id), np.asarray(lines)[st:st + n])
+            if int(a_id) not in anchors:
+                anchors[int(a_id)] = plan.first_retained_cycle_start_behavior_s(reg, int(s_id), int(np.asarray(lines)[st]))
+        except ValueError as exc:
+            unusable[int(a_id)] = f"trial {t0 + 1}: {exc}"
+            continue
         times.setdefault(int(a_id), []).append(tt)
         labels.setdefault(int(a_id), []).append(lab)
     out_t = {k: np.concatenate(v) for k, v in times.items() if k not in unusable}
     out_l = {k: np.concatenate(v) for k, v in labels.items() if k not in unusable}
+    out_a = {k: v for k, v in anchors.items() if k in out_t}
     info = {
         "method": plan.method,
         "epochs_with_measured_times": sorted(out_t.keys()),
         "epochs_without_measured_times": {str(k): v for k, v in unusable.items()},
         "behavior_time_origin_harp_s": plan.behavior_time_origin_harp_s,
+        "epoch_anchor_cycle_start_sec": {str(k): float(v) for k, v in out_a.items()},
     }
-    return out_t, out_l, info
+    return out_t, out_l, info, out_a
 
 
 # ---------------------------------------------------------------------------
@@ -819,7 +902,8 @@ def resolve_cycle_registration(
         reg = cycle_registration if int(cycle_registration.dmd) == int(dmd) else None
         info["resolved"] = "provided" if reg is not None else f"provided registration is for DMD {cycle_registration.dmd}"
     else:
-        reg = cycle_registration.get(int(dmd))
+        mapping = {int(k): v for k, v in dict(cycle_registration).items()}
+        reg = mapping.get(int(dmd))
         info["resolved"] = "provided_mapping" if reg is not None else "no entry for this DMD"
     if reg is not None:
         info.update({
@@ -907,6 +991,8 @@ def source_epochs_from_raw_dat(dynamic_data_dir: PathLike, dmd: int, *, line_rat
             timing = read_dmd_acquisition_timing(dynamic_data_dir, dmd, prefix=prefix)
         except FileNotFoundError:
             continue
+        except ValueError as exc:
+            raise ValueError(f"{dynamic_data_dir} prefix {prefix!r} DMD{dmd}: {exc}") from exc
         lr = line_rate_hz
         if lr is None:
             meta = find_meta_file(dynamic_data_dir, dmd, prefix=prefix)
@@ -918,7 +1004,7 @@ def source_epochs_from_raw_dat(dynamic_data_dir: PathLike, dmd: int, *, line_rat
         out.append(SourceEpochCycles(
             epoch_index=i, n_cycles=int(timing.n_cycles), lines_per_cycle=int(timing.lines_per_cycle),
             line_rate_hz=float(lr), cycle_start_s=timing.cycle_start_s, n_source_gaps=int(timing.gap_indices.size),
-            source=f"raw_dat:{prefix}",
+            source=f"raw_dat:{prefix}", has_partial_trailing_cycle=bool(getattr(timing, "has_partial_trailing_cycle", False)),
         ))
     return out
 
@@ -976,10 +1062,36 @@ def run_cycle_registration(
             origin = float(np.asarray(df.index, dtype=float)[0])
             inputs["behavior_time_origin_source"] = f"{pkl} (first photodiode sample)"
     inputs["behavior_time_origin_harp_s"] = origin
+    record_start = float(rec.record_start_s)
+    if origin is not None and origin < record_start:
+        # The analog stream started earlier than the first digital-input message: the recording
+        # (and therefore any DI3-low lead) began at the analog start.
+        record_start = float(origin)
+        inputs["record_start_source"] = "analog_stream_start"
 
+    extra_limitations: List[str] = []
     if dynamic_data_dir is not None and Path(dynamic_data_dir).exists():
         src = source_epochs_from_raw_dat(dynamic_data_dir, dmd)
         inputs["source_epochs_source"] = f"raw_dat:{dynamic_data_dir}"
+        if summary is not None:
+            # Cross-check the summary's epoch structure against the raw acquisitions (R4).
+            try:
+                src_summary = source_epochs_from_summary(summary, dmd)
+            except Exception:
+                src_summary = []
+            if src_summary:
+                inputs["summary_epochs"] = [{"epochIdx": e.epoch_index, "nCycles": e.n_cycles, "linesPerCycle": e.lines_per_cycle} for e in src_summary]
+                if len(src_summary) != len(src):
+                    extra_limitations.append(
+                        f"Summary reports {len(src_summary)} source epoch(s) but raw dynamic_data holds {len(src)} acquisition(s); "
+                        "epoch pairing between summary and raw files is not established."
+                    )
+                else:
+                    for a, b in zip(src, src_summary):
+                        if abs(int(a.n_cycles) - int(b.n_cycles)) > 1:
+                            extra_limitations.append(
+                                f"Epoch {a.epoch_index}: raw .dat has {a.n_cycles} cycles but the summary reports {b.n_cycles}."
+                            )
     elif summary is not None:
         src = source_epochs_from_summary(summary, dmd)
         inputs["source_epochs_source"] = "summary_metadata"
@@ -987,10 +1099,14 @@ def run_cycle_registration(
         raise ValueError("Either dynamic_data_dir or a summary reader is required for source cycle counts")
 
     reg = register_di3_to_source_cycles(
-        rise_times_s=rec.rise_times_s, record_start_s=rec.record_start_s, record_end_s=rec.record_end_s,
+        rise_times_s=rec.rise_times_s, record_start_s=record_start, record_end_s=rec.record_end_s,
         source_epochs=src, dmd=dmd, session_id=getattr(asset, "session_id", None),
         inputs={**inputs, "harp_recording": rec.to_dict()}, **kwargs,
     )
+    if extra_limitations:
+        reg.limitations.extend(extra_limitations)
+        reg.status = STATUS_INCONSISTENT
+        reg.safe_for_physiology = False
     if save and getattr(asset, "qc_dir", None) is not None:
         save_cycle_registration(reg, asset.qc_dir)
     return reg

@@ -88,6 +88,9 @@ def read_dat_file_header(path: PathLike) -> DatFileHeader:
     size = os.path.getsize(path)
     with open(path, "rb") as f:
         head = np.frombuffer(f.read(4096), dtype="<u4")
+        if head.size >= 3 and int(head[2]) > 4096:
+            f.seek(0)
+            head = np.frombuffer(f.read(int(head[2]) + 16), dtype="<u4")
     if head.size < 4 or int(head[0]) != MAGIC_NUMBER:
         raise ValueError(f"{path}: not a SLAP2 data file (bad magic number)")
     version = int(head[1])
@@ -219,6 +222,7 @@ class DmdAcquisitionTiming:
     gap_indices: np.ndarray              # cycle index i where start[i+1]-start[i] > 1.5*median
     gap_durations_s: np.ndarray
     chunk_cycle_counts: List[int]
+    has_partial_trailing_cycle: bool = False   # last chunk's size is not a whole number of cycles
 
     @property
     def duration_s(self) -> float:
@@ -243,6 +247,7 @@ class DmdAcquisitionTiming:
             "gap_indices": self.gap_indices.astype(int).tolist(),
             "gap_durations_s": self.gap_durations_s.astype(float).tolist(),
             "chunk_cycle_counts": [int(x) for x in self.chunk_cycle_counts],
+            "has_partial_trailing_cycle": bool(self.has_partial_trailing_cycle),
         }
         if include_arrays:
             out["cycle_start_s"] = self.cycle_start_s.astype(float).tolist()
@@ -313,6 +318,7 @@ def read_dmd_acquisition_timing(
         gap_indices=np.asarray(gap_idx, dtype=int),
         gap_durations_s=np.asarray(gap_dur, dtype=float),
         chunk_cycle_counts=[int(h.numCycles) for h in headers],
+        has_partial_trailing_cycle=bool((headers[-1].fileSizeBytes - headers[-1].firstCycleOffsetBytes) % headers[-1].bytesPerCycle),
     )
 
 

@@ -9,6 +9,7 @@ fixed-length or ragged event tensors.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -396,8 +397,9 @@ def _plan_from_registration(
     cycle_registration: Any,
     *,
     trial_source_lines: Dict[int, np.ndarray],
-    source_trial_epoch: np.ndarray,
+    source_trial_epoch: Optional[np.ndarray],
     n_valid_trials: int,
+    n_trials: Optional[int] = None,
 ) -> Tuple[Optional[Any], Dict[str, Any]]:
     """Build a :class:`RegisteredSamplePlan` or explain why registration is not applied.
 
@@ -435,6 +437,15 @@ def _plan_from_registration(
             "measured timing requires all of them"
         )
         return None, info
+    n_reg_epochs = len(getattr(cycle_registration, "epochs", []))
+    if source_trial_epoch is None:
+        if n_reg_epochs > 1:
+            info["reason"] = (
+                f"registration has {n_reg_epochs} source epochs but the summary provides no per-trial source epoch labels"
+            )
+            return None, info
+        n_tr = int(n_trials) if n_trials is not None else (max(trial_source_lines) if trial_source_lines else 0)
+        source_trial_epoch = np.ones((n_tr,), dtype=int)
     plan = plan_registered_samples(
         cycle_registration,
         trial_source_lines=trial_source_lines,
@@ -443,10 +454,36 @@ def _plan_from_registration(
     )
     info.update({
         "leading_samples_by_source_epoch": {str(k): int(v) for k, v in plan.source_epoch_leading_samples.items()},
+        "leading_samples_by_trial": {str(k): int(v) for k, v in plan.trial_leading_samples.items()},
         "skipped_source_epochs": {str(k): v for k, v in plan.skipped_source_epochs.items()},
+        "dropped_placeholder_trials": {str(k): list(v) for k, v in plan.trials_without_lines.items()},
         "notes": list(plan.notes),
     })
+    if not plan.applied_source_epochs:
+        info["reason"] = "no source epoch could be planned: " + "; ".join(f"{k}: {v}" for k, v in plan.skipped_source_epochs.items())
+        return None, info
     return plan, info
+
+
+def _drop_placeholder_trials(source_trial_lengths: np.ndarray, plan: Any) -> np.ndarray:
+    """Zero the placeholder length of trials without source lines in applied epochs."""
+    out = np.asarray(source_trial_lengths, dtype=int).copy()
+    for trials in getattr(plan, "trials_without_lines", {}).values():
+        for t in trials:
+            if 1 <= int(t) <= out.size:
+                out[int(t) - 1] = 0
+    return out
+
+
+def warn_if_registration_not_applied(cycle_registration: Any, info: Dict[str, Any], *, context: str) -> None:
+    """Emit a warning when an identified registration ends up not applied (R12)."""
+    if cycle_registration is not None and getattr(cycle_registration, "identified", False) and not info.get("applied", False):
+        warnings.warn(
+            f"{context}: identified DI3 cycle registration was NOT applied ({info.get('reason', 'see cycle_registration metadata')}); "
+            "historical first-pulse anchoring used",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -611,9 +648,12 @@ def reconstruct_dmd_session_traces(
             registration_plan, registration_info = _plan_from_registration(
                 cycle_registration,
                 trial_source_lines=trial_source_lines,
-                source_trial_epoch=source_labels_for_plan,
+                source_trial_epoch=source_labels_for_plan if trial_epoch is not None else None,
                 n_valid_trials=len(valid_trial_data),
+                n_trials=n_trials,
             )
+            if registration_plan is not None:
+                source_trial_lengths = _drop_placeholder_trials(source_trial_lengths, registration_plan)
         reconciliation = reconcile_trial_epochs(
             source_trial_lengths,
             sample_rate_hz=float(im_rate_hz),
@@ -624,6 +664,9 @@ def reconstruct_dmd_session_traces(
             strict_epoch_match=strict_epoch_match,
             source_epoch_leading_samples=(
                 registration_plan.source_epoch_leading_samples if registration_plan is not None else None
+            ),
+            trial_leading_samples=(
+                registration_plan.trial_leading_samples if registration_plan is not None else None
             ),
         )
         trial_lengths = reconciliation.trial_lengths_samples
@@ -683,7 +726,7 @@ def reconstruct_dmd_session_traces(
         if registration_plan is not None and reconciliation is not None:
             from vip_slap2_analysis.common.cycle_registration import registered_epoch_sample_times
 
-            measured_times, measured_labels, timing_info = registered_epoch_sample_times(
+            measured_times, measured_labels, timing_info, measured_anchors = registered_epoch_sample_times(
                 cycle_registration,
                 registration_plan,
                 trial_source_lines=trial_source_lines,
@@ -703,6 +746,7 @@ def reconstruct_dmd_session_traces(
             strict_epoch_match=strict_epoch_match,
             epoch_sample_times_sec=measured_times or None,
             epoch_sample_time_labels=measured_labels or None,
+            epoch_anchor_sec=measured_anchors if measured_times else None,
         )
         timebase_sec = epoch_tb.timebase_sec
         trial_starts_sec = epoch_tb.trial_starts_sec
@@ -710,6 +754,7 @@ def reconstruct_dmd_session_traces(
         sample_epoch = epoch_tb.sample_epoch
         sample_time_label = epoch_tb.sample_time_label
         metadata["cycle_registration"] = registration_info
+        warn_if_registration_not_applied(cycle_registration, registration_info, context=f"DMD{dmd} glutamate reconstruction")
         if reconciliation is not None:
             metadata["epoch_qc"] = reconciliation.metadata
             metadata["source_trial_epoch"] = reconciliation.source_trial_epoch.astype(int).tolist()
