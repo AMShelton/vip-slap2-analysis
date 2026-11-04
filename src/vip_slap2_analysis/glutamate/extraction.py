@@ -36,6 +36,7 @@ from vip_slap2_analysis.common.alignment import (
     filter_intervals_to_epochs,
     filter_ordered_images_to_epochs,
     load_corrected_bonsai_csv,
+    resolve_corrected_event_log,
     load_imaging_epochs_csv,
     reconstruct_dmd_session_traces,
     summarize_event_tensor,
@@ -280,7 +281,7 @@ def process_glutamate_extraction(
             "qc_json": str(qc_json),
         }
 
-    stim_df = load_corrected_bonsai_csv(asset.bonsai_event_log_csv)
+    stim_df = load_corrected_bonsai_csv(resolve_corrected_event_log(asset))
     epoch_df = load_imaging_epochs_csv(
         Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv",
         min_duration_sec=min_epoch_duration_sec,
@@ -327,7 +328,7 @@ def process_glutamate_extraction(
         "summary_path": summary_provenance.get("selected_path"),
         "cycle_registration": registration_info,
         "require_identified_cycle_alignment": bool(require_identified_cycle_alignment),
-        "bonsai_event_log_csv": str(asset.bonsai_event_log_csv),
+        "bonsai_event_log_csv": str(resolve_corrected_event_log(asset)),
         "im_rate_hz": float(im_rate_hz),
         "windows_sec": {
             "image": tuple(float(x) for x in windows.image),
@@ -372,7 +373,7 @@ def process_glutamate_extraction(
         "summary_format": summary_provenance.get("selected_format"),
         "cycle_registration": registration_info,
         "require_identified_cycle_alignment": bool(require_identified_cycle_alignment),
-        "bonsai_event_log_csv": str(asset.bonsai_event_log_csv),
+        "bonsai_event_log_csv": str(resolve_corrected_event_log(asset)),
         "use_synapse_qc": bool(use_synapse_qc),
         "trace_signal": str(trace_signal),
         "trace_mode": None if trace_mode is None else str(trace_mode),

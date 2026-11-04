@@ -42,6 +42,7 @@ from vip_slap2_analysis.common.alignment import (
     filter_intervals_to_epochs,
     filter_ordered_images_to_epochs,
     load_corrected_bonsai_csv,
+    resolve_corrected_event_log,
     load_imaging_epochs_csv,
     summarize_event_tensor,
     tolerant_summary_ragged,
@@ -798,7 +799,7 @@ def process_calcium_extraction(
             "meta_json": str(meta_json),
         }
 
-    stim_df = load_corrected_bonsai_csv(asset.bonsai_event_log_csv)
+    stim_df = load_corrected_bonsai_csv(resolve_corrected_event_log(asset))
     epoch_df = load_imaging_epochs_csv(
         Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv",
         min_duration_sec=min_epoch_duration_sec,
@@ -851,7 +852,7 @@ def process_calcium_extraction(
         "summary_format": summary_provenance["selected_format"],
         "cycle_registration": registration_info,
         "require_identified_cycle_alignment": bool(require_identified_cycle_alignment),
-        "bonsai_event_log_csv": str(asset.bonsai_event_log_csv),
+        "bonsai_event_log_csv": str(resolve_corrected_event_log(asset)),
         "indicator2": indicator2,
         "im_rate_hz": float(im_rate_hz),
         "windows_sec": {

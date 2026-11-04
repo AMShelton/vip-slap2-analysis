@@ -104,6 +104,26 @@ def load_corrected_bonsai_csv(path: Union[str, Path]) -> pd.DataFrame:
     return df
 
 
+def resolve_corrected_event_log(asset: Any) -> Path:
+    """Return the HARP-corrected Bonsai event log for a session asset.
+
+    ``behavior.preprocess.process_behavior_session(save_corrected_in_place=False)``
+    writes ``qc/behavior/bonsai_event_log_corrected.csv`` and leaves the raw log
+    untouched; with ``True`` (historical default) the raw ``bonsai_event_log.csv``
+    is overwritten with the corrected columns. This resolver prefers the
+    side-car file when it exists so extraction works with either setting.
+    """
+    qc_dir = getattr(asset, "qc_dir", None)
+    if qc_dir is not None:
+        side = Path(qc_dir) / "behavior" / "bonsai_event_log_corrected.csv"
+        if side.exists():
+            return side
+    raw = getattr(asset, "bonsai_event_log_csv", None)
+    if raw is None:
+        raise FileNotFoundError("asset.bonsai_event_log_csv is missing and no qc/behavior/bonsai_event_log_corrected.csv exists")
+    return Path(raw)
+
+
 def load_imaging_epochs_csv(
     path: Union[str, Path],
     *,
