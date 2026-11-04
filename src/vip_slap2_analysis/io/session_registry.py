@@ -23,6 +23,7 @@ from typing import Iterable, Optional, Sequence
 import pandas as pd
 
 from vip_slap2_analysis.common.session import SessionAssets
+from vip_slap2_analysis.io.summary_formats import FORMAT_GIANT, FORMAT_VOLTEX, classify_summary_candidates
 
 
 VOLTAGE_SUMMARY_RE = re.compile(
@@ -258,6 +259,9 @@ def _build_modality_assets(
     voltex_trial_table_h5: Optional[Path] = None,
     dynamic_data_dir: Optional[Path] = None,
     summary_preference: str = SUMMARY_PREFERENCE_DEFAULT,
+    giant_candidates: Optional[Sequence[Path]] = None,
+    voltex_candidates: Optional[Sequence[Path]] = None,
+    unclassified_h5: Optional[Sequence[Path]] = None,
 ) -> dict[str, dict[str, Optional[object]]]:
     """Build generic modality asset mappings for a session.
 
@@ -285,6 +289,7 @@ def _build_modality_assets(
             modality_assets[key] = {
                 "summary_mat": summary_mat,
                 "summary_h5": giant_summary_h5,
+                "summary_h5_candidates": [str(p) for p in (giant_candidates or [])],
                 "trial_table_h5": giant_trial_table_h5,
                 "extraction_dir": extraction_dir,
                 **selection,
@@ -308,6 +313,7 @@ def _build_modality_assets(
             "summary_mat": voltage_summary_mat,
             "trace_h5": voltage_trace_h5,
             "summary_h5": voltex_summary_h5,
+            "summary_h5_candidates": [str(p) for p in (voltex_candidates or [])],
             "trial_table_h5": voltex_trial_table_h5,
             "extraction_dir": extraction_dir,
             **selection,
@@ -317,6 +323,9 @@ def _build_modality_assets(
         modality_assets.setdefault("slap2", {})
         modality_assets["slap2"]["dynamic_data_dir"] = dynamic_data_dir
         modality_assets["slap2"]["meta_files"] = sorted(dynamic_data_dir.glob("*.meta"))
+    if unclassified_h5:
+        modality_assets.setdefault("slap2", {})
+        modality_assets["slap2"]["unclassified_summary_h5"] = [str(p) for p in unclassified_h5]
 
     return modality_assets
 
@@ -524,14 +533,23 @@ class VIPSessionRegistry:
         )
         voltage_trace_h5 = _find_voltage_trace_h5(session_dir, voltage_summary_mat)
 
-        giant_summary_h5 = _find_one(
-            session_dir,
-            "experiment_summary.h5",
-            preferred_parts=PREFERRED_GIANT_PARTS,
+        # Modern HDF5 products are classified by *content*, not file name: the voltage
+        # extractor is often run with its output named experiment_summary.h5 under a
+        # Voltage/ folder, which must not be mistaken for a GIAnT glutamate summary.
+        h5_candidates = (
+            _find_matches(session_dir, "experiment_summary.h5")
+            + _find_matches(session_dir, "VoltageSummary.h5")
+            + _find_matches(session_dir, "voltage_summary.h5")
         )
-        voltex_summary_h5 = _find_one(session_dir, "VoltageSummary.h5", preferred_parts=PREFERRED_VOLTEX_PARTS)
-        if voltex_summary_h5 is None:
-            voltex_summary_h5 = _find_one(session_dir, "voltage_summary.h5", preferred_parts=PREFERRED_VOLTEX_PARTS)
+        classified = classify_summary_candidates(h5_candidates)
+        giant_candidates = classified.get(FORMAT_GIANT, [])
+        voltex_candidates = classified.get(FORMAT_VOLTEX, [])
+        giant_summary_h5 = (
+            max(giant_candidates, key=lambda p: _rank_path(p, PREFERRED_GIANT_PARTS)) if giant_candidates else None
+        )
+        voltex_summary_h5 = (
+            max(voltex_candidates, key=lambda p: _rank_path(p, PREFERRED_VOLTEX_PARTS)) if voltex_candidates else None
+        )
         dynamic_data_dir = _find_dynamic_data_dir(session_dir)
 
         bonsai_csv = _find_one(session_dir, "bonsai_event_log*.csv")
@@ -568,6 +586,9 @@ class VIPSessionRegistry:
                 voltex_trial_table_h5=_find_trial_table_for(voltex_summary_h5),
                 dynamic_data_dir=dynamic_data_dir,
                 summary_preference=summary_preference,
+                giant_candidates=giant_candidates,
+                voltex_candidates=voltex_candidates,
+                unclassified_h5=[p for k, v in classified.items() if k not in (FORMAT_GIANT, FORMAT_VOLTEX) for p in v],
             ),
             metadata=row.to_dict(),
         )

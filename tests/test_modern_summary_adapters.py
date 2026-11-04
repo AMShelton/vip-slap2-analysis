@@ -142,15 +142,30 @@ def test_summary_loader_falls_back_when_modern_is_incompatible(tmp_path):
     (sd / "behavior").mkdir()
     reg = _registry_for(sd)
     a = reg.resolve_assets(sd.name)
-    assert a.get_asset("glutamate", "summary_format") == "giant_experiment_summary_h5"
-    with pytest.raises(FileNotFoundError) as exc:
-        load_glutamate_summary(a)  # incompatible modern and no legacy -> explicit failure with attempts
-    assert "schema" in str(exc.value) or "attempts" in str(exc.value)
-    # with a valid Voltex file the voltage loader selects it and records provenance
+    # an HDF5 file that is neither GIAnT nor Voltex is reported, not assigned to a modality
+    assert a.get_asset("glutamate", "summary_format") is None
+    assert a.get_asset("slap2", "unclassified_summary_h5") and "experiment_summary.h5" in a.get_asset("slap2", "unclassified_summary_h5")[0]
+    with pytest.raises(FileNotFoundError):
+        load_glutamate_summary(a)  # nothing loadable -> explicit failure
+    # a Voltex-format file *named* experiment_summary.h5 under Voltage/ is classified by content
     (sd / "processed" / "Voltage").mkdir()
-    write_voltex_summary(sd / "processed" / "Voltage" / "VoltageSummary.h5", trial_lines=[50], trial_epoch=[1], n_rois=1)
+    write_voltex_summary(sd / "processed" / "Voltage" / "experiment_summary.h5", trial_lines=[50], trial_epoch=[1], n_rois=1)
     a = reg.resolve_assets(sd.name)
+    assert a.get_asset("glutamate", "summary_h5") is None
+    assert str(a.get_asset("voltage", "summary_h5")).endswith("Voltage/experiment_summary.h5") or str(a.get_asset("voltage", "summary_h5")).endswith("Voltage\\experiment_summary.h5")
     vs, prov = load_voltage_summary(a)
     assert prov["selected_format"] == "voltex_voltage_summary_h5" and prov["attempts"][0]["schema_compatible"]
     assert vs.summary_format == "voltex_voltage_summary_h5"
     vs.close()
+    # a schema-incompatible GIAnT-like file falls through to the legacy MAT with the reason recorded
+    import h5py
+    bad = sd / "processed" / "source_extraction" / "SILo"; bad.mkdir()
+    with h5py.File(bad / "experiment_summary.h5", "w") as f:
+        f.create_dataset("row_major", data=np.array([[0]], dtype=np.uint8))
+        f.create_group("params")
+        f.create_dataset("Path1/sources/temporal/dF_ls", data=np.zeros((3, 1, 2)))  # missing frame_info -> incompatible
+    a = reg.resolve_assets(sd.name)
+    assert a.get_asset("glutamate", "summary_format") == "giant_experiment_summary_h5"
+    with pytest.raises(FileNotFoundError) as exc:
+        load_glutamate_summary(a)  # incompatible modern, no legacy
+    assert "attempts" in str(exc.value) and "missing" in str(exc.value)
