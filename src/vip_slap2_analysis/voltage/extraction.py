@@ -1795,6 +1795,7 @@ def process_voltage_extraction(
     summary_preference: Optional[str] = None,
     voltex_trace_kind: str = "raw_f",
     apply_motion_censor: bool = False,
+    output_subdir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Extract voltage image/change/omission packages for one session asset.
 
@@ -1822,6 +1823,10 @@ def process_voltage_extraction(
         when a modern summary is selected. ``raw_f`` keeps the historical
         behavior of computing dF/F here; ``apply_motion_censor`` treats Voltex's
         ``motion_censor`` samples like discard frames.
+    output_subdir
+        Optional sub-folder under ``analysis/derived/voltage`` and
+        ``analysis/qc/voltage`` (e.g. ``"sync_compare/legacy"``) so comparison runs
+        never overwrite the session's standard products.
     metadata
         Optional caller metadata.  ``metadata['prepost_sec']`` can override event
         windows with keys ``image``/``image_identity``, ``change``, and
@@ -1900,6 +1905,11 @@ def process_voltage_extraction(
 
     voltage_dir = _modality_dir(asset, "derived", "voltage")
     voltage_qc_dir = _modality_dir(asset, "qc", "voltage")
+    if output_subdir:
+        voltage_dir = voltage_dir / str(output_subdir)
+        voltage_qc_dir = voltage_qc_dir / str(output_subdir)
+        voltage_dir.mkdir(parents=True, exist_ok=True)
+        voltage_qc_dir.mkdir(parents=True, exist_ok=True)
 
     # Resolve output names early so skipped runs are cheap.
     suffix = _trace_suffix(trace_signal, trace_mode)
