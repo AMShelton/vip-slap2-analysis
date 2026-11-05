@@ -49,6 +49,73 @@ def _event_snr(summary: dict, t: np.ndarray, *, pre_end: float = -0.05, resp: tu
     return float(np.nanmax(np.abs(win - np.nanmean(base))) / sd) if sd > 0 else float("nan")
 
 
+def per_epoch_comparison(asset, runs, dmds, out: Path, session: str, trace_signal: str) -> dict:
+    """Image-locked population averages per acquisition epoch, historical vs registered.
+
+    Events are assigned to behavior epochs by onset time (``qc/behavior/imaging_epochs.csv``);
+    population means are accumulated per event from the single-trial H5 so memory stays flat.
+    """
+    import h5py
+    import pandas as pd
+    from vip_slap2_analysis.common.epoch_alignment import load_epoch_dataframe_from_asset
+
+    epochs = load_epoch_dataframe_from_asset(asset)
+    starts = epochs["start_time"].to_numpy(float); ends = epochs["end_time"].to_numpy(float)
+    ids = epochs["epoch_index"].to_numpy(int)
+    report = {}
+    for dmd in dmds:
+        key = f"DMD{dmd}"
+        acc = {}
+        t_img = None
+        for name in ("legacy", "registered"):
+            path = runs[name].get("single_h5")
+            if not path or not Path(path).exists():
+                continue
+            with h5py.File(path, "r") as f:
+                if key not in f or "image_identity" not in f[key]:
+                    continue
+                t_img = np.asarray(f["timebase_sec/image"][()], dtype=float)
+                grp = f[key]["image_identity"]
+                for img in grp.keys():
+                    g = grp[img]
+                    if "traces" not in g or "onsets_sec" not in g:
+                        continue
+                    onsets = np.asarray(g["onsets_sec"][()], dtype=float)
+                    ds = g["traces"]
+                    for i0 in range(0, onsets.size, 64):
+                        block = np.asarray(ds[i0:i0 + 64], dtype=float)        # (events, rois, time)
+                        pop = np.nanmean(block, axis=1)                          # (events, time)
+                        for j, on in enumerate(onsets[i0:i0 + 64]):
+                            hit = np.flatnonzero((on >= starts) & (on <= ends))
+                            ep = int(ids[hit[0]]) if hit.size else 0
+                            d = acc.setdefault((name, ep), {"sum": np.zeros(pop.shape[1]), "n": 0})
+                            d["sum"] += np.nan_to_num(pop[j]); d["n"] += 1
+        if t_img is None:
+            continue
+        ep_ids = sorted({ep for (_, ep) in acc.keys() if ep > 0})
+        if not ep_ids:
+            continue
+        fig, axes = plt.subplots(1, len(ep_ids), figsize=(3.2 * len(ep_ids), 3.4), sharey=True, squeeze=False)
+        rep = {}
+        for ax, ep in zip(axes[0], ep_ids):
+            r = {}
+            for name, color in (("legacy", "0.5"), ("registered", "tab:blue")):
+                d = acc.get((name, ep))
+                if not d or d["n"] == 0:
+                    continue
+                m = d["sum"] / d["n"]; n = min(m.size, t_img.size)
+                ax.plot(t_img[:n], m[:n], color=color, lw=1.0, label=f"{name} (n={d['n']})")
+                r[f"{name}_snr"] = _event_snr({"mean": m[None, :]}, t_img); r[f"{name}_n"] = int(d["n"])
+            ax.axvline(0, color="k", ls="--", lw=0.8); ax.set_title(f"epoch {ep}", fontsize=10); ax.set_xlabel("time from image onset (s)")
+            ax.legend(fontsize=7)
+            rep[str(ep)] = r
+        axes[0][0].set_ylabel(trace_signal)
+        fig.suptitle(f"{session} {key}: image-locked population mean per acquisition epoch (historical grey, registered blue)", fontsize=10)
+        fig.tight_layout(); fig.savefig(out / f"{session}_{key}_before_after_per_epoch.png", dpi=150); plt.close(fig)
+        report[key] = rep
+    return report
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--summary-xlsx", required=True)
@@ -57,6 +124,9 @@ def main(argv=None) -> int:
     ap.add_argument("--trace-signal", default="dff_robust_f0")
     ap.add_argument("--dmd", type=int, nargs="*", default=[1, 2])
     ap.add_argument("--max-roi-plot", type=int, default=12)
+    ap.add_argument("--per-epoch", action="store_true",
+                    help="also write single-trial H5s and compare image-locked averages epoch by epoch "
+                         "(the registration differs from the historical anchoring only in epochs with a nonzero offset)")
     a = ap.parse_args(argv)
 
     reg = VIPSessionRegistry.from_excel(a.summary_xlsx)
@@ -66,7 +136,7 @@ def main(argv=None) -> int:
     for name, cr, require in (("legacy", None, False), ("registered", "auto", True)):
         print(f"[{name}] extracting ...", flush=True)
         runs[name] = process_voltage_extraction(
-            asset, trace_signal=a.trace_signal, overwrite=True, write_single_trials=False, write_sequence=False,
+            asset, trace_signal=a.trace_signal, overwrite=True, write_single_trials=bool(a.per_epoch), write_sequence=False,
             write_session_traces=False, use_roi_qc=False, cycle_registration=cr,
             require_identified_cycle_alignment=require, output_subdir=f"sync_compare/{name}",
         )
@@ -108,6 +178,8 @@ def main(argv=None) -> int:
         fig.suptitle(f"{a.session} {key}: population mean, historical vs DI3-registered timebase", fontsize=10)
         fig.tight_layout(); fig.savefig(out / f"{a.session}_{key}_before_after.png", dpi=150); plt.close(fig)
         report["per_dmd"][key] = rep
+    if a.per_epoch:
+        report["per_epoch"] = per_epoch_comparison(asset, runs, a.dmd, out, a.session, a.trace_signal)
     report["registered_qc_json"] = runs["registered"]["qc_json"]; report["legacy_qc_json"] = runs["legacy"]["qc_json"]
     (out / f"{a.session}_before_after.json").write_text(json.dumps(report, indent=2, default=str))
     print(json.dumps(report["per_dmd"], indent=1))
