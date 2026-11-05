@@ -135,7 +135,9 @@ def build(summary_xlsx: Path, manifest: Path, registration_csv: Path | None, *, 
                 status = h.get("status")
                 row.update({f"reg_{k}": v for k, v in h.items() if k not in ("session_id",)})
         if status is None:
-            if registrable:
+            if r is None:
+                row["sync_classification"] = "not_in_vast_manifest (session newer than directory_manifest.tsv; re-run the inventory)"
+            elif registrable:
                 row["sync_classification"] = "pending_registration (raw DI3 + .dat headers present; run scripts/run_cycle_registration.py)"
             elif summary_metadata_fallback:
                 row["sync_classification"] = "pending_registration_summary_metadata_only (no raw .dat headers; cycle count from summary)"
