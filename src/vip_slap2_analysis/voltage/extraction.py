@@ -2140,12 +2140,13 @@ def process_voltage_extraction(
                 if bundle.traces.size == 0:
                     qc["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no valid traces"}
                     continue
-                if require_identified_cycle_alignment and not (
-                    (getattr(bundle, "metadata", {}) or {}).get("cycle_registration", {}).get("applied", False)
+                _creg = (getattr(bundle, "metadata", {}) or {}).get("cycle_registration", {})
+                if require_identified_cycle_alignment and (
+                    not _creg.get("applied", False) or _creg.get("epochs_without_measured_times")
                 ):
                     raise RuntimeError(
-                        f"{asset.session_id} DMD{dmd}: identified cycle registration could not be applied: "
-                        f"{(bundle.metadata or {}).get('cycle_registration', {}).get('reason', 'unknown reason')}"
+                        f"{asset.session_id} DMD{dmd}: identified cycle registration could not be applied to every epoch: "
+                        f"{_creg.get('reason') or _creg.get('epochs_without_measured_times') or 'unknown reason'}"
                     )
 
                 bundle, transform_meta, transform_payload = _transform_voltage_bundle(

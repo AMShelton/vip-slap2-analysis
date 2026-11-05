@@ -963,15 +963,38 @@ def plan_registered_samples(
             without_lines[sid] = missing_lines
             notes.append(f"Source epoch {sid}: trials {missing_lines} have no source lines and are dropped (no data).")
         n_lead = 0
+        prev_last_line: Optional[int] = None
+        n_dup_total = 0
         for t in with_lines:
-            cyc = (np.asarray(trial_source_lines[t], dtype=np.int64) - 1) // lpc
+            lines_t = np.asarray(trial_source_lines[t], dtype=np.int64)
+            if lines_t.size > 1 and np.any(np.diff(lines_t) <= 0):
+                skipped[sid] = f"trial {t}: source line indices are not strictly increasing within the trial"
+                break
+            cyc = (lines_t - 1) // lpc
             n_t = int(np.sum(cyc < k0))
+            # Legacy (half-open) trial tables repeat the previous trial's last line as the first line of
+            # the next trial. Those samples are duplicates of data already placed; skip them so every
+            # source line appears once (this is the "duplicated boundary sample" defect, fixed at the
+            # source in SLAP2-Voltage-Extraction 2026-09-03 but present in older products).
+            if prev_last_line is not None:
+                n_dup = int(np.sum(lines_t <= prev_last_line))
+                if n_dup:
+                    n_t = max(n_t, n_dup)
+                    n_dup_total += n_dup
             per_trial[t] = n_t
             n_lead += n_t
-        leading[sid] = n_lead
-        applied.append(sid)
-        if k0 > 0:
-            notes.append(f"Source epoch {sid}: skipping {n_lead} leading samples (first {k0} cycles have no HARP coverage).")
+            prev_last_line = int(lines_t[-1])
+        else:
+            if n_dup_total:
+                notes.append(f"Source epoch {sid}: {n_dup_total} duplicated trial-boundary sample(s) skipped "
+                             "(legacy half-open trial line ranges).")
+            leading[sid] = n_lead
+            applied.append(sid)
+            if k0 > 0:
+                notes.append(f"Source epoch {sid}: skipping {n_lead} leading samples (first {k0} cycles have no HARP coverage).")
+            continue
+        # for/else: loop broke on a bad trial -> epoch skipped (already recorded)
+        continue
     return RegisteredSamplePlan(
         source_epoch_leading_samples=leading,
         applied_source_epochs=applied,

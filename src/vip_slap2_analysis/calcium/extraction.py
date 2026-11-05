@@ -985,8 +985,9 @@ def process_calcium_extraction(
             min_epoch_duration_sec=min_epoch_duration_sec,
             cycle_registration=registrations.get(dmd),
         )
-        if require_identified_cycle_alignment and bundle.get("traces") is not None and np.asarray(bundle["traces"]).size and not (
-            (bundle.get("epoch_metadata") or {}).get("cycle_registration", {}).get("applied", False)
+        _creg = (bundle.get("epoch_metadata") or {}).get("cycle_registration", {})
+        if require_identified_cycle_alignment and bundle.get("traces") is not None and np.asarray(bundle["traces"]).size and (
+            not _creg.get("applied", False) or _creg.get("epochs_without_measured_times")
         ):
             raise RuntimeError(
                 f"{asset.session_id} DMD{dmd}: identified cycle registration could not be applied to calcium: "

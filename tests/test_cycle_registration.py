@@ -298,3 +298,20 @@ def test_transfer_registration_to_second_dmd_via_shared_fpga():
     np.testing.assert_allclose(times, truth2, atol=5e-6)
     assert np.all(labels[k2:] == 0) and np.all(labels[:k2] == 1)
     assert e.timing_source == "transferred_from_dmd1_shared_fpga"
+
+
+def test_legacy_half_open_trial_boundaries_duplicate_sample_is_skipped():
+    """extractDendrites (pre 2026-09-03) trial tables repeat the previous trial's last line."""
+    truth = _truth()
+    reg = _reg(truth, truth[0] - 5, truth[-1] + 5, inputs={"behavior_time_origin_harp_s": 900.0})
+    L = N * LPC
+    edges = np.linspace(1, L + 1, 4).astype(int)            # half-open: last(i) == first(i+1)
+    lines = {1: np.arange(edges[0], edges[1] + 1), 2: np.arange(edges[1], edges[2] + 1), 3: np.arange(edges[2], min(edges[3], L) + 1)}
+    plan = plan_registered_samples(reg, trial_source_lines=lines, trial_source_epoch=[1, 1, 1], behavior_time_origin_harp_s=900.0)
+    assert plan.trial_leading_samples == {1: 0, 2: 1, 3: 1}
+    assert any("duplicated trial-boundary" in n for n in plan.notes)
+    lengths = [lines[t].size - plan.trial_leading_samples[t] for t in (1, 2, 3)]
+    times, labels, info, anchors = registered_epoch_sample_times(
+        reg, plan, trial_source_lines=lines, source_trial_epoch=[1, 1, 1], analysis_trial_epoch=[1, 1, 1],
+        trial_lengths_samples=lengths, trial_source_start_samples=[0, 1, 1])
+    assert np.all(np.diff(times[1]) > 0) and times[1].size == min(L, edges[3]) - 0
