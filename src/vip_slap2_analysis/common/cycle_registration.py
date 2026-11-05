@@ -848,8 +848,15 @@ def source_lines_to_harp_time(
     lpc = int(lines_per_cycle)
     cyc = (lines - 1) // lpc
     within = (lines - 1) % lpc
-    if np.any(cyc < 0) or np.any(cyc >= cyc_t.size):
+    N = int(cyc_t.size)
+    if np.any(cyc < 0) or np.any(cyc > N):
         raise ValueError("source line indices fall outside the registered cycle range")
+    if np.any(cyc == N):
+        # Legacy half-open trial tables end the last trial at nLinesTot + 1, one line past the
+        # acquisition. Extrapolate that single cycle at the observed cadence and label it as tail
+        # extrapolation (2) so it stays visible in sample_time_label.
+        cyc_t = np.r_[cyc_t, cyc_t[-1] + float(epoch_reg.observed_cycle_period_s)]
+        cyc_label = np.r_[cyc_label, np.int8(2)]
     ratio = epoch_reg.rate_ratio_harp_over_source if np.isfinite(epoch_reg.rate_ratio_harp_over_source) else 1.0
     line_period_harp = ratio / float(line_rate_hz)
     return cyc_t[cyc] + within * line_period_harp, cyc_label[cyc]

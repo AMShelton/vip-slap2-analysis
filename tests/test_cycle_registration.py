@@ -315,3 +315,14 @@ def test_legacy_half_open_trial_boundaries_duplicate_sample_is_skipped():
         reg, plan, trial_source_lines=lines, source_trial_epoch=[1, 1, 1], analysis_trial_epoch=[1, 1, 1],
         trial_lengths_samples=lengths, trial_source_start_samples=[0, 1, 1])
     assert np.all(np.diff(times[1]) > 0) and times[1].size == min(L, edges[3]) - 0
+
+
+def test_one_line_past_acquisition_end_is_extrapolated_not_refused():
+    truth = _truth()
+    reg = _reg(truth, truth[0] - 5, truth[-1] + 5)
+    e = reg.epochs[0]
+    L = N * LPC
+    t, lab = source_lines_to_harp_time(np.array([L - 1, L, L + 1]), e, lines_per_cycle=LPC, line_rate_hz=LINE_RATE)
+    assert lab.tolist() == [0, 0, 2] and t[2] > t[1] > t[0]
+    with pytest.raises(ValueError):
+        source_lines_to_harp_time(np.array([L + LPC + 1]), e, lines_per_cycle=LPC, line_rate_hz=LINE_RATE)
