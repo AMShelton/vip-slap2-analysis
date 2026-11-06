@@ -65,6 +65,26 @@ Reproduced on the reference pulses (`scripts/make_sync_qc_figures.py`,
 remove last 160 → `k = 0` (head anchor); remove both → 311 candidates, `ambiguous`;
 internal dropped pulses are counted, not mistaken for an offset.
 
+### Cross-acquisition check through the shared FPGA counter
+
+Every acquisition's `.dat` header stores `referenceTimestamp`, the FPGA tick at its start,
+and the line headers carry ticks on the same counter. If the counter runs continuously for
+the SLAP2 session, the *absolute* FPGA time of every cycle of every acquisition is known,
+and all acquisitions share one affine relation HARP = a·FPGA + b. `common/fpga_cross_epoch.py`
+uses this as timing evidence independent of pulse *counting*:
+
+* leave-one-out: fit the map on the pulses of the other identified acquisitions, predict the
+  HARP time of this acquisition's cycle `k`, compare with its first observed pulse. A wrong
+  count is off by a whole period (9–22 ms) against a fit residual of tens of µs, so the test is
+  decisive; `all_identified_offsets_confirmed` is only `True` when the single fit also holds
+  across acquisitions (`fpga_counter_continuous`).
+* for `inconsistent`/`ambiguous` acquisitions in the same session, the fit says where the
+  cycles without pulses fall (before the first pulse, inside the train, after the last pulse).
+
+Single-acquisition sessions have nothing to fit against; the check does not help them.
+`scripts/check_fpga_cross_epoch.py` writes `qc/sync/fpga_cross_epoch_DMD<n>.json` per session
+and a cohort CSV.
+
 ## 4. Implementation
 
 * `common/cycle_registration.py` — `register_di3_to_source_cycles` → `CycleRegistration`
@@ -134,7 +154,10 @@ internal dropped pulses are counted, not mistaken for an offset.
    `ambiguous`/`inconsistent` sessions are skipped and listed; identified ones are re-extracted
    with the registered timebase. Re-running with `cycle_registration=None` reproduces the
    historical products for before/after comparison.
-4. `python scripts/build_sync_status_table.py … --registration-csv <status.csv>` for the
+4. `python scripts/check_fpga_cross_epoch.py --summary-xlsx … --indicator ASAP7y ASAP8 --out <fpga.csv>`
+   for every multi-acquisition session: a corrected offset counts as *independently confirmed*
+   only when `all_identified_offsets_confirmed` is `True` here.
+5. `python scripts/build_sync_status_table.py … --registration-csv <status.csv>` for the
    session-level classification (corrected / verified_no_offset / identified_with_assumptions /
    unresolved / pending / not_registrable).
 

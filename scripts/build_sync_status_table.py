@@ -19,7 +19,8 @@ registration not yet run) or ``not_registrable`` (raw HARP or .dat headers
 missing), with the evidence columns next to it.
 
     python scripts/build_sync_status_table.py --summary-xlsx <VIP_SD_summary.xlsx> \
-        --manifest <directory_manifest.tsv> [--registration-csv <sync_status.csv>] --out <table.csv>
+        --manifest <directory_manifest.tsv> [--registration-csv <sync_status.csv>] \
+        [--fpga-check-csv <fpga_cross_epoch.csv>] --out <table.csv>
 """
 from __future__ import annotations
 
@@ -88,13 +89,17 @@ def expected_start_order(date: pd.Timestamp) -> str:
     return "harp_first_with_gray_buffer_expected"
 
 
-def build(summary_xlsx: Path, manifest: Path, registration_csv: Path | None, *, include_glutamate: bool) -> pd.DataFrame:
+def build(summary_xlsx: Path, manifest: Path, registration_csv: Path | None, *, include_glutamate: bool,
+          fpga_check_csv: Path | None = None) -> pd.DataFrame:
     sessions = pd.read_excel(summary_xlsx, sheet_name="sessions")
     sessions["session_date"] = pd.to_datetime(sessions["session_date"], errors="coerce")
     inv = manifest_inventory(manifest)
     reg = None
     if registration_csv is not None and Path(registration_csv).exists():
         reg = pd.read_csv(registration_csv)
+    fpga = None
+    if fpga_check_csv is not None and Path(fpga_check_csv).exists():
+        fpga = pd.read_csv(fpga_check_csv)
     rows = []
     for _, s in sessions.iterrows():
         sid = str(s["session_id"])
@@ -154,6 +159,28 @@ def build(summary_xlsx: Path, manifest: Path, registration_csv: Path | None, *, 
                 row["sync_classification"] = f"unresolved ({status}: {h.get('limitations', '')})"
             else:
                 row["sync_classification"] = f"error ({h.get('limitations', '')})"
+        # independent confirmation through the shared FPGA counter (multi-acquisition sessions only)
+        row["fpga_cross_epoch_check"] = "not_run"
+        if fpga is not None:
+            fh = fpga[fpga["session_id"].astype(str) == sid]
+            if len(fh):
+                f = fh.iloc[0].to_dict()
+                res = f.get("result")
+                if res == "checked":
+                    conf = f.get("all_identified_offsets_confirmed")
+                    cont = f.get("fpga_counter_continuous")
+                    if str(conf) == "True":
+                        row["fpga_cross_epoch_check"] = "confirmed (counted offsets reproduced from the other acquisitions' FPGA timing)"
+                    elif str(conf) == "False":
+                        row["fpga_cross_epoch_check"] = "CONTRADICTED or counter discontinuous; review"
+                    else:
+                        row["fpga_cross_epoch_check"] = f"inconclusive (continuous={cont})"
+                    row["fpga_cross_epoch_residual_rms_us"] = f.get("global_residual_rms_us")
+                    row["fpga_cross_epoch_limitations"] = f.get("limitations")
+                else:
+                    row["fpga_cross_epoch_check"] = str(res)
+                if "corrected" in str(row.get("sync_classification", "")) and str(f.get("all_identified_offsets_confirmed")) == "True":
+                    row["sync_classification"] = row["sync_classification"].replace("corrected (", "corrected+confirmed (")
         rows.append(row)
     return pd.DataFrame(rows).sort_values(["modality", "session_date", "session_id"]).reset_index(drop=True)
 
@@ -163,10 +190,12 @@ def main(argv=None) -> int:
     ap.add_argument("--summary-xlsx", required=True)
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--registration-csv", default=None)
+    ap.add_argument("--fpga-check-csv", default=None, help="output of scripts/check_fpga_cross_epoch.py")
     ap.add_argument("--include-glutamate", action="store_true")
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
-    df = build(Path(a.summary_xlsx), Path(a.manifest), Path(a.registration_csv) if a.registration_csv else None, include_glutamate=a.include_glutamate)
+    df = build(Path(a.summary_xlsx), Path(a.manifest), Path(a.registration_csv) if a.registration_csv else None, include_glutamate=a.include_glutamate,
+               fpga_check_csv=Path(a.fpga_check_csv) if a.fpga_check_csv else None)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(a.out, index=False)
     print(df["sync_classification"].value_counts().to_string())
