@@ -37,7 +37,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from vip_slap2_analysis.common.cycle_registration import (
-    CycleRegistration, EpochCycleRegistration, RELATIONSHIP_DIRECT, STATUS_IDENTIFIED, STATUS_IDENTIFIED_ASSUMED,
+    ANCHOR_FPGA_CROSS_EPOCH, CycleRegistration, EpochCycleRegistration, RELATIONSHIP_DIRECT, STATUS_IDENTIFIED,
+    STATUS_IDENTIFIED_ASSUMED,
 )
 
 PathLike = Union[str, Path]
@@ -141,8 +142,10 @@ def cross_epoch_fpga_check(
     limitations: List[str] = []
     if reg.relationship != RELATIONSHIP_DIRECT:
         limitations.append(f"Registration relationship is '{reg.relationship}', not the direct DMD cycle clock; the check needs DI3 pulses of this DMD.")
+    # epochs that were themselves resolved through the FPGA map must not feed the fit (circular)
     ident = [e for e in reg.epochs
              if e.status in (STATUS_IDENTIFIED, STATUS_IDENTIFIED_ASSUMED) and e.cycle_index_offset is not None
+             and e.anchor != ANCHOR_FPGA_CROSS_EPOCH
              and e.pulse_times_harp_s is not None and int(e.source_epoch_index) in absolute_cycle_start_s
              and np.isfinite(e.observed_cycle_period_s)]
     per_epoch_xy: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
@@ -193,6 +196,8 @@ def cross_epoch_fpga_check(
         if e.pulse_times_harp_s is None or len(e.pulse_times_harp_s) == 0:
             row.notes.append("No pulses recorded for this epoch.")
             epochs_out.append(row); continue
+        if e.anchor == ANCHOR_FPGA_CROSS_EPOCH:
+            row.notes.append("Offset was itself obtained from the shared-FPGA map; excluded from the fit (not an independent confirmation).")
         if sid in per_epoch_xy:
             # identified epoch: predict it from the *other* identified epochs only (leave-one-out)
             others = [i for i in fit_ids if i != sid]

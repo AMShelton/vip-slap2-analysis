@@ -79,6 +79,9 @@ class SourceEpochCycles:
     n_source_gaps: int = 0
     source: str = "summary_metadata"
     has_partial_trailing_cycle: bool = False
+    # absolute FPGA time (s) of the acquisition reference (referenceTimestamp / clock). All acquisitions of a
+    # SLAP2 session share the counter, so cycle_start_s + fpga_reference_s is comparable across epochs.
+    fpga_reference_s: Optional[float] = None
 
     @property
     def nominal_cycle_period_s(self) -> float:
@@ -484,6 +487,99 @@ def infer_clock_relationship(
     return RELATIONSHIP_UNRESOLVED, eff
 
 
+ANCHOR_FPGA_CROSS_EPOCH = "fpga_cross_epoch"
+
+
+def _resolve_epochs_via_shared_fpga(
+    epochs: List[EpochCycleRegistration],
+    src_list: Sequence[SourceEpochCycles],
+    *,
+    max_fit_rms_s: float = 5e-4,
+    integer_tolerance_cycles: float = 0.25,
+) -> List[str]:
+    """Second pass: place unresolved epochs on the HARP axis through the FPGA counter shared by all acquisitions.
+
+    Pulses of the epochs identified by counting fix the affine map HARP = a*FPGA + b
+    (a few ppm from 1). Every other epoch's cycle starts are then predicted in HARP
+    time. An epoch is resolved only when its first pulse falls within
+    ``integer_tolerance_cycles`` of a predicted cycle start *and* the number of
+    predicted cycles inside its pulse train equals the pulses (plus inferred
+    dropped ones); cycles predicted after the last pulse are cycles the DI3
+    recording did not cover. Anything else is left as it was. With two or more
+    identified epochs the single fit must hold across them (``max_fit_rms_s``),
+    otherwise the counter is not continuous and nothing is resolved.
+    Leave-one-out on 12 multi-acquisition sessions (2026-11-06) reproduced every
+    counted offset to within 0.04 cycles; the tolerance here is six times that.
+    """
+    notes: List[str] = []
+    by_idx = {int(s.epoch_index): s for s in src_list}
+
+    def _abs(src: SourceEpochCycles) -> Optional[np.ndarray]:
+        if src.cycle_start_s is None or src.fpga_reference_s is None:
+            return None
+        return float(src.fpga_reference_s) + np.asarray(src.cycle_start_s, dtype=float)
+
+    xs, ys, fit_ids = [], [], []
+    for e in epochs:
+        if e.status != STATUS_IDENTIFIED or e.cycle_index_offset is None or e.pulse_times_harp_s is None or e.anchor == ANCHOR_FPGA_CROSS_EPOCH:
+            continue
+        src = by_idx.get(int(e.source_epoch_index)); ts = _abs(src) if src is not None else None
+        if ts is None or not np.isfinite(e.observed_cycle_period_s):
+            continue
+        pulses = np.asarray(e.pulse_times_harp_s, dtype=float)
+        idx = np.empty(pulses.size, dtype=int); idx[0] = int(e.cycle_index_offset)
+        if pulses.size > 1:
+            steps = np.rint(np.diff(pulses) / float(e.observed_cycle_period_s)).astype(int); steps[steps < 1] = 1
+            idx[1:] = idx[0] + np.cumsum(steps)
+        ok = idx < ts.size
+        if ok.sum() >= 3:
+            xs.append(ts[idx[ok]]); ys.append(pulses[ok]); fit_ids.append(int(e.source_epoch_index))
+    targets = [e for e in epochs if e.status in (STATUS_INCONSISTENT, STATUS_AMBIGUOUS) and e.pulse_times_harp_s is not None
+               and len(e.pulse_times_harp_s) > 0 and int(e.source_epoch_index) in by_idx and _abs(by_idx[int(e.source_epoch_index)]) is not None]
+    if not targets or not fit_ids:
+        return notes
+    X = np.concatenate(xs); Y = np.concatenate(ys)
+    a, b = np.polyfit(X, Y, 1)
+    rms = float(np.sqrt(np.mean((Y - (a * X + b)) ** 2)))
+    if len(fit_ids) >= 2 and rms > max_fit_rms_s:
+        notes.append(f"Shared-FPGA map does not fit identified epochs {fit_ids} ({rms*1e6:.0f} us RMS); unresolved epochs left as they are.")
+        return notes
+    for e in targets:
+        src = by_idx[int(e.source_epoch_index)]
+        pred = a * _abs(src) + b
+        period = float(np.median(np.diff(pred))) if pred.size > 1 else float(e.nominal_cycle_period_s)
+        pulses = np.asarray(e.pulse_times_harp_s, dtype=float)
+        t_first, t_last = float(pulses[0]), float(pulses[-1])
+        est = (t_first - pred[0]) / period
+        k = int(np.rint(est))
+        tol = max(2e-4, 0.1 * period)
+        before = int(np.sum(pred < t_first - tol)); after = int(np.sum(pred > t_last + tol))
+        inside = int(pred.size - before - after)
+        n_eff = int(e.n_observed_pulses) + int(e.n_internal_missing_pulses)
+        basis = (f"shared-FPGA prediction from epoch(s) {fit_ids} (fit {rms*1e6:.0f} us RMS"
+                 + (", continuity verified across epochs" if len(fit_ids) >= 2 else ", single donor epoch: continuity assumed") + ")")
+        if inside == 0:
+            e.status = STATUS_UNAVAILABLE
+            e.cycle_index_offset = None
+            e.notes.append(f"The paired DI3 train lies entirely outside this acquisition ({basis}: first pulse at cycle {est:.1f}); "
+                           "the acquisition has no DI3 coverage.")
+            continue
+        if abs(est - k) > integer_tolerance_cycles or k < 0 or k >= pred.size or abs(inside - n_eff) > 1:
+            e.notes.append(f"{basis} puts the first pulse at cycle {est:.3f} with {inside} cycles inside the train vs {n_eff} pulses; "
+                           "not integer-consistent, left unresolved.")
+            continue
+        e.cycle_index_offset = k
+        e.candidate_offset_range = (k, k)
+        e.status = STATUS_IDENTIFIED
+        e.anchor = ANCHOR_FPGA_CROSS_EPOCH
+        e.missing_initial_cycles = k
+        e.missing_terminal_cycles = int(pred.size - k - n_eff)
+        e.notes.append(f"Resolved by {basis}: first pulse at cycle {est:+.3f} -> k={k}; {before} cycles before the first pulse, "
+                       f"{after} after the last (DI3 not recorded for those).")
+        notes.append(f"Epoch {e.source_epoch_index} resolved through the shared FPGA counter (k={k}).")
+    return notes
+
+
 def register_di3_to_source_cycles(
     *,
     rise_times_s: Sequence[float],
@@ -559,7 +655,7 @@ def register_di3_to_source_cycles(
         if unmatched_di3:
             limitations.append(
                 f"{len(unmatched_di3)} DI3 pulse train(s) without a saved acquisition (aborted/preview acquisitions?): "
-                + ", ".join(f"{u['n_pulses']} pulses / {u['duration_s']:.1f} s at +{u['start_s']:.1f} s" for u in unmatched_di3)
+                + ", ".join(f"{u['n_pulses']} pulses / {u['duration_s']:.1f} s (period {u.get('median_period_s', float('nan'))*1e3:.1f} ms) at +{u['start_s']:.1f} s" for u in unmatched_di3)
             )
         if unmatched_source:
             limitations.append(
@@ -596,6 +692,9 @@ def register_di3_to_source_cycles(
                 lines_per_cycle=int(src_u.lines_per_cycle), line_rate_hz=float(src_u.line_rate_hz),
             ))
         epochs.sort(key=lambda e: e.source_epoch_index)
+        if relationship == RELATIONSHIP_DIRECT:
+            fpga_notes = _resolve_epochs_via_shared_fpga(epochs, src_list)
+            limitations.extend(fpga_notes)
         statuses = {e.status for e in epochs}
         if statuses <= {STATUS_IDENTIFIED}:
             status = STATUS_IDENTIFIED
@@ -656,6 +755,7 @@ def pair_source_and_di3_epochs(
     *,
     relationship: str,
     count_tolerance: float = 0.5,
+    period_tolerance: float = 0.02,
 ) -> Tuple[List[Tuple[SourceEpochCycles, Di3PulseEpoch]], List[Dict[str, Any]], List[int]]:
     """Pair saved acquisitions with DI3 pulse trains chronologically, by pulse/cycle count.
 
@@ -667,6 +767,12 @@ def pair_source_and_di3_epochs(
     comparison uses durations instead of counts. Nothing is matched by position
     alone, so a 7-vs-11 mismatch pairs the 7 real acquisitions and reports 4
     unmatched trains instead of refusing (863774_2026-08-07).
+
+    A train whose median pulse period differs from the acquisition's nominal
+    cycle period by more than ``period_tolerance`` is never paired under the
+    direct relationship, whatever its count: preview/structural acquisitions
+    emit DI3 at a different cadence (75 ms trains of 193-229 pulses seen next
+    to 22 ms voltage acquisitions, 852835_2026-08-01 / 852834_2026-07-28).
     """
     pairs: List[Tuple[SourceEpochCycles, Di3PulseEpoch]] = []
     unmatched: List[Dict[str, Any]] = []
@@ -680,6 +786,9 @@ def pair_source_and_di3_epochs(
             if relationship == RELATIONSHIP_DIRECT:
                 n = tr.n_pulses
                 ok = (n <= src.n_cycles + 1) and (n >= count_tolerance * src.n_cycles)
+                if ok and n >= 3:
+                    med = float(np.median(np.diff(tr.rise_times_s)))
+                    ok = abs(med / float(src.nominal_cycle_period_s) - 1.0) <= float(period_tolerance)
             else:
                 dur = tr.duration_s
                 nominal = src.nominal_duration_s
@@ -689,14 +798,16 @@ def pair_source_and_di3_epochs(
                 matched = tr
                 break
             unmatched.append({"di3_epoch_index": int(tr.epoch_index), "n_pulses": int(tr.n_pulses),
-                              "duration_s": float(tr.duration_s), "start_s": float(tr.rise_times_s[0])})
+                              "duration_s": float(tr.duration_s), "start_s": float(tr.rise_times_s[0]),
+                              "median_period_s": float(np.median(np.diff(tr.rise_times_s))) if tr.n_pulses >= 2 else float("nan")})
         if matched is None:
             leftover_source.append(int(src.epoch_index))
         else:
             pairs.append((src, matched))
     for tr in trains[j:]:
         unmatched.append({"di3_epoch_index": int(tr.epoch_index), "n_pulses": int(tr.n_pulses),
-                          "duration_s": float(tr.duration_s), "start_s": float(tr.rise_times_s[0])})
+                          "duration_s": float(tr.duration_s), "start_s": float(tr.rise_times_s[0]),
+                          "median_period_s": float(np.median(np.diff(tr.rise_times_s))) if tr.n_pulses >= 2 else float("nan")})
     return pairs, unmatched, leftover_source
 
 
@@ -1366,6 +1477,7 @@ def source_epochs_from_raw_dat(dynamic_data_dir: PathLike, dmd: int, *, line_rat
             epoch_index=i, n_cycles=int(timing.n_cycles), lines_per_cycle=int(timing.lines_per_cycle),
             line_rate_hz=float(lr), cycle_start_s=timing.cycle_start_s, n_source_gaps=int(timing.gap_indices.size),
             source=f"raw_dat:{prefix}", has_partial_trailing_cycle=bool(getattr(timing, "has_partial_trailing_cycle", False)),
+            fpga_reference_s=float(timing.reference_timestamp) / float(timing.fpga_clock_hz),
         ))
     return out
 

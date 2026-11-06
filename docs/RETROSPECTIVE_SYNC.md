@@ -82,6 +82,15 @@ uses this as timing evidence independent of pulse *counting*:
   cycles without pulses fall (before the first pulse, inside the train, after the last pulse).
 
 Single-acquisition sessions have nothing to fit against; the check does not help them.
+
+Result on the voltage cohort (2026-11-06): all 12 multi-acquisition corrected sessions
+confirmed to within 0.04 cycles (fit 17–50 µs RMS). The registration itself now uses the same
+map as a *second pass* (`_resolve_epochs_via_shared_fpga`): an epoch that counting left
+`inconsistent`/`ambiguous` is placed when its first pulse is within 0.25 cycles of a predicted
+cycle start and the predicted cycles inside its train equal the pulses; such epochs carry
+`anchor = "fpga_cross_epoch"` and are excluded from the leave-one-out fit. Pairing also rejects
+DI3 trains whose cadence differs >2 % from the acquisition's cycle period (preview acquisitions
+at 75 ms).
 `scripts/check_fpga_cross_epoch.py` writes `qc/sync/fpga_cross_epoch_DMD<n>.json` per session
 and a cohort CSV.
 

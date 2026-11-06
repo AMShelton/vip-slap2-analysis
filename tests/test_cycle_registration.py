@@ -326,3 +326,53 @@ def test_one_line_past_acquisition_end_is_extrapolated_not_refused():
     assert lab.tolist() == [0, 0, 2] and t[2] > t[1] > t[0]
     with pytest.raises(ValueError):
         source_lines_to_harp_time(np.array([L + LPC + 1]), e, lines_per_cycle=LPC, line_rate_hz=LINE_RATE)
+
+
+def test_pairing_rejects_train_with_foreign_cadence():
+    # 852835_2026-08-01: a 75 ms-cadence preview train (193 pulses) sat where a 326-cycle 22 ms acquisition was expected
+    t_a = _truth(n=2000, t0=1000.0)
+    t_pre = t_a[-1] + 40.0 + np.arange(193) * 0.075
+    srcs = [_src(n=2000, epoch=1), _src(n=326, epoch=2)]
+    rises = np.r_[t_a, t_pre]
+    reg = _reg(rises, t_a[0] - 5.0, t_pre[-1] + 14.5, srcs)
+    e1, e2 = reg.epochs
+    assert e1.status == STATUS_IDENTIFIED and e1.cycle_index_offset == 0
+    assert e2.status == "unavailable" and e2.n_observed_pulses == 0
+    assert len(reg.inputs["unmatched_di3_trains"]) == 1 and abs(reg.inputs["unmatched_di3_trains"][0]["median_period_s"] - 0.075) < 1e-6
+
+
+def _src_fpga(n, epoch, fpga_t0):
+    return SourceEpochCycles(epoch_index=epoch, n_cycles=n, lines_per_cycle=LPC, line_rate_hz=LINE_RATE,
+                             cycle_start_s=np.arange(n) * PERIOD, fpga_reference_s=fpga_t0)
+
+
+def test_both_anchor_deficit_resolved_through_shared_fpga():
+    # 852834_2026-07-28 epoch 2: both anchors covered, 9785 cycles but 8348 pulses; the FPGA counter shared with
+    # epoch 1 (tail-anchored, k=616) places the pulse-less cycles after the last pulse -> k=0, DI3 stopped early
+    fpga_a0, n_a, n_b, gap = 171.4, 3000, 1200, 40.0
+    fpga_b0 = fpga_a0 + n_a * PERIOD + gap
+    harp = lambda t: 5000.0 + (t - fpga_a0) * (1 + HARP_PPM * 1e-6)
+    t_a = harp(fpga_a0 + np.arange(n_a) * PERIOD); t_b = harp(fpga_b0 + np.arange(n_b) * PERIOD)
+    srcs = [_src_fpga(n_a, 1, fpga_a0), _src_fpga(n_b, 2, fpga_b0)]
+    rises = np.r_[t_a[616:], t_b[:-300]]                      # HARP starts late in A; DI3 stops 300 cycles before B ends
+    reg = _reg(rises, t_a[616] - 0.003, t_b[-301] + 1.0, srcs)   # HARP recording ends 1 s after the last pulse
+    e1, e2 = reg.epochs
+    assert e1.status == STATUS_IDENTIFIED and e1.cycle_index_offset == 616
+    assert e2.status == STATUS_IDENTIFIED and e2.anchor == "fpga_cross_epoch" and e2.cycle_index_offset == 0
+    assert e2.missing_terminal_cycles == 300 and e2.missing_initial_cycles == 0
+    assert reg.status == STATUS_IDENTIFIED
+    assert any("shared FPGA" in l for l in reg.limitations)
+
+
+def test_shared_fpga_does_not_resolve_without_integer_consistency():
+    fpga_a0, n_a, n_b, gap = 171.4, 3000, 1200, 40.0
+    fpga_b0 = fpga_a0 + n_a * PERIOD + gap
+    harp = lambda t: 5000.0 + (t - fpga_a0) * (1 + HARP_PPM * 1e-6)
+    t_a = harp(fpga_a0 + np.arange(n_a) * PERIOD); t_b = harp(fpga_b0 + np.arange(n_b) * PERIOD)
+    # epoch 2's cycle_start_s claims a different reference (counter reset): prediction lands off-grid
+    srcs = [_src_fpga(n_a, 1, fpga_a0), _src_fpga(n_b, 2, fpga_b0 + 0.4 * PERIOD)]
+    rises = np.r_[t_a[616:], t_b[:-300]]
+    reg = _reg(rises, t_a[616] - 0.003, t_b[-301] + 1.0, srcs)
+    e2 = reg.epochs[1]
+    assert e2.status == STATUS_INCONSISTENT and e2.cycle_index_offset is None
+    assert any("not integer-consistent" in n for n in e2.notes)
