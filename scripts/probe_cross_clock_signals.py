@@ -124,8 +124,11 @@ def main(argv=None) -> int:
         period = float(np.median(np.diff(cyc_harp)))
         k_true = int(e.cycle_index_offset)
         # HARP analog: photodiode (ch0) and encoder (ch1)
-        t44, _, vals = read_harp_register(find_register_file(asset.harp_dir, 44))
+        t44, vals, _info = read_harp_register(find_register_file(asset.harp_dir, 44))
         vals = np.asarray(vals)
+        if vals.ndim != 2 or vals.shape[1] < 1:
+            print(f"{sid}: unexpected AnalogData payload shape {vals.shape}"); continue
+        order = np.argsort(t44); t44, vals = t44[order], vals[order]
         pd_c = np.interp(cyc_harp, t44, vals[:, 0].astype(float), left=np.nan, right=np.nan)
         enc = None
         if vals.shape[1] > 1:
