@@ -38,7 +38,7 @@ import numpy as np
 
 from vip_slap2_analysis.common.cycle_registration import (
     ANCHOR_FPGA_CROSS_EPOCH, CycleRegistration, EpochCycleRegistration, RELATIONSHIP_DIRECT, STATUS_IDENTIFIED,
-    STATUS_IDENTIFIED_ASSUMED,
+    STATUS_IDENTIFIED_ASSUMED, cumulative_step_before, destep_harp_times, detect_relation_steps,
 )
 
 PathLike = Union[str, Path]
@@ -74,6 +74,7 @@ class FpgaCrossEpochCheck:
     dmd: int
     n_source_epochs: int
     n_identified_epochs: int
+    relation_steps: List[Dict[str, float]]      # HARP-vs-FPGA steps inside identified epochs (removed before fitting)
     fpga_counter_continuous: Optional[bool]     # None = cannot tell (fewer than 2 identified epochs)
     global_fit_n_pulses: int
     global_rate_ratio_harp_over_fpga: Optional[float]
@@ -149,14 +150,23 @@ def cross_epoch_fpga_check(
              and e.pulse_times_harp_s is not None and int(e.source_epoch_index) in absolute_cycle_start_s
              and np.isfinite(e.observed_cycle_period_s)]
     per_epoch_xy: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+    all_steps: List[Dict[str, float]] = []
     for e in ident:
         idx, pulses = _pulse_cycle_indices(e)
         ts = absolute_cycle_start_s[int(e.source_epoch_index)]
         ok = idx < ts.size
         if ok.sum() < 3:
             continue
-        per_epoch_xy[int(e.source_epoch_index)] = (ts[idx[ok]], pulses[ok])
+        x = ts[idx[ok]]; y = pulses[ok]
+        steps = detect_relation_steps(x, y)
+        all_steps.extend({**st, "source_epoch_index": int(e.source_epoch_index)} for st in steps)
+        # fit on the de-stepped axis; predictions get the steps that preceded them added back
+        per_epoch_xy[int(e.source_epoch_index)] = (x, destep_harp_times(y, steps))
     fit_ids = sorted(per_epoch_xy)
+    if all_steps:
+        limitations.append(f"{len(all_steps)} step(s) in the HARP-vs-FPGA relation inside identified epochs: "
+                           + ", ".join(f"{st['step_s']*1e3:+.2f} ms at HARP {st['harp_s']:.3f} s (epoch {st['source_epoch_index']})" for st in all_steps)
+                           + "; removed before fitting, re-applied to predictions.")
 
     glob_a = glob_b = glob_rms = glob_max = None
     n_fit = 0
@@ -213,10 +223,10 @@ def cross_epoch_fpga_check(
                 epochs_out.append(row); continue
             a, b = glob_a, glob_b
             row.fit_epochs = list(fit_ids)
-        pred = a * np.asarray(ts, dtype=float) + b
         pulses = np.asarray(e.pulse_times_harp_s, dtype=float)
-        period = float(np.median(np.diff(pred))) if pred.size > 1 else float(e.nominal_cycle_period_s)
         t_first, t_last = float(pulses[0]), float(pulses[-1])
+        pred = a * np.asarray(ts, dtype=float) + b + cumulative_step_before(t_first, all_steps)
+        period = float(np.median(np.diff(pred))) if pred.size > 1 else float(e.nominal_cycle_period_s)
         row.first_pulse_harp_s = t_first
         # where does the first pulse fall on the predicted cycle grid?
         est = (t_first - pred[0]) / period
@@ -258,7 +268,7 @@ def cross_epoch_fpga_check(
         all_ok = False
     return FpgaCrossEpochCheck(
         schema_version=SCHEMA_VERSION, session_id=reg.session_id, dmd=int(reg.dmd), n_source_epochs=len(reg.epochs),
-        n_identified_epochs=len(fit_ids), fpga_counter_continuous=continuous, global_fit_n_pulses=n_fit,
+        n_identified_epochs=len(fit_ids), relation_steps=all_steps, fpga_counter_continuous=continuous, global_fit_n_pulses=n_fit,
         global_rate_ratio_harp_over_fpga=glob_a, global_residual_rms_s=glob_rms, global_residual_max_s=glob_max,
         all_identified_offsets_confirmed=all_ok, epochs=epochs_out, limitations=limitations,
     )

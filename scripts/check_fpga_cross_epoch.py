@@ -70,6 +70,8 @@ def main(argv=None) -> int:
                 "global_residual_rms_us": (chk.global_residual_rms_s or float("nan")) * 1e6,
                 "global_residual_max_us": (chk.global_residual_max_s or float("nan")) * 1e6,
                 "all_identified_offsets_confirmed": chk.all_identified_offsets_confirmed,
+                "n_relation_steps": len(chk.relation_steps),
+                "relation_steps_ms": "; ".join(f"{st['step_s']*1e3:+.2f}@{st['harp_s']:.3f}" for st in chk.relation_steps),
                 "limitations": " | ".join(chk.limitations),
             }
             for e in chk.epochs:

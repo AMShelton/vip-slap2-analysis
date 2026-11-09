@@ -91,6 +91,13 @@ cycle start and the predicted cycles inside its train equal the pulses; such epo
 `anchor = "fpga_cross_epoch"` and are excluded from the leave-one-out fit. Pairing also rejects
 DI3 trains whose cadence differs >2 % from the acquisition's cycle period (preview acquisitions
 at 75 ms).
+
+**Steps in the HARP-vs-FPGA relation.** Two early-2026 sessions (826031_02-02, 02-11) contain a
+single −2.3/−2.5 ms jump of DI3-minus-FPGA inside one acquisition (`scripts/plot_harp_fpga_residuals.py`).
+`detect_relation_steps` finds such jumps (> 200 µs between consecutive pulses); the DMD2 transfer maps
+FPGA→HARP by interpolation between the measured DMD1 pulses (`piecewise_fpga_to_harp`, exact at every
+pulse, affine extrapolation outside) and judges the fit per step-free segment; cross-epoch fits remove
+the steps first and re-apply them to predictions. Steps are stored per epoch in `relation_steps`.
 `scripts/check_fpga_cross_epoch.py` writes `qc/sync/fpga_cross_epoch_DMD<n>.json` per session
 and a cohort CSV.
 

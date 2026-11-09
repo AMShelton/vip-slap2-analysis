@@ -376,3 +376,30 @@ def test_shared_fpga_does_not_resolve_without_integer_consistency():
     e2 = reg.epochs[1]
     assert e2.status == STATUS_INCONSISTENT and e2.cycle_index_offset is None
     assert any("not integer-consistent" in n for n in e2.notes)
+
+
+def test_transfer_interpolates_across_a_harp_step():
+    """A -2.4 ms HARP-vs-FPGA step inside the epoch must be carried into DMD2 times, not smeared or refused."""
+    from vip_slap2_analysis.common.cycle_registration import transfer_registration_via_fpga
+    n1, lpc2 = 4000, 150
+    fpga1 = np.arange(n1) * PERIOD
+    period2 = lpc2 / LINE_RATE
+    fpga2 = np.arange(int(n1 * PERIOD / period2)) * period2
+    harp = lambda t: 2000.0 + t * (1 + HARP_PPM * 1e-6)
+    t1 = harp(fpga1)
+    t1[2500:] -= 0.0024                                   # HARP clock jumps back 2.4 ms
+    reg1 = _reg(t1, t1[0] - 5.0, t1[-1] + 5.0, [SourceEpochCycles(1, n1, LPC, LINE_RATE, cycle_start_s=fpga1)])
+    assert reg1.status == STATUS_IDENTIFIED
+    reg2 = transfer_registration_via_fpga(reg1, src_cycle_start_s={1: fpga1}, dst_cycle_start_s={1: fpga2},
+                                          dst_lines_per_cycle={1: lpc2}, dst_line_rate_hz={1: LINE_RATE}, dst_dmd=2)
+    e = reg2.epochs[0]
+    assert e.status == STATUS_IDENTIFIED and len(e.relation_steps) == 1 and abs(e.relation_steps[0]["step_s"] + 0.0024) < 1e-4
+    truth2 = harp(fpga2); truth2[fpga2 > fpga1[2500] - 1e-9] -= 0.0024
+    got = np.asarray(e.pulse_times_harp_s)
+    f2 = fpga2[e.cycle_index_offset:e.cycle_index_offset + got.size]
+    err = np.abs(got - truth2[e.cycle_index_offset:e.cycle_index_offset + got.size])
+    # the exact instant of the step inside one DI3 interval is unknowable: only DMD2 cycles starting inside
+    # that interval may be off (by at most the step); everything else must be exact
+    straddle = (f2 > fpga1[2499]) & (f2 < fpga1[2500])
+    assert straddle.sum() <= 2 and np.all(err[straddle] <= 0.0024 + 1e-6)
+    assert np.max(err[~straddle]) < 1e-4

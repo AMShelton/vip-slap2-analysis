@@ -197,6 +197,9 @@ class EpochCycleRegistration:
     # tolerance for the origin-consistency anchor (None -> caller default, 2 ms). Transferred
     # registrations need one cycle period because this DMD's cycle boundaries are not the DI3 edges.
     anchor_tolerance_s: Optional[float] = None
+    # discontinuities in the HARP-vs-FPGA relation inside this epoch (one clock stepped); each entry
+    # {"after_pulse_index", "harp_s", "step_s"}. Measured where FPGA cycle timestamps are available.
+    relation_steps: List[Dict[str, float]] = field(default_factory=list)
     # not serialized by default (large)
     pulse_times_harp_s: Optional[np.ndarray] = field(default=None, repr=False)
 
@@ -320,6 +323,76 @@ def _linear_fit_residual(pulses: np.ndarray, cycle_idx: np.ndarray) -> Tuple[flo
     a, b = np.polyfit(cycle_idx.astype(float), pulses, 1)
     r = pulses - (a * cycle_idx + b)
     return float(a), float(np.sqrt(np.mean(r * r))), float(np.max(np.abs(r)))
+
+
+RELATION_STEP_THRESHOLD_S = 2e-4
+
+
+def detect_relation_steps(x_fpga: np.ndarray, y_harp: np.ndarray, *, threshold_s: float = RELATION_STEP_THRESHOLD_S) -> List[Dict[str, float]]:
+    """Discontinuities of HARP-vs-FPGA: jumps of the affine-fit residual between consecutive pulses.
+
+    Seen on 826031_2026-02-02 / 02-11 as a single -2.3/-2.5 ms step in a session;
+    a dropped pulse is *not* a step (cycle indices already account for it).
+    """
+    if x_fpga.size < 3:
+        return []
+    a, b = np.polyfit(x_fpga, y_harp, 1)
+    r = y_harp - (a * x_fpga + b)
+    d = np.diff(r)
+    out = []
+    for i in np.flatnonzero(np.abs(d) > float(threshold_s)):
+        out.append({"after_pulse_index": int(i), "harp_s": float(y_harp[i + 1]), "step_s": float(d[i])})
+    return out
+
+
+def destep_harp_times(y_harp: np.ndarray, steps: Sequence[Dict[str, float]]) -> np.ndarray:
+    """Remove detected steps so that HARP ~ FPGA is affine again (for fitting only; never applied to data)."""
+    y = np.asarray(y_harp, dtype=float).copy()
+    for st in steps:
+        y[int(st["after_pulse_index"]) + 1:] -= float(st["step_s"])
+    return y
+
+
+def cumulative_step_before(t_harp: float, steps: Sequence[Dict[str, float]]) -> float:
+    """Sum of relation steps that occurred before HARP time ``t_harp`` (to re-apply to de-stepped predictions)."""
+    return float(sum(float(st["step_s"]) for st in steps if float(st["harp_s"]) <= float(t_harp)))
+
+
+def piecewise_fpga_to_harp(ts_fpga: np.ndarray, x_fpga: np.ndarray, y_harp: np.ndarray, steps: Sequence[Dict[str, float]]) -> np.ndarray:
+    """Map FPGA times to HARP by linear interpolation between measured pulses, affine extrapolation outside.
+
+    Interpolation reproduces the measured HARP axis exactly at every pulse, so a
+    clock step (``steps``) is carried into the mapped times instead of being
+    smeared over the epoch by a single affine fit. Outside the pulse range the
+    affine fit of the nearest step-free segment is used.
+    """
+    ts = np.asarray(ts_fpga, dtype=float)
+    out = np.interp(ts, x_fpga, y_harp)
+    bounds = [0] + [int(st["after_pulse_index"]) + 1 for st in steps] + [int(x_fpga.size)]
+    first = (bounds[0], bounds[1]); last = (bounds[-2], bounds[-1])
+    for (lo, hi), side in ((first, "left"), (last, "right")):
+        xs, ys = x_fpga[lo:hi], y_harp[lo:hi]
+        if xs.size >= 3:
+            a, b = np.polyfit(xs, ys, 1)
+        else:
+            a, b = np.polyfit(x_fpga, y_harp, 1)
+        m = ts < x_fpga[0] if side == "left" else ts > x_fpga[-1]
+        out[m] = a * ts[m] + b
+    return out
+
+
+def _segment_fit_residuals(x_fpga: np.ndarray, y_harp: np.ndarray, steps: Sequence[Dict[str, float]]) -> Tuple[float, float]:
+    """Max over step-free segments of (rms, max |resid|) of each segment's own affine fit."""
+    bounds = [0] + [int(st["after_pulse_index"]) + 1 for st in steps] + [int(x_fpga.size)]
+    rms_all, max_all = 0.0, 0.0
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        xs, ys = x_fpga[lo:hi], y_harp[lo:hi]
+        if xs.size < 3:
+            continue
+        a, b = np.polyfit(xs, ys, 1)
+        r = ys - (a * xs + b)
+        rms_all = max(rms_all, float(np.sqrt(np.mean(r * r)))); max_all = max(max_all, float(np.max(np.abs(r))))
+    return rms_all, max_all
 
 
 def _register_epoch(
@@ -520,6 +593,7 @@ def _resolve_epochs_via_shared_fpga(
         return float(src.fpga_reference_s) + np.asarray(src.cycle_start_s, dtype=float)
 
     xs, ys, fit_ids = [], [], []
+    all_steps: List[Dict[str, float]] = []
     for e in epochs:
         if e.status != STATUS_IDENTIFIED or e.cycle_index_offset is None or e.pulse_times_harp_s is None or e.anchor == ANCHOR_FPGA_CROSS_EPOCH:
             continue
@@ -533,7 +607,15 @@ def _resolve_epochs_via_shared_fpga(
             idx[1:] = idx[0] + np.cumsum(steps)
         ok = idx < ts.size
         if ok.sum() >= 3:
-            xs.append(ts[idx[ok]]); ys.append(pulses[ok]); fit_ids.append(int(e.source_epoch_index))
+            x = ts[idx[ok]]; y = pulses[ok]
+            steps = detect_relation_steps(x, y)
+            if steps and not e.relation_steps:
+                e.relation_steps = steps
+                e.notes.append(f"{len(steps)} step(s) in the HARP-vs-FPGA relation inside this epoch: "
+                               + ", ".join(f"{st['step_s']*1e3:+.2f} ms at HARP {st['harp_s']:.3f} s" for st in steps)
+                               + ". Measured pulse times are used as they are; the steps only matter for cross-epoch fits.")
+            all_steps.extend(steps)
+            xs.append(x); ys.append(destep_harp_times(y, steps)); fit_ids.append(int(e.source_epoch_index))
     targets = [e for e in epochs if e.status in (STATUS_INCONSISTENT, STATUS_AMBIGUOUS) and e.pulse_times_harp_s is not None
                and len(e.pulse_times_harp_s) > 0 and int(e.source_epoch_index) in by_idx and _abs(by_idx[int(e.source_epoch_index)]) is not None]
     if not targets or not fit_ids:
@@ -546,10 +628,11 @@ def _resolve_epochs_via_shared_fpga(
         return notes
     for e in targets:
         src = by_idx[int(e.source_epoch_index)]
-        pred = a * _abs(src) + b
-        period = float(np.median(np.diff(pred))) if pred.size > 1 else float(e.nominal_cycle_period_s)
         pulses = np.asarray(e.pulse_times_harp_s, dtype=float)
         t_first, t_last = float(pulses[0]), float(pulses[-1])
+        # the fit lives on the de-stepped axis; measured pulses of this epoch carry the steps that preceded them
+        pred = a * _abs(src) + b + cumulative_step_before(t_first, all_steps)
+        period = float(np.median(np.diff(pred))) if pred.size > 1 else float(e.nominal_cycle_period_s)
         est = (t_first - pred[0]) / period
         k = int(np.rint(est))
         tol = max(2e-4, 0.1 * period)
@@ -876,8 +959,13 @@ def transfer_registration_via_fpga(
         x = ts_src[idx[ok]]; y = pulses[ok]
         a, b = np.polyfit(x, y, 1)
         resid = y - (a * x + b)
-        rms = float(np.sqrt(np.mean(resid ** 2))); rmax = float(np.max(np.abs(resid)))
-        dst_t = a * np.asarray(ts_dst, dtype=float) + b
+        rms_global = float(np.sqrt(np.mean(resid ** 2)))
+        # a step in the HARP-vs-FPGA relation (one clock jumped) must not be smeared over the epoch:
+        # map by interpolation between the measured pulses and judge the fit per step-free segment
+        steps = detect_relation_steps(x, y)
+        rms, rmax = _segment_fit_residuals(x, y, steps)
+        dst_t = piecewise_fpga_to_harp(np.asarray(ts_dst, dtype=float), x, y, steps)
+        base["relation_steps"] = steps
         t_first = float(pulses[0]); t_last = float(pulses[-1])
         # coverage window with a tolerance for HARP quantization / fit noise (a destination cycle that
         # starts on the same FPGA tick as the first source pulse must count as covered)
@@ -890,7 +978,8 @@ def transfer_registration_via_fpga(
                 missing_terminal_cycles=None, observed_cycle_period_s=float("nan"), rate_ratio_harp_over_source=float(a),
                 period_error_ppm=float((a - 1) * 1e6), residual_rms_s=rms, residual_max_s=rmax,
                 first_pulse_harp_s=float("nan"), last_pulse_harp_s=float("nan"),
-                notes=[f"HARP~FPGA fit residual {rms*1e6:.1f} us RMS exceeds {max_fit_residual_s*1e6:.0f} us, or no destination cycle inside coverage."],
+                notes=[f"HARP~FPGA fit residual {rms*1e6:.1f} us RMS within step-free segments exceeds {max_fit_residual_s*1e6:.0f} us "
+                       f"({len(steps)} relation step(s) detected; global fit {rms_global*1e6:.0f} us), or no destination cycle inside coverage."],
             ))
             continue
         k0d, k1d = int(inside[0]), int(inside[-1])
@@ -901,8 +990,11 @@ def transfer_registration_via_fpga(
             missing_terminal_cycles=int(ts_dst.size - 1 - k1d), observed_cycle_period_s=float(dst_period),
             rate_ratio_harp_over_source=float(a), period_error_ppm=float((a - 1) * 1e6), residual_rms_s=rms,
             residual_max_s=rmax, first_pulse_harp_s=float(dst_t[k0d]), last_pulse_harp_s=float(dst_t[k1d]),
-            notes=[f"Transferred from DMD{reg_src.dmd}: HARP = {a:.9f}*FPGA + b fitted on {int(ok.sum())} pulses "
-                   f"(residual {rms*1e6:.1f} us RMS); destination cycles {k0d}..{k1d} lie inside HARP coverage."],
+            notes=[f"Transferred from DMD{reg_src.dmd}: FPGA->HARP by interpolation between {int(ok.sum())} measured pulses "
+                   f"(affine a = {a:.9f}; segment residual {rms*1e6:.1f} us RMS); destination cycles {k0d}..{k1d} lie inside HARP coverage."]
+                  + ([f"{len(steps)} step(s) in the HARP-vs-FPGA relation inside this epoch: "
+                      + ", ".join(f"{st['step_s']*1e3:+.2f} ms at HARP {st['harp_s']:.3f} s" for st in steps)
+                      + "; carried into the mapped times, not smeared."] if steps else []),
             anchor_tolerance_s=float(dst_period) + 0.002,
             pulse_times_harp_s=dst_t[k0d:k1d + 1],
         ))

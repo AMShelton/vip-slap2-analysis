@@ -108,3 +108,17 @@ def test_absolute_fpga_cycle_starts_from_raw_dat(tmp_path):
     assert abs(ts[1][0] - ref_a / FPGA_CLOCK_HZ) < 1e-9
     assert abs((ts[2][0] - ts[1][0]) - 60.0) < 1e-6
     assert ts[1].size == 50 and ts[2].size == 30
+
+
+def test_harp_step_inside_epoch_is_detected_and_does_not_break_continuity():
+    # 826031_2026-02-11: a -2.5 ms step in HARP-vs-FPGA inside one acquisition
+    reg, abs_ts = _session()
+    e2 = reg.epochs[1]
+    p = np.asarray(e2.pulse_times_harp_s, dtype=float).copy()
+    p[1500:] -= 0.0025
+    e2.pulse_times_harp_s = p
+    chk = cross_epoch_fpga_check(reg, abs_ts)
+    assert len(chk.relation_steps) == 1 and abs(chk.relation_steps[0]["step_s"] + 0.0025) < 1e-4
+    assert chk.fpga_counter_continuous is True and chk.global_residual_rms_s < 5e-5
+    assert all(x.agrees_within_half_cycle for x in chk.epochs)
+    assert any("step(s) in the HARP-vs-FPGA relation" in l for l in chk.limitations)
