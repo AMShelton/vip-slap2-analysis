@@ -36,6 +36,7 @@ def registration_row(reg, session_id: str, dmd: int) -> dict:
         "relationship": reg.relationship,
         "unmatched_di3_trains": len(reg.inputs.get("unmatched_di3_trains", []) or []),
         "wall_clock_offset_estimates": str(reg.wall_clock_evidence.get("epoch_offset_estimates", "")),
+        "pc_clock_discrepancy_s": str(reg.wall_clock_evidence.get("pc_clock_discrepancy_s", "")),
         "acquisition_start_order": reg.acquisition_start_order,
         "start_order_evidence": reg.start_order_evidence,
         "harp_n_rising_edges": reg.harp_n_rising_edges,
@@ -66,6 +67,8 @@ def main(argv=None) -> int:
     ap.add_argument("--session", nargs="*", default=None, help="session IDs (default: all matching filters)")
     ap.add_argument("--indicator", nargs="*", default=None, help="indicator1 filter, e.g. ASAP7y ASAP8")
     ap.add_argument("--session-type", nargs="*", default=None)
+    ap.add_argument("--modality", choices=["voltage", "glutamate"], default=None,
+                    help="voltage = indicator1 contains 'ASAP'; glutamate = everything else")
     ap.add_argument("--dmd", nargs="*", type=int, default=[1, 2])
     ap.add_argument("--out", default=None, help="status CSV path")
     ap.add_argument("--dry-run", action="store_true", help="compute but do not write qc/sync files")
@@ -76,6 +79,9 @@ def main(argv=None) -> int:
     df = reg.sessions(session_types=args.session_type, indicators=args.indicator)
     if args.session:
         df = df[df["session_id"].astype(str).isin(set(args.session))]
+    if args.modality:
+        is_v = df["indicator1"].astype(str).str.lower().str.contains("asap")
+        df = df[is_v] if args.modality == "voltage" else df[~is_v]
     rows = []
     for _, r in df.iterrows():
         sid = str(r["session_id"])
