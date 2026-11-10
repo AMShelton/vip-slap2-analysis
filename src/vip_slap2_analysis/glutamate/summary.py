@@ -1,4 +1,9 @@
-"""Load, normalize, and process SLAP2 glutamate summary files.
+"""LEGACY READER (kept until the modern-vs-legacy comparison is signed off; see
+CONSOLIDATION_AUDIT.md). Prefer io/giant_summary.py and voltage/voltex_summary.py for
+GIAnT/Voltex products. Do not remove before scripts/compare_modern_legacy_summary.py has
+been run on one kept glutamate and one kept voltage session.
+
+Load, normalize, and process SLAP2 glutamate summary files.
 
 This module wraps MATLAB ``summarize_LoCo.m`` ExperimentSummary exports stored as
 MATLAB v7.3 / HDF5 files. It provides lazy access to per-trial DMD groups,

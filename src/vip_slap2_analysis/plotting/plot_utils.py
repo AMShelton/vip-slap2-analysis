@@ -13,7 +13,6 @@ from typing import List, Optional, Sequence
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from vip_slap2_analysis.utils.utils import save_figure
 
 
 def apply_plot_style() -> None:
@@ -81,6 +80,8 @@ def finalize_and_save_figure(
         formats = [".pdf", ".png"]
 
     fig.tight_layout()
+    from vip_slap2_analysis.utils.utils import save_figure  # lazy: utils pulls heavy deps
+
     save_figure(fig, str(save_path_stem), formats=list(formats), dpi=dpi)
 
     if close:
