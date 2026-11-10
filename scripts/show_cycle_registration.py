@@ -17,7 +17,7 @@ EPOCH = ("source_epoch_index", "di3_epoch_index", "n_source_cycles", "n_observed
 
 for pattern in sys.argv[1:]:
     for f in sorted(glob.glob(pattern)):
-        d = json.load(open(f))
+        d = json.load(open(f, encoding="utf-8"))
         out = {k: d.get(k) for k in TOP}
         out["inputs"] = {k: v for k, v in d.get("inputs", {}).items() if k != "summary_epochs"}
         out["summary_epochs"] = d.get("inputs", {}).get("summary_epochs")

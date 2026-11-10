@@ -181,7 +181,7 @@ def main(argv=None) -> int:
     if a.per_epoch:
         report["per_epoch"] = per_epoch_comparison(asset, runs, a.dmd, out, a.session, a.trace_signal)
     report["registered_qc_json"] = runs["registered"]["qc_json"]; report["legacy_qc_json"] = runs["legacy"]["qc_json"]
-    (out / f"{a.session}_before_after.json").write_text(json.dumps(report, indent=2, default=str))
+    (out / f"{a.session}_before_after.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     print(json.dumps(report["per_dmd"], indent=1))
     print("wrote", out)
     return 0

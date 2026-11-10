@@ -197,7 +197,7 @@ def main(argv=None) -> int:
         fig.suptitle(f"{sid} DMD{args.dmd} epoch {args.epoch}: cross-clock signal probe", fontsize=10); fig.tight_layout()
         out_dir = Path(asset.qc_dir) / "sync"; out_dir.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_dir / f"cross_clock_probe_DMD{args.dmd}_epoch{args.epoch}.png", dpi=130); plt.close(fig)
-        (out_dir / f"cross_clock_probe_DMD{args.dmd}_epoch{args.epoch}.json").write_text(json.dumps(res, indent=1))
+        (out_dir / f"cross_clock_probe_DMD{args.dmd}_epoch{args.epoch}.json").write_text(json.dumps(res, indent=1), encoding="utf-8")
         print(f"  wrote {out_dir / f'cross_clock_probe_DMD{args.dmd}_epoch{args.epoch}.png'}")
     return 0
 

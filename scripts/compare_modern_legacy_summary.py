@@ -104,7 +104,7 @@ def main(argv=None) -> int:
     rep = compare(Path(a.modern), Path(a.legacy), max_trials=a.max_trials)
     txt = json.dumps(rep, indent=2, default=str)
     if a.out:
-        Path(a.out).write_text(txt)
+        Path(a.out).write_text(txt, encoding="utf-8")
         print(f"wrote {a.out}")
     print("verdict:", rep["verdict"])
     for p in rep["problems"]:

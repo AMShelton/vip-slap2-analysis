@@ -320,7 +320,7 @@ def run_fpga_cross_epoch_check(asset: Any, *, dmd: int, dynamic_data_dir: PathLi
     if save and getattr(asset, "qc_dir", None) is not None:
         p = check_paths(asset.qc_dir, dmd)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(d, indent=1, default=_json_default))
+        p.write_text(json.dumps(d, indent=1, default=_json_default), encoding="utf-8")
     return chk
 
 

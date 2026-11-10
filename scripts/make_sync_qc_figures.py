@@ -47,7 +47,7 @@ def reference_figures(ref: Path, out: Path) -> None:
     reg = register_di3_to_source_cycles(rise_times_s=rec.rise_times_s, record_start_s=rec.record_start_s,
                                         record_end_s=rec.record_end_s, source_epochs=src, dmd=1,
                                         session_id=ref.name, inputs={"harp_recording": rec.to_dict()})
-    (out / "reference_registration_DMD1.json").write_text(json.dumps(reg.to_dict(), indent=2, default=str))
+    (out / "reference_registration_DMD1.json").write_text(json.dumps(reg.to_dict(), indent=2, default=str), encoding="utf-8")
     plot_registration_coverage(reg).savefig(out / "reference_registration_coverage.png", dpi=150); plt.close("all")
     plot_pulse_residuals(reg, source_cycle_start_s=timing.cycle_start_s).savefig(out / "reference_pulse_residuals.png", dpi=150); plt.close("all")
 

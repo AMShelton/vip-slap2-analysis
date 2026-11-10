@@ -1437,7 +1437,7 @@ def save_cycle_registration(reg: CycleRegistration, qc_dir: PathLike) -> Path:
     """Write ``qc/sync/cycle_registration_DMD<n>.json`` (+ pulse times ``.npz``)."""
     json_path, npz_path = registration_paths(qc_dir, reg.dmd)
     json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.write_text(json.dumps(reg.to_dict(), indent=2, default=_json_default))
+    json_path.write_text(json.dumps(reg.to_dict(), indent=2, default=_json_default), encoding="utf-8")
     arrays = {f"epoch{e.source_epoch_index}_pulse_times_harp_s": np.asarray(e.pulse_times_harp_s, dtype=float)
               for e in reg.epochs if e.pulse_times_harp_s is not None}
     if arrays:
@@ -1450,7 +1450,7 @@ def load_cycle_registration(qc_dir: PathLike, dmd: int) -> Optional[CycleRegistr
     json_path, npz_path = registration_paths(qc_dir, dmd)
     if not json_path.exists():
         return None
-    d = json.loads(json_path.read_text())
+    d = json.loads(json_path.read_text(encoding="utf-8"))
     if d.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"{json_path}: unsupported schema {d.get('schema_version')!r}")
     pulses: Dict[str, np.ndarray] = {}
