@@ -647,7 +647,10 @@ def _resolve_integer_line_epochs(
         rel_steps = detect_relation_steps(x, y)
         rms, rmax = _segment_fit_residuals(x, y, rel_steps)
         if rms > max_segment_rms_s:
-            e.notes.append(f"Integer-line cadence: pulses do not sit on the FPGA line grid (residual {rms*1e6:.0f} us RMS within segments); left unresolved.")
+            r_all = y - (a * x + b)
+            e.notes.append(f"Integer-line cadence: pulses do not sit on the FPGA line grid with L={L} (residual {rms*1e6:.0f} us RMS within "
+                           f"{len(rel_steps) + 1} step-free segment(s), max {rmax*1e6:.0f} us; slope {(a-1)*1e6:+.1f} ppm; "
+                           f"global residual p5/p95 {np.percentile(r_all, 5)*1e6:+.0f}/{np.percentile(r_all, 95)*1e6:+.0f} us); left unresolved.")
             demote(e)
             continue
         mapped = piecewise_fpga_to_harp(cycle_fpga, x, y, rel_steps)

@@ -84,11 +84,68 @@ def _coerce_path(x) -> Optional[Path]:
     return Path(str(x))
 
 
+# One directory walk per session instead of one recursive glob per asset pattern. On the VAST share a
+# session can hold tens of thousands of files (motion_correction/ alone has thousands), and
+# ``glob("**/x")`` walked the whole tree eight or nine times per ``resolve_assets`` call. Folders that
+# never hold registry assets are pruned from the walk.
+_PRUNE_DIR_NAMES = {"motion_correction", ".reorganization_reports", "behavior-videos", ".git", "__pycache__", ".ipynb_checkpoints"}
+_PRUNE_DIR_SUFFIXES = ("_metadata_backup",)
+_TREE_CACHE: dict[str, tuple[list[Path], list[Path]]] = {}
+_TREE_CACHE_MAX = 4
+
+
+def _prune(name: str) -> bool:
+    return name in _PRUNE_DIR_NAMES or name.endswith(_PRUNE_DIR_SUFFIXES)
+
+
+def _tree_index(root: Path) -> tuple[list[Path], list[Path]]:
+    """(files, dirs) below ``root`` (root excluded), cached; pruned folders are skipped entirely."""
+    key = os.path.normcase(str(Path(root).resolve()))
+    hit = _TREE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    files: list[Path] = []
+    dirs: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not _prune(d)]
+        dp = Path(dirpath)
+        dirs.extend(dp / d for d in dirnames)
+        files.extend(dp / f for f in filenames)
+    if len(_TREE_CACHE) >= _TREE_CACHE_MAX:
+        _TREE_CACHE.pop(next(iter(_TREE_CACHE)))
+    _TREE_CACHE[key] = (files, dirs)
+    return files, dirs
+
+
+def clear_tree_cache() -> None:
+    """Forget cached directory walks (call after moving files on disk)."""
+    _TREE_CACHE.clear()
+
+
 def _find_matches(base: Path, pattern: str) -> list[Path]:
-    """Return all recursive matches for ``pattern`` below ``base``."""
+    """Return all recursive matches for ``pattern`` below ``base`` (final path component, case-insensitive)."""
     if base is None or not Path(base).exists():
         return []
-    return [Path(p) for p in sorted(glob.glob(str(Path(base) / "**" / pattern), recursive=True))]
+    import fnmatch
+    base = Path(base)
+    # reuse the walk of an enclosing cached root when there is one
+    key_base = os.path.normcase(str(base.resolve()))
+    root = base
+    for key in _TREE_CACHE:
+        if key_base == key or key_base.startswith(key.rstrip(os.sep) + os.sep):
+            root = Path(key)
+            break
+    files, dirs = _tree_index(root)
+    pat = pattern.lower()
+    under = None if root == base else key_base.rstrip(os.sep) + os.sep
+    out = []
+    for p in files + dirs:
+        if not fnmatch.fnmatchcase(p.name.lower(), pat):
+            continue
+        if under is not None and not os.path.normcase(str(p)).startswith(under):
+            continue
+        out.append(p)
+    return sorted(out)
 
 
 def _path_contains_parts(path: Path, parts: Sequence[str]) -> bool:
@@ -520,6 +577,17 @@ class VIPSessionRegistry:
         """
         row = self.get_session_row(session) if isinstance(session, str) else session
         session_dir = Path(row["session_dir"])
+        # one directory walk per call; every _find_* below reads the cached listing. The cache is
+        # dropped again on return so files written between calls are always seen.
+        clear_tree_cache()
+        if session_dir.exists():
+            _tree_index(session_dir)
+        try:
+            return self._resolve_assets_indexed(row, session_dir, summary_preference=summary_preference)
+        finally:
+            clear_tree_cache()
+
+    def _resolve_assets_indexed(self, row, session_dir: Path, *, summary_preference: str) -> SessionAssets:
 
         summary_mat = _find_one(
             session_dir,
