@@ -672,6 +672,8 @@ def _resolve_integer_line_epochs(
         e.anchor_tolerance_s = cyc_period + 0.002
         e.relation_steps = rel_steps
         e.pulse_times_harp_s = mapped[:n_cov]
+        # the first-pass notes ("only coverage anchors are reported", "unverified phase") are superseded here
+        e.notes = [n for n in e.notes if "Only coverage anchors are reported" not in n and "first pulse assumed to mark acquisition start" not in n]
         e.notes.append(f"Integer-line DI3 cadence: {L} lines per pulse; pulse j taken as line j*{L} with the first pulse at line 0 "
                        f"(head anchor, {e.lead_s:.3f} s of DI3-low lead; the pulse phase within the first {L} lines is assumed). "
                        f"{int(inside.sum())} pulses fitted to the FPGA line grid: slope {a:.9f} ({(a-1)*1e6:+.1f} ppm), residual {rms*1e6:.1f} us RMS. "
