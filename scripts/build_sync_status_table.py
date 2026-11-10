@@ -94,12 +94,13 @@ def build(summary_xlsx: Path, manifest: Path, registration_csv: Path | None, *, 
     sessions = pd.read_excel(summary_xlsx, sheet_name="sessions")
     sessions["session_date"] = pd.to_datetime(sessions["session_date"], errors="coerce")
     inv = manifest_inventory(manifest)
-    reg = None
-    if registration_csv is not None and Path(registration_csv).exists():
-        reg = pd.read_csv(registration_csv)
-    fpga = None
-    if fpga_check_csv is not None and Path(fpga_check_csv).exists():
-        fpga = pd.read_csv(fpga_check_csv)
+    def _concat(paths):
+        if paths is None:
+            return None
+        paths = [Path(p) for p in (paths if isinstance(paths, (list, tuple)) else [paths]) if Path(p).exists()]
+        return pd.concat([pd.read_csv(p) for p in paths], ignore_index=True) if paths else None
+    reg = _concat(registration_csv)
+    fpga = _concat(fpga_check_csv)
     rows = []
     for _, s in sessions.iterrows():
         sid = str(s["session_id"])
@@ -189,13 +190,13 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--summary-xlsx", required=True)
     ap.add_argument("--manifest", required=True)
-    ap.add_argument("--registration-csv", default=None)
-    ap.add_argument("--fpga-check-csv", default=None, help="output of scripts/check_fpga_cross_epoch.py")
+    ap.add_argument("--registration-csv", nargs="*", default=None, help="one or more outputs of scripts/run_cycle_registration.py")
+    ap.add_argument("--fpga-check-csv", nargs="*", default=None, help="one or more outputs of scripts/check_fpga_cross_epoch.py")
     ap.add_argument("--include-glutamate", action="store_true")
     ap.add_argument("--out", required=True)
     a = ap.parse_args(argv)
-    df = build(Path(a.summary_xlsx), Path(a.manifest), Path(a.registration_csv) if a.registration_csv else None, include_glutamate=a.include_glutamate,
-               fpga_check_csv=Path(a.fpga_check_csv) if a.fpga_check_csv else None)
+    df = build(Path(a.summary_xlsx), Path(a.manifest), a.registration_csv, include_glutamate=a.include_glutamate,
+               fpga_check_csv=a.fpga_check_csv)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(a.out, index=False)
     print(df["sync_classification"].value_counts().to_string())
