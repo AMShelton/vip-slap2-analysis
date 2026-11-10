@@ -1699,8 +1699,11 @@ def _apply_wall_clock_bound(reg: CycleRegistration) -> None:
         if i >= len(acqs):
             continue
         period = float(e.observed_cycle_period_s)
-        # HARP folder stamp ~ HARP recording start; first pulse follows it by lead_s
-        est_k = (harp_t + float(e.lead_s) - float(acqs[i]["slap2_acq_start_local_epoch_s"])) / period
+        # HARP folder stamp ~ HARP recording start; this epoch's first pulse follows it by
+        # (first_pulse - record_start), for every epoch (lead_s is only that for the first train)
+        if not np.isfinite(e.first_pulse_harp_s) or reg.harp_record_start_s is None:
+            continue
+        est_k = (harp_t + (float(e.first_pulse_harp_s) - float(reg.harp_record_start_s)) - float(acqs[i]["slap2_acq_start_local_epoch_s"])) / period
         if e.cycle_index_offset is not None:
             # calibration: how far the two PCs' wall clocks are from the registered truth (seconds, HARP PC minus SLAP2 PC)
             reg.wall_clock_evidence.setdefault("pc_clock_discrepancy_s", {})[str(e.source_epoch_index)] = float((est_k - e.cycle_index_offset) * period)
