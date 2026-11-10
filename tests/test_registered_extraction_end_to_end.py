@@ -146,6 +146,18 @@ def test_glutamate_extraction_selects_true_frame_only_with_registration(tmp_path
     assert qc["per_dmd"]["DMD1"]["cycle_registration"]["leading_samples_by_source_epoch"]["1"] > 0
 
 
+def test_glutamate_extraction_output_subdir_leaves_existing_outputs(tmp_path):
+    asset, truth = _build_session(tmp_path)
+    meta = {"im_rate_hz": FS_FRAMES}
+    kw = dict(metadata=meta, use_synapse_qc=False, trace_signal="dF", trace_mode="ls", cycle_registration=None)
+    base = process_glutamate_extraction(asset, overwrite=True, **kw)
+    sub = process_glutamate_extraction(asset, overwrite=False, output_subdir="reextract_test", **kw)
+    assert sub["status"] == "ok"
+    assert Path(sub["single_npz"]).parent.name == "reextract_test"
+    assert Path(sub["single_npz"]).exists() and Path(base["single_npz"]).exists()
+    assert Path(sub["single_npz"]) != Path(base["single_npz"])
+
+
 def test_voltage_extraction_selects_true_line_only_with_registration(tmp_path):
     asset, truth = _build_session(tmp_path)
     run_cycle_registration(asset, dmd=1, dynamic_data_dir=truth["dd"])

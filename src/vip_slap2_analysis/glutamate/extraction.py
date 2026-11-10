@@ -229,6 +229,7 @@ def process_glutamate_extraction(
     cycle_registration: Any = "auto",
     require_identified_cycle_alignment: bool = False,
     summary_preference: Optional[str] = None,
+    output_subdir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Extract event-aligned glutamate response packages for one registered session asset.
@@ -263,6 +264,11 @@ def process_glutamate_extraction(
 
     glut_dir = Path(asset.derived_dir) / "glutamate"
     glut_qc_dir = Path(asset.qc_dir) / "glutamate"
+    if output_subdir:
+        # Write into derived/glutamate/<output_subdir> and qc/glutamate/<output_subdir> so existing
+        # (e.g. legacy-derived) products are left untouched. Inputs are read from elsewhere.
+        glut_dir = glut_dir / str(output_subdir)
+        glut_qc_dir = glut_qc_dir / str(output_subdir)
     glut_dir.mkdir(parents=True, exist_ok=True)
     glut_qc_dir.mkdir(parents=True, exist_ok=True)
 
