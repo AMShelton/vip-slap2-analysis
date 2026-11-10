@@ -87,6 +87,7 @@ class VoltageSummary:
         self.n_epochs: int = 0
 
         self._summary_layout: str = "unknown"
+        self.summary_format: str = "legacy_dendritic_voltage_mat_h5"
         self._trace_axis: Optional[str] = None
         self._E_layout: str = "dmd_trial"
         self._metadata: Optional[Dict[str, Any]] = None
@@ -731,6 +732,44 @@ class VoltageSummary:
         align them to behavior time.
         """
         return self._read_numeric_summary_group("trialTable", dmd=dmd)
+
+    def get_trial_source_lines(self, dmd: int, trial: int) -> Optional[np.ndarray]:
+        """Return 1-based SLAP2 source line indices of every sample of one trial.
+
+        Split-H5 outputs store ``trialFirstLineGlobal``/``trialLastLineGlobal``
+        attributes on each ``/traces/trial_XXXX`` dataset; otherwise the
+        ``summary/trialLineRanges`` arrays (``firstLineRounded``/``lastLineRounded``
+        or ``trialFirstLineGlobal``/``trialLastLineGlobal``) are used. Samples are
+        lines, so the result is ``arange(first, last + 1)``. Returns ``None`` when
+        the information is not stored.
+        """
+        self._validate_dmd(dmd)
+        trial0 = self._validate_trial(trial)
+        first = last = None
+        if self._summary_layout == "split_h5" and self._h5 is not None:
+            name = f"traces/trial_{trial0 + 1:04d}"
+            if name in self._h5:
+                attrs = self._h5[name].attrs
+                for fk, lk in (("trialFirstLineGlobal", "trialLastLineGlobal"), ("firstLineRounded", "lastLineRounded")):
+                    if fk in attrs and lk in attrs:
+                        try:
+                            first = int(np.asarray(attrs[fk]).ravel()[0]); last = int(np.asarray(attrs[lk]).ravel()[0])
+                        except Exception:
+                            first = last = None
+                        if first is not None:
+                            break
+        if first is None:
+            ranges = self.get_trial_line_ranges(dmd=dmd)
+            for fk, lk in (("trialFirstLineGlobal", "trialLastLineGlobal"), ("firstLineRounded", "lastLineRounded")):
+                if fk in ranges and lk in ranges:
+                    fa = np.asarray(ranges[fk], dtype=float).reshape(-1)
+                    la = np.asarray(ranges[lk], dtype=float).reshape(-1)
+                    if trial0 < fa.size and trial0 < la.size and np.isfinite(fa[trial0]) and np.isfinite(la[trial0]):
+                        first, last = int(round(fa[trial0])), int(round(la[trial0]))
+                        break
+        if first is None or last is None or last < first:
+            return None
+        return np.arange(first, last + 1, dtype=np.int64)
 
     def _read_group_scalars(self, group: h5py.Group) -> Dict[str, Any]:
         """Read scalar-like datasets from a metadata group into a dictionary."""

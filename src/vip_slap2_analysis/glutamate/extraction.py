@@ -18,7 +18,12 @@ import numpy as np
 from vip_slap2_analysis.common.session import SessionAssets
 from vip_slap2_analysis.common.epoch_alignment import DEFAULT_MIN_EPOCH_DURATION_SEC
 from vip_slap2_analysis.common.clock_qc import compare_slap2_harp_clock
+from vip_slap2_analysis.common.cycle_registration import (
+    require_identified_registration,
+    resolve_cycle_registration,
+)
 from vip_slap2_analysis.glutamate.summary import GlutamateSummary
+from vip_slap2_analysis.io.summary_loader import load_glutamate_summary
 from vip_slap2_analysis.common.alignment import (
     EventWindows,
     align_traces_to_session_intervals,
@@ -31,6 +36,7 @@ from vip_slap2_analysis.common.alignment import (
     filter_intervals_to_epochs,
     filter_ordered_images_to_epochs,
     load_corrected_bonsai_csv,
+    resolve_corrected_event_log,
     load_imaging_epochs_csv,
     reconstruct_dmd_session_traces,
     summarize_event_tensor,
@@ -220,14 +226,24 @@ def process_glutamate_extraction(
     strict_epoch_match: bool = True,
     epoch_scale_mode: str = "never",
     min_epoch_duration_sec: float = DEFAULT_MIN_EPOCH_DURATION_SEC,
+    cycle_registration: Any = "auto",
+    require_identified_cycle_alignment: bool = False,
+    summary_preference: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Extract event-aligned glutamate response packages for one registered session asset.
-    
+
     The pipeline loads corrected stimulus events and imaging epochs, reconstructs
     continuous traces for each DMD, extracts event-aligned image/change/omission
     snippets, builds change-locked sequence summaries, applies optional synapse QC,
     writes compressed NPZ outputs, and saves extraction QC metadata as JSON.
+
+    The summary is opened through
+    :func:`vip_slap2_analysis.io.summary_loader.load_glutamate_summary` (GIAnT
+    ``experiment_summary.h5`` first, legacy ``SummaryLoCo*.mat`` fallback) and the
+    selection is recorded as ``summary_provenance``. ``cycle_registration`` /
+    ``require_identified_cycle_alignment`` behave as in
+    :func:`vip_slap2_analysis.voltage.extraction.process_voltage_extraction`.
     """
     metadata = metadata or {}
     pp = metadata.get("prepost_sec", {})
@@ -238,8 +254,8 @@ def process_glutamate_extraction(
     )
     im_rate_hz = _resolve_im_rate_hz(asset, metadata)
 
-    if asset.summary_mat is None:
-        raise FileNotFoundError("asset.summary_mat is missing")
+    if asset.summary_mat is None and asset.get_asset("glutamate", "summary_h5") is None:
+        raise FileNotFoundError("asset.summary_mat is missing and no GIAnT experiment_summary.h5 was found")
     if asset.bonsai_event_log_csv is None:
         raise FileNotFoundError("asset.bonsai_event_log_csv is missing")
     if asset.qc_dir is None or asset.derived_dir is None:
@@ -265,7 +281,7 @@ def process_glutamate_extraction(
             "qc_json": str(qc_json),
         }
 
-    stim_df = load_corrected_bonsai_csv(asset.bonsai_event_log_csv)
+    stim_df = load_corrected_bonsai_csv(resolve_corrected_event_log(asset))
     epoch_df = load_imaging_epochs_csv(
         Path(asset.qc_dir) / "behavior" / "imaging_epochs.csv",
         min_duration_sec=min_epoch_duration_sec,
@@ -286,7 +302,15 @@ def process_glutamate_extraction(
     omission_times_f = filter_intervals_to_epochs(omission_times, epoch_df, pre_time=windows.omission[0], post_time=windows.omission[1])
     ordered_images_f = filter_ordered_images_to_epochs(ordered_images, epoch_df, pre_time=windows.image[0], post_time=windows.image[1])
 
-    exp = GlutamateSummary(asset.summary_mat)
+    exp, summary_provenance = load_glutamate_summary(asset, prefer=summary_preference)
+    registrations: Dict[int, Any] = {}
+    registration_info: Dict[str, Any] = {}
+    for dmd in (1, 2):
+        reg, info = resolve_cycle_registration(asset, dmd, cycle_registration)
+        if require_identified_cycle_alignment and dmd <= int(exp.n_dmds):
+            require_identified_registration(reg, info, dmd=dmd, session_id=str(asset.session_id))
+        registrations[dmd] = reg
+        registration_info[f"DMD{dmd}"] = info
     clock_qc = compare_slap2_harp_clock(
         exp,
         behavior_qc_dir=Path(asset.qc_dir) / "behavior",
@@ -295,11 +319,16 @@ def process_glutamate_extraction(
     tvecs = _time_vectors(windows, im_rate_hz)
 
     base_meta = {
-        "schema_version": "0.3.1",
+        "schema_version": "0.4.0",
         "session_id": asset.session_id,
         "subject_id": int(asset.subject_id),
-        "summary_mat": str(asset.summary_mat),
-        "bonsai_event_log_csv": str(asset.bonsai_event_log_csv),
+        "summary_mat": str(asset.summary_mat) if asset.summary_mat is not None else None,
+        "summary_provenance": summary_provenance,
+        "summary_format": summary_provenance.get("selected_format"),
+        "summary_path": summary_provenance.get("selected_path"),
+        "cycle_registration": registration_info,
+        "require_identified_cycle_alignment": bool(require_identified_cycle_alignment),
+        "bonsai_event_log_csv": str(resolve_corrected_event_log(asset)),
         "im_rate_hz": float(im_rate_hz),
         "windows_sec": {
             "image": tuple(float(x) for x in windows.image),
@@ -337,10 +366,14 @@ def process_glutamate_extraction(
     seq_pkg: Dict[str, Any] = {"metadata": base_meta, "timebase_sec": {"image": tvecs["image"]}, "DMD1": {}, "DMD2": {}}
 
     qc: Dict[str, Any] = {
-        "schema_version": "0.3.1",
+        "schema_version": "0.4.0",
         "session_id": asset.session_id,
-        "summary_mat": str(asset.summary_mat),
-        "bonsai_event_log_csv": str(asset.bonsai_event_log_csv),
+        "summary_mat": str(asset.summary_mat) if asset.summary_mat is not None else None,
+        "summary_provenance": summary_provenance,
+        "summary_format": summary_provenance.get("selected_format"),
+        "cycle_registration": registration_info,
+        "require_identified_cycle_alignment": bool(require_identified_cycle_alignment),
+        "bonsai_event_log_csv": str(resolve_corrected_event_log(asset)),
         "use_synapse_qc": bool(use_synapse_qc),
         "trace_signal": str(trace_signal),
         "trace_mode": None if trace_mode is None else str(trace_mode),
@@ -375,6 +408,9 @@ def process_glutamate_extraction(
     seq_events = build_change_locked_sequences(ordered_images_f)
 
     for dmd in (1, 2):
+        if dmd > int(exp.n_dmds) or (len(exp.valid_trials) >= dmd and not exp.valid_trials[dmd - 1]):
+            qc["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "DMD not present in summary or no valid trials"}
+            continue
         bundle = reconstruct_dmd_session_traces(
             exp,
             dmd=dmd,
@@ -387,10 +423,19 @@ def process_glutamate_extraction(
             scale_epochs=epoch_scale_mode,
             strict_epoch_match=strict_epoch_match,
             min_epoch_duration_sec=min_epoch_duration_sec,
+            cycle_registration=registrations.get(dmd),
         )
         if bundle.traces.size == 0:
             qc["per_dmd"][f"DMD{dmd}"] = {"skipped": True, "reason": "no valid traces"}
             continue
+        _creg = (bundle.metadata or {}).get("cycle_registration", {})
+        if require_identified_cycle_alignment and (
+            not _creg.get("applied", False) or _creg.get("epochs_without_measured_times")
+        ):
+            raise RuntimeError(
+                f"{asset.session_id} DMD{dmd}: identified cycle registration could not be applied to every epoch: "
+                f"{_creg.get('reason') or _creg.get('epochs_without_measured_times') or 'unknown reason'}"
+            )
 
         syn_mask = _load_synapse_qc_mask(asset, dmd) if use_synapse_qc else None
         n_syn_total = int(bundle.traces.shape[0])
@@ -482,6 +527,9 @@ def process_glutamate_extraction(
             "epoch_qc": (bundle.metadata or {}).get("epoch_qc", {}),
             "source_epoch_qc": (bundle.metadata or {}).get("source_epoch_qc", []),
             "source_epoch_durations_sec": (bundle.metadata or {}).get("source_epoch_durations_sec", {}),
+            "cycle_registration": (bundle.metadata or {}).get("cycle_registration", {}),
+            "timebase_method_by_epoch": (bundle.metadata or {}).get("timebase_method_by_epoch", {}),
+            "trial_source_start_samples": (bundle.metadata or {}).get("trial_source_start_samples", []),
             "source_acquisition_epochs": exp.get_dmd_epoch_metadata(dmd),
             "n_image_ids_extracted": int(len(image_count_by_id)),
             "image_count_by_id": image_count_by_id,

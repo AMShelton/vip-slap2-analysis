@@ -18,9 +18,24 @@ three canonical folders are created beside the supplied session directory.
 
 Supported source-extraction conventions
 ---------------------------------------
+``source_extraction`` is organized by modality (inferred from the indicator,
+see ``infer_modality``)::
+
+    source_extraction/Voltage/{experiment_summary.h5, dendriticVoltageExtraction/}
+    source_extraction/Glutamate/{experiment_summary.h5, SILo/, summarize_LoCo/, ExperimentSummary/}
+
 * Voltage: ``dendriticVoltageExtraction`` containing paired
-  ``dendriticVoltageSummary-*.mat`` and ``dendriticVoltageTraces-*.h5`` files.
-* Glutamate: ``ExperimentSummary`` (for example ``SummaryLoCo-*.mat``).
+  ``dendriticVoltageSummary-*.mat`` and ``dendriticVoltageTraces-*.h5`` files;
+  Voltex output (``dynamic_data/Voltage/experiment_summary.h5``) moves whole to
+  ``source_extraction/Voltage``. ``trial_table.h5``/``trialTable.h5`` go to the
+  processed root and overwrite an existing copy; ``ALIGNMENTDATA.h5`` goes to
+  ``motion_correction``.
+* Glutamate: ``ExperimentSummary`` (for example ``SummaryLoCo-*.mat``) and GIAnT
+  ``experiment_summary.h5`` / ``SILo`` / ``summarize_LoCo``.
+
+``--restructure-processed`` applies the same layout to an *existing* processed
+folder and moves any ``analysis`` folder found inside it to ``<session>/analysis``
+(the session-level folder next to raw and processed that the registry reads).
 
 Vascular reference images whose names contain variants of
 ``localvasculature`` or ``VasMap`` remain in the canonical raw session root.
@@ -33,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -65,6 +81,14 @@ SOURCE_EXTRACTION_DIR_NAMES = {
     "dendriticvoltageextraction": "dendriticVoltageExtraction",
     "experimentsummary": "ExperimentSummary",
 }
+ANALYSIS_DIR_NAME = "analysis"
+MODALITY_DIRS = {"glutamate": "Glutamate", "voltage": "Voltage"}
+SE_LEGACY_DIRS = {
+    "experimentsummary": ("Glutamate", "ExperimentSummary"),
+    "dendriticvoltageextraction": ("Voltage", "dendriticVoltageExtraction"),
+}
+GIANT_METHOD_DIRS = {"silo": "SILo", "summarize_loco": "summarize_LoCo"}
+PROCESSED_NAME_RE = r"^%s_slap2?_"
 
 
 @dataclass
@@ -76,6 +100,7 @@ class MoveRecord:
     category: str
     reason: str
     status: str = "PLANNED"
+    overwrite: bool = False
 
 
 @dataclass
@@ -100,15 +125,18 @@ class ReorgPlan:
     raw_root: Path
     processed_root: Path
     overflow_root: Path
+    modality: str = "unknown"
     records: list[MoveRecord] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
-    def add(self, src: Path, dst: Path, category: str, reason: str) -> None:
+    def add(
+        self, src: Path, dst: Path, category: str, reason: str, overwrite: bool = False
+    ) -> None:
         """Append a planned move if source and destination differ."""
         if _same_path(src, dst):
             return
         self.records.append(
-            MoveRecord(src=src, dst=dst, category=category, reason=reason)
+            MoveRecord(src=src, dst=dst, category=category, reason=reason, overwrite=overwrite)
         )
 
 
@@ -220,6 +248,25 @@ def find_session_dirs(
     return sorted(set(sessions))
 
 
+def find_organized_sessions(root: Path, subject_ids: Optional[Set[str]] = None) -> list[Path]:
+    """Session folders below ``root`` that already have a processed folder (nested container or raw sibling)."""
+    root = root.expanduser().resolve()
+    found: list[Path] = []
+    for path in [root] + [p for p in root.rglob("*") if p.is_dir()]:
+        match = SESSION_RE.fullmatch(path.name)
+        if match is None or path.parent.name == path.name:
+            continue
+        if subject_ids and match.group("mouse") not in subject_ids:
+            continue
+        try:
+            processed, _ = find_processed_dir(path)
+        except RuntimeError:
+            continue
+        if processed is not None:
+            found.append(path)
+    return sorted(set(found))
+
+
 # -----------------------------------------------------------------------------
 # Routing helpers
 # -----------------------------------------------------------------------------
@@ -256,7 +303,7 @@ def is_motion_or_registered_output(path: Path) -> bool:
     """Return true for known registered/downsampled/alignment outputs."""
     name = path.name.lower()
     return (
-        name.endswith("_alignmentdata.mat")
+        re.search(r"alignmentdata\.(mat|h5)$", name) is not None
         or "registered" in name
         or "downsampled" in name
         or re.match(r"^e\d+t\d+dmd\d+_.*", name) is not None
@@ -264,7 +311,62 @@ def is_motion_or_registered_output(path: Path) -> bool:
 
 
 def is_trial_table(path: Path) -> bool:
-    return path.name.lower().startswith("trialtable.")
+    name = path.name.lower()
+    return name.startswith("trialtable.") or name.startswith("trial_table.")
+
+
+def is_trial_table_h5(path: Path) -> bool:
+    """Voltex/GIAnT trial table; always overwrites the processed-root copy."""
+    return path.name.lower() in ("trialtable.h5", "trial_table.h5")
+
+
+def infer_modality(text: str) -> str:
+    """``glutamate`` / ``voltage`` / ``glutamate+voltage`` / ``unknown`` from an indicator or path string."""
+    low = str(text or "").lower()
+    has_glu, has_asap = "iglu" in low, "asap" in low
+    if has_glu and has_asap:
+        return "glutamate+voltage"
+    return "glutamate" if has_glu else "voltage" if has_asap else "unknown"
+
+
+def modality_from_registry(summary_xlsx: Path, session_id: str) -> str:
+    """Modality from the registry's ``indicator1`` column (VIP_SD_summary.xlsx)."""
+    from vip_slap2_analysis.io.session_registry import VIPSessionRegistry
+
+    row = VIPSessionRegistry.from_excel(summary_xlsx).get_session_row(session_id)
+    return infer_modality(row.get("indicator1", ""))
+
+
+def summary_modality_dir(name: str, modality: str) -> Optional[str]:
+    """Modality folder under ``source_extraction`` for a summary file."""
+    low = name.lower()
+    if low in ("voltagesummary.h5", "voltage_summary.h5") or low.startswith("dendriticvoltage"):
+        return "Voltage"
+    if low.startswith("summaryloco") or low.startswith("experimentsummary"):
+        return "Glutamate"
+    if low == "experiment_summary.h5":
+        return MODALITY_DIRS.get(modality)
+    return None
+
+
+def legacy_se_path(processed_root: Path, canonical: str) -> Path:
+    sub = "Voltage" if canonical == "dendriticVoltageExtraction" else "Glutamate"
+    return processed_root / "source_extraction" / sub / canonical
+
+
+def se_tail_dst(processed_root: Path, tail: Path, modality: str) -> Path:
+    """Destination for a path found below a ``source_extraction`` folder."""
+    se = processed_root / "source_extraction"
+    first = tail.parts[0].lower() if tail.parts else ""
+    if first in GIANT_METHOD_DIRS:
+        return se / "Glutamate" / GIANT_METHOD_DIRS[first] / Path(*tail.parts[1:])
+    if first in ("voltage", "glutamate"):
+        return se / tail
+    if len(tail.parts) == 1:
+        sub = summary_modality_dir(tail.name, modality)
+        if sub:
+            return se / sub / tail.name
+    return se / tail
 
 
 def copy_tail_after_named_part(rel: Path, part_name: str) -> Path:
@@ -284,6 +386,7 @@ def copy_tail_after_named_part(rel: Path, part_name: str) -> Path:
 def build_reorganization_plan(
     target_session_dir: Path,
     layout: str = "nested",
+    modality: str = "unknown",
 ) -> ReorgPlan:
     """Build a conservative reorganization plan for one SLAP2 session."""
     target_session_dir = target_session_dir.expanduser().resolve()
@@ -307,6 +410,7 @@ def build_reorganization_plan(
         raw_root=output_base / names.raw_root_name,
         processed_root=output_base / names.processed_root_name,
         overflow_root=output_base / names.overflow_root_name,
+        modality=modality,
     )
 
     for root in (plan.raw_root, plan.processed_root, plan.overflow_root):
@@ -379,7 +483,7 @@ def route_top_level_child(child: Path, plan: ReorgPlan) -> None:
     if canonical_dir is not None:
         plan.add(
             child,
-            plan.processed_root / "source_extraction" / canonical_dir,
+            legacy_se_path(plan.processed_root, canonical_dir),
             "processed",
             "%s source-extraction directory" % canonical_dir,
         )
@@ -390,6 +494,7 @@ def route_top_level_child(child: Path, plan: ReorgPlan) -> None:
             child,
             plan.processed_root
             / "source_extraction"
+            / "Voltage"
             / "dendriticVoltageExtraction"
             / child.name,
             "processed",
@@ -398,7 +503,13 @@ def route_top_level_child(child: Path, plan: ReorgPlan) -> None:
         return
 
     if is_trial_table(child):
-        plan.add(child, plan.processed_root / child.name, "processed", "trial table")
+        plan.add(
+            child,
+            plan.processed_root / child.name,
+            "processed",
+            "trial table",
+            overwrite=is_trial_table_h5(child),
+        )
         return
 
     if child.name.lower() == "annotations.mat":
@@ -457,7 +568,7 @@ def route_slap2_tree(path: Path, slap2_root: Path, plan: ReorgPlan) -> None:
         if src.is_dir():
             continue
         dst, category, reason = route_slap2_file(src, slap2_root, plan)
-        plan.add(src, dst, category, reason)
+        plan.add(src, dst, category, reason, overwrite=is_trial_table_h5(src))
 
 
 def route_slap2_file(
@@ -475,6 +586,7 @@ def route_slap2_file(
         return (
             plan.processed_root
             / "source_extraction"
+            / "Voltage"
             / "dendriticVoltageExtraction"
             / tail,
             "processed",
@@ -484,15 +596,81 @@ def route_slap2_file(
     if "experimentsummary" in lower_parts:
         tail = copy_tail_after_named_part(rel, "ExperimentSummary")
         return (
-            plan.processed_root / "source_extraction" / "ExperimentSummary" / tail,
+            plan.processed_root
+            / "source_extraction"
+            / "Glutamate"
+            / "ExperimentSummary"
+            / tail,
             "processed",
             "ExperimentSummary glutamate source-extraction asset",
+        )
+
+    if "source_extraction" in lower_parts:
+        tail = copy_tail_after_named_part(rel, "source_extraction")
+        return (
+            se_tail_dst(plan.processed_root, tail, plan.modality),
+            "processed",
+            "source_extraction output inside raw",
+        )
+
+    if "motion_correction" in lower_parts:
+        tail = copy_tail_after_named_part(rel, "motion_correction")
+        return (
+            plan.processed_root / "motion_correction" / tail,
+            "processed",
+            "motion_correction output inside raw",
+        )
+
+    if lower_name == "experiment_summary.h5":
+        sub = "Voltage" if "voltage" in lower_parts else MODALITY_DIRS.get(plan.modality)
+        if sub is None:
+            plan.warnings.append(
+                "experiment_summary.h5 with unknown modality (%s) placed in source_extraction root"
+                % plan.modality
+            )
+        return (
+            plan.processed_root / "source_extraction" / (sub or "") / src.name,
+            "processed",
+            "preprocessing summary (experiment_summary.h5)",
+        )
+
+    if is_trial_table_h5(src):
+        return (
+            plan.processed_root / src.name,
+            "processed",
+            "trial table h5 (overwrites processed copy)",
+        )
+
+    if lower_name == "alignmentdata.h5" or lower_name.endswith("_alignmentdata.h5"):
+        return (
+            plan.processed_root / "motion_correction" / src.name,
+            "processed",
+            "ALIGNMENTDATA.h5 motion product",
+        )
+
+    if "voltage" in lower_parts:
+        return (
+            plan.processed_root
+            / "source_extraction"
+            / "Voltage"
+            / copy_tail_after_named_part(rel, "Voltage"),
+            "processed",
+            "Voltex output folder (Voltage/) inside raw",
+        )
+
+    sub = summary_modality_dir(src.name, plan.modality)
+    if sub and lower_name != "experiment_summary.h5" and not is_voltage_processed_asset(src):
+        return (
+            plan.processed_root / "source_extraction" / sub / src.name,
+            "processed",
+            "preprocessing summary file",
         )
 
     if is_voltage_processed_asset(src):
         return (
             plan.processed_root
             / "source_extraction"
+            / "Voltage"
             / "dendriticVoltageExtraction"
             / src.name,
             "processed",
@@ -509,7 +687,7 @@ def route_slap2_file(
             "source-extraction annotations",
         )
 
-    if lower_name.endswith("_alignmentdata.mat") or is_motion_or_registered_output(src):
+    if is_motion_or_registered_output(src):
         return (
             plan.processed_root / "motion_correction" / src.name,
             "processed",
@@ -645,24 +823,111 @@ def create_destination_roots(plan: ReorgPlan, execute: bool) -> None:
             root.mkdir(parents=True, exist_ok=True)
 
 
-def execute_plan(plan: ReorgPlan, execute: bool) -> None:
+def execute_plan(plan: ReorgPlan, execute: bool, create_roots: bool = True) -> None:
     """Dry-run or execute all planned moves."""
-    create_destination_roots(plan, execute=execute)
+    if create_roots:
+        create_destination_roots(plan, execute=execute)
     for rec in sorted(plan.records, key=lambda r: (-len(r.src.parts), str(r.src))):
-        rec.status = move_one(rec.src, rec.dst, execute=execute)
+        rec.status = move_one(rec.src, rec.dst, execute=execute, overwrite=rec.overwrite)
 
 
-def move_one(src: Path, dst: Path, execute: bool) -> str:
-    """Move one file/directory with overwrite protection."""
+def move_one(src: Path, dst: Path, execute: bool, overwrite: bool = False) -> str:
+    """Move one file/directory; existing destinations are kept unless ``overwrite``."""
     if not src.exists():
         return "MISSING_SOURCE"
-    if dst.exists():
+    if dst.exists() and not overwrite:
         return "DEST_EXISTS"
     if execute:
         dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists():
+            os.replace(src, dst)
+            return "OVERWROTE"
         shutil.move(str(src), str(dst))
         return "MOVED"
     return "DRY_RUN"
+
+
+def find_processed_dir(session_dir: Path) -> tuple[Optional[Path], Path]:
+    """Return (processed folder, session-level base) for a nested container or a sibling-layout raw folder."""
+    rx = re.compile(PROCESSED_NAME_RE % re.escape(session_dir.name))
+    for base in (session_dir, session_dir.parent):
+        hits = sorted(
+            p
+            for p in base.iterdir()
+            if p.is_dir()
+            and rx.match(p.name)
+            and not any(w in p.name for w in ("backup", "metadata", "reorganization"))
+        )
+        if len(hits) == 1:
+            return hits[0], base
+        if len(hits) > 1:
+            raise RuntimeError("Multiple processed folders in %s: %s" % (base, [h.name for h in hits]))
+    return None, session_dir
+
+
+def build_restructure_plan(session_dir: Path, modality: str = "unknown") -> ReorgPlan:
+    """Plan the modality layout for an EXISTING processed folder and pull ``analysis`` products out of it.
+
+    ``source_extraction/experiment_summary.h5`` -> ``source_extraction/<Glutamate|Voltage>/``;
+    ``ExperimentSummary/``, ``SILo/``, ``summarize_LoCo/`` -> ``Glutamate/``;
+    ``dendriticVoltageExtraction/`` -> ``Voltage/``; any ``analysis/`` inside the processed folder
+    (and processed-root ``derived/``, ``qc/``) -> ``<session>/analysis/``. Nothing is overwritten.
+    """
+    session_dir = session_dir.expanduser().resolve()
+    processed, base = find_processed_dir(session_dir)
+    if processed is None:
+        raise FileNotFoundError("No processed folder found for %s" % session_dir)
+    names = infer_session_names(session_dir)
+    plan = ReorgPlan(
+        target_session_dir=session_dir,
+        layout="nested" if base == session_dir else "sibling",
+        output_base=base,
+        raw_root=base / names.raw_root_name,
+        processed_root=processed,
+        overflow_root=base / names.overflow_root_name,
+        modality=modality,
+    )
+    se = processed / "source_extraction"
+    if se.is_dir():
+        for child in sorted(se.iterdir(), key=lambda p: p.name):
+            low = child.name.lower()
+            if child.is_dir():
+                if low in SE_LEGACY_DIRS:
+                    sub, canon = SE_LEGACY_DIRS[low]
+                    plan.add(child, se / sub / canon, "processed", "%s -> %s/" % (canon, sub))
+                elif low in GIANT_METHOD_DIRS:
+                    plan.add(child, se / "Glutamate" / GIANT_METHOD_DIRS[low], "processed", "GIAnT method folder -> Glutamate/")
+                continue
+            if is_voltage_processed_asset(child):
+                plan.add(child, se / "Voltage" / "dendriticVoltageExtraction" / child.name, "processed", "loose voltage asset")
+                continue
+            sub = summary_modality_dir(child.name, modality)
+            if sub:
+                plan.add(child, se / sub / child.name, "processed", "summary file -> %s/" % sub)
+            elif low == "experiment_summary.h5":
+                plan.warnings.append(
+                    "experiment_summary.h5 left in source_extraction: modality is '%s' (decide by hand)" % modality
+                )
+    analysis_dst = base / ANALYSIS_DIR_NAME
+    for root, dirs, files in os.walk(processed):
+        rel = Path(root).relative_to(processed)
+        low = [p.lower() for p in rel.parts]
+        if low[:1] == ["motion_correction"]:
+            dirs[:] = []
+            continue
+        if low and low[-1] == ANALYSIS_DIR_NAME:
+            anchor = Path(root)
+            prefix = Path()
+        elif len(low) == 1 and low[0] in ("derived", "qc"):
+            anchor = Path(root)
+            prefix = Path(rel.parts[0])
+        else:
+            continue
+        for f in anchor.rglob("*"):
+            if f.is_file():
+                plan.add(f, analysis_dst / prefix / f.relative_to(anchor), "analysis", "analysis product inside processed folder")
+        dirs[:] = []
+    return plan
 
 
 def cleanup_empty_dirs(root: Path, execute: bool) -> None:
@@ -711,7 +976,7 @@ def summarize_plan(plan: ReorgPlan) -> str:
         "Overflow root:  %s" % plan.overflow_root,
         "Planned moves:  %d" % len(plan.records),
     ]
-    for key in ("raw", "processed", "overflow"):
+    for key in ("raw", "processed", "overflow", "analysis"):
         lines.append("  %s: %d" % (key, counts.get(key, 0)))
     if statuses:
         lines.append("Statuses:")
@@ -776,6 +1041,25 @@ def build_argparser() -> argparse.ArgumentParser:
         help="After execution, remove empty source folders left behind.",
     )
     parser.add_argument(
+        "--restructure-processed",
+        action="store_true",
+        help=(
+            "Reorganize the EXISTING processed folder (modality layout under source_extraction, "
+            "analysis products moved to <session>/analysis) instead of reorganizing raw."
+        ),
+    )
+    parser.add_argument(
+        "--indicator",
+        default=None,
+        help="Indicator text (e.g. iGluSnFR4f or ASAP7) that sets the modality; default: inferred from the path.",
+    )
+    parser.add_argument(
+        "--summary-xlsx",
+        type=Path,
+        default=None,
+        help="VIP_SD_summary.xlsx; modality is read from the registry's indicator1 column.",
+    )
+    parser.add_argument(
         "--report-dir",
         type=Path,
         default=None,
@@ -802,9 +1086,15 @@ def run_one(
     cleanup: bool,
     report_dir: Optional[Path],
     layout: str,
+    modality: str = "unknown",
+    restructure: bool = False,
 ) -> None:
     """Plan, validate, execute/dry-run, and report one session."""
-    plan = build_reorganization_plan(session_dir, layout=layout)
+    if restructure:
+        plan = build_restructure_plan(session_dir, modality=modality)
+        layout = plan.layout
+    else:
+        plan = build_reorganization_plan(session_dir, layout=layout, modality=modality)
     errors = validate_plan(plan)
     print(summarize_plan(plan))
     if errors:
@@ -813,9 +1103,9 @@ def run_one(
             print("  - %s" % error)
         raise RuntimeError("Plan validation failed; refusing to continue.")
 
-    execute_plan(plan, execute=execute)
-    if cleanup:
-        cleanup_empty_dirs(session_dir, execute=execute)
+    execute_plan(plan, execute=execute, create_roots=not restructure)
+    if cleanup or restructure:
+        cleanup_empty_dirs(plan.processed_root if restructure else session_dir, execute=execute)
 
     mode = "executed" if execute else "dry_run"
     if report_dir is not None:
@@ -826,7 +1116,8 @@ def run_one(
         base_report_dir = session_dir.expanduser().resolve().parent
 
     report_path = base_report_dir / (
-        "%s_slap2_reorganization_%s_report.tsv" % (session_dir.name, mode)
+        "%s_slap2_%s_%s_report.tsv"
+        % (session_dir.name, "restructure" if restructure else "reorganization", mode)
     )
     write_report(plan, report_path)
     print(summarize_plan(plan))
@@ -840,6 +1131,8 @@ def main() -> None:
 
     if args.session_dir is not None:
         sessions = [args.session_dir.expanduser().resolve()]
+    elif args.restructure_processed:
+        sessions = find_organized_sessions(args.root, subject_ids=subject_ids)
     else:
         sessions = find_session_dirs(args.root, subject_ids=subject_ids)
 
@@ -847,12 +1140,20 @@ def main() -> None:
         raise FileNotFoundError("No matching raw SLAP2 session folders found.")
 
     for session_dir in sessions:
+        if args.indicator:
+            modality = infer_modality(args.indicator)
+        elif args.summary_xlsx is not None:
+            modality = modality_from_registry(args.summary_xlsx, session_dir.name)
+        else:
+            modality = infer_modality(str(session_dir))
         run_one(
             session_dir=session_dir,
             execute=args.execute,
             cleanup=args.cleanup_empty_dirs,
             report_dir=args.report_dir,
             layout=args.layout,
+            modality=modality,
+            restructure=args.restructure_processed,
         )
 
 

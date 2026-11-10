@@ -8,6 +8,7 @@ optional creation of configured output directories.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, Any, Mapping
@@ -184,3 +185,19 @@ class SessionAssets:
         if create:
             path.mkdir(parents=True, exist_ok=True)
         return path
+
+
+_PROCESSED_DIR_RE = re.compile(r"^\d{6}_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_slap2?_")
+
+
+def analysis_dir_for(path: "str | Path") -> Path:
+    """Session-level ``analysis`` folder (next to the raw and processed folders) for any path inside a processed folder.
+
+    Layout: ``<session>/{<s>, <s>_slap2_<stamp>, analysis/{derived,qc}}``. Paths that are not inside a processed
+    folder fall back to ``<path or its parent>/analysis``.
+    """
+    p = Path(path)
+    for anc in (p, *p.parents):
+        if _PROCESSED_DIR_RE.match(anc.name):
+            return anc.parent / "analysis"
+    return (p if p.is_dir() else p.parent) / "analysis"
