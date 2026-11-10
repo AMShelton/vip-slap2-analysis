@@ -372,8 +372,11 @@ def piecewise_fpga_to_harp(ts_fpga: np.ndarray, x_fpga: np.ndarray, y_harp: np.n
     """
     ts = np.asarray(ts_fpga, dtype=float)
     out = np.interp(ts, x_fpga, y_harp)
+    # extrapolate with the *local* slope at each end (last/first `n_local` pulses of the end segment), so a
+    # slowly slewing relation is continued from where it actually is, not from a whole-epoch affine fit
+    n_local = 50
     bounds = [0] + [int(st["after_pulse_index"]) + 1 for st in steps] + [int(x_fpga.size)]
-    first = (bounds[0], bounds[1]); last = (bounds[-2], bounds[-1])
+    first = (bounds[0], min(bounds[1], bounds[0] + n_local)); last = (max(bounds[-2], bounds[-1] - n_local), bounds[-1])
     for (lo, hi), side in ((first, "left"), (last, "right")):
         xs, ys = x_fpga[lo:hi], y_harp[lo:hi]
         if xs.size >= 3:
@@ -383,6 +386,27 @@ def piecewise_fpga_to_harp(ts_fpga: np.ndarray, x_fpga: np.ndarray, y_harp: np.n
         m = ts < x_fpga[0] if side == "left" else ts > x_fpga[-1]
         out[m] = a * ts[m] + b
     return out
+
+
+def local_relation_roughness(x_fpga: np.ndarray, y_harp: np.ndarray) -> Tuple[float, float]:
+    """(rms, max) deviation of each pulse from the straight line through its two neighbours, in seconds.
+
+    This is what interpolation between measured pulses actually relies on: local
+    linearity over two pulse intervals. A slow drift or ramp of the HARP-vs-FPGA
+    relation leaves it small; pulse jitter, dropped-pulse mis-assignment or a
+    clock step inside the pair raise it.
+    """
+    if x_fpga.size < 3:
+        return 0.0, 0.0
+    x0, x1, x2 = x_fpga[:-2], x_fpga[1:-1], x_fpga[2:]
+    y0, y1, y2 = y_harp[:-2], y_harp[1:-1], y_harp[2:]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pred = y0 + (y2 - y0) * (x1 - x0) / (x2 - x0)
+    d = y1 - pred
+    d = d[np.isfinite(d)]
+    if d.size == 0:
+        return 0.0, 0.0
+    return float(np.sqrt(np.mean(d * d))), float(np.max(np.abs(d)))
 
 
 def _segment_fit_residuals(x_fpga: np.ndarray, y_harp: np.ndarray, steps: Sequence[Dict[str, float]]) -> Tuple[float, float]:
@@ -1143,22 +1167,29 @@ def transfer_registration_via_fpga(
         # map by interpolation between the measured pulses and judge the fit per step-free segment
         steps = detect_relation_steps(x, y)
         rms, rmax = _segment_fit_residuals(x, y, steps)
+        # The map is interpolation between measured pulses, so the gate is *local* smoothness, not global
+        # affinity: a HARP clock that slews over seconds (826031_02-02/02-11, 803121_10-29, 826033_02-21,
+        # 838410_03-02: 300-530 us RMS about any affine fit, yet smooth) is mapped exactly at every pulse.
+        local_rms, local_max = local_relation_roughness(x, y)
+        # a step that is not instantaneous shows up as an affine residual far above the local roughness
+        nonaffine = rms > max_fit_residual_s and local_rms <= max_fit_residual_s
         dst_t = piecewise_fpga_to_harp(np.asarray(ts_dst, dtype=float), x, y, steps)
         base["relation_steps"] = steps
         t_first = float(pulses[0]); t_last = float(pulses[-1])
         # coverage window with a tolerance for HARP quantization / fit noise (a destination cycle that
         # starts on the same FPGA tick as the first source pulse must count as covered)
-        tol = max(2e-4, 5.0 * rms)
+        tol = max(2e-4, 5.0 * local_rms)
         inside = np.flatnonzero((dst_t >= t_first - tol) & (dst_t <= t_last + float(e.observed_cycle_period_s)))
-        if rms > max_fit_residual_s or inside.size == 0:
+        if local_rms > max_fit_residual_s or inside.size == 0:
             epochs.append(EpochCycleRegistration(
                 **base, n_source_cycles=int(ts_dst.size), n_observed_pulses=0, status=STATUS_INCONSISTENT,
                 cycle_index_offset=None, candidate_offset_range=(0, int(ts_dst.size)), missing_initial_cycles=None,
                 missing_terminal_cycles=None, observed_cycle_period_s=float("nan"), rate_ratio_harp_over_source=float(a),
                 period_error_ppm=float((a - 1) * 1e6), residual_rms_s=rms, residual_max_s=rmax,
                 first_pulse_harp_s=float("nan"), last_pulse_harp_s=float("nan"),
-                notes=[f"HARP~FPGA fit residual {rms*1e6:.1f} us RMS within step-free segments exceeds {max_fit_residual_s*1e6:.0f} us "
-                       f"({len(steps)} relation step(s) detected; global fit {rms_global*1e6:.0f} us), or no destination cycle inside coverage."],
+                notes=[f"HARP-vs-FPGA relation is locally rough ({local_rms*1e6:.0f} us RMS, max {local_max*1e6:.0f} us pulse-to-neighbour deviation; "
+                       f"affine residual {rms*1e6:.0f} us within {len(steps) + 1} segment(s), global {rms_global*1e6:.0f} us): interpolation between pulses "
+                       f"is not reliable, or no destination cycle inside coverage."],
             ))
             continue
         k0d, k1d = int(inside[0]), int(inside[-1])
@@ -1170,7 +1201,9 @@ def transfer_registration_via_fpga(
             rate_ratio_harp_over_source=float(a), period_error_ppm=float((a - 1) * 1e6), residual_rms_s=rms,
             residual_max_s=rmax, first_pulse_harp_s=float(dst_t[k0d]), last_pulse_harp_s=float(dst_t[k1d]),
             notes=[f"Transferred from DMD{reg_src.dmd}: FPGA->HARP by interpolation between {int(ok.sum())} measured pulses "
-                   f"(affine a = {a:.9f}; segment residual {rms*1e6:.1f} us RMS); destination cycles {k0d}..{k1d} lie inside HARP coverage."]
+                   f"(local roughness {local_rms*1e6:.1f} us RMS; affine a = {a:.9f}, residual {rms*1e6:.1f} us RMS); destination cycles {k0d}..{k1d} lie inside HARP coverage."]
+                  + ([f"The HARP-vs-FPGA relation is not affine over this epoch (affine residual {rms*1e6:.0f} us vs local roughness {local_rms*1e6:.0f} us): "
+                      "one clock drifts/slews rather than jumping; interpolation follows it exactly at every pulse."] if nonaffine else [])
                   + ([f"{len(steps)} step(s) in the HARP-vs-FPGA relation inside this epoch: "
                       + ", ".join(f"{st['step_s']*1e3:+.2f} ms at HARP {st['harp_s']:.3f} s" for st in steps)
                       + "; carried into the mapped times, not smeared."] if steps else []),

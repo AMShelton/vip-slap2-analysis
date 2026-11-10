@@ -180,7 +180,7 @@ def cross_epoch_fpga_check(
             if not continuous:
                 limitations.append(
                     f"A single affine HARP~FPGA map does not fit the {len(fit_ids)} identified epochs ({glob_rms*1e6:.0f} us RMS): "
-                    "the FPGA counter is not continuous across these acquisitions (or a counted offset is wrong); "
+                    "the FPGA counter is not continuous across these acquisitions, the HARP-vs-FPGA relation slews within an epoch, or a counted offset is wrong; "
                     "cross-epoch predictions below are not trustworthy.")
         else:
             limitations.append("Only one identified epoch: the fit cannot be validated across acquisitions; predictions for "

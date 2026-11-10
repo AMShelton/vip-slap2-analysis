@@ -155,7 +155,7 @@ def build(summary_xlsx: Path, manifest: Path, registration_csv: Path | None, *, 
             if status == "identified":
                 row["sync_classification"] = "corrected (identified, nonzero cycle offset applied)" if any(float(o) > 0 for o in offs) else "verified_no_offset (identified, first pulse = cycle 0)"
             elif status == "identified_with_assumptions":
-                row["sync_classification"] = "identified_with_assumptions (count-consistent, no coverage margin; review)"
+                row["sync_classification"] = "identified_with_assumptions (offset 0 from head anchor; integer-line DI3 cadence phase or trailing-pulse attribution assumed; see limitations)"
             elif status in ("ambiguous", "inconsistent", "unavailable"):
                 row["sync_classification"] = f"unresolved ({status}: {h.get('limitations', '')})"
             else:

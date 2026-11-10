@@ -498,3 +498,25 @@ def test_integer_line_cadence_delayed_minority_is_dropped_not_averaged():
     times, labels = e.cycle_times_harp_s()
     err = times[labels == 0] - truth(np.arange(n) * lpc)[labels == 0]
     assert np.max(np.abs(err)) < 5e-5          # the delayed pulses must not bias the timebase
+
+
+def test_transfer_follows_a_slow_harp_slew():
+    """A HARP clock slewing 2.5 ms over 20 s is smooth locally: the transfer must interpolate through it, not refuse."""
+    from vip_slap2_analysis.common.cycle_registration import transfer_registration_via_fpga
+    n1, lpc2 = 4000, 150
+    fpga1 = np.arange(n1) * PERIOD
+    period2 = lpc2 / LINE_RATE
+    fpga2 = np.arange(int(n1 * PERIOD / period2)) * period2
+    slew = lambda t: -0.0025 * np.clip((t - 30.0) / 20.0, 0.0, 1.0)         # ramps from 0 to -2.5 ms between t=30 and t=50 s
+    harp = lambda t: 2000.0 + t * (1 + HARP_PPM * 1e-6) + slew(t)
+    t1 = harp(fpga1)
+    reg1 = _reg(t1, t1[0] - 5.0, t1[-1] + 5.0, [SourceEpochCycles(1, n1, LPC, LINE_RATE, cycle_start_s=fpga1)])
+    assert reg1.status == STATUS_IDENTIFIED
+    reg2 = transfer_registration_via_fpga(reg1, src_cycle_start_s={1: fpga1}, dst_cycle_start_s={1: fpga2},
+                                          dst_lines_per_cycle={1: lpc2}, dst_line_rate_hz={1: LINE_RATE}, dst_dmd=2)
+    e = reg2.epochs[0]
+    assert e.status == STATUS_IDENTIFIED, e.notes
+    assert any("not affine" in n for n in e.notes)
+    got = np.asarray(e.pulse_times_harp_s)
+    truth = harp(fpga2)[e.cycle_index_offset:e.cycle_index_offset + got.size]
+    assert np.max(np.abs(got - truth)) < 2e-5                                 # interpolation error on a 2.5 ms / 20 s ramp
