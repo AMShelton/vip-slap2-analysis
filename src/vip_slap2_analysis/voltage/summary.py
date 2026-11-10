@@ -1,4 +1,9 @@
-"""Lazy accessors for SLAP2 dendritic-voltage summary and trace outputs.
+"""LEGACY READER (kept until the modern-vs-legacy comparison is signed off; see
+CONSOLIDATION_AUDIT.md). Prefer io/giant_summary.py and voltage/voltex_summary.py for
+GIAnT/Voltex products. Do not remove before scripts/compare_modern_legacy_summary.py has
+been run on one kept glutamate and one kept voltage session.
+
+Lazy accessors for SLAP2 dendritic-voltage summary and trace outputs.
 
 This module provides :class:`VoltageSummary`, a lightweight reader for voltage
 imaging outputs created by the MATLAB ``extractDendrites_new.m`` pipeline and

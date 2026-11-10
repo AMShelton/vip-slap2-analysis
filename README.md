@@ -20,7 +20,6 @@ assets to reviewable tables and figures explicit, reproducible, and easy to audi
 - [Calcium workflow](#calcium-workflow)
 - [Behavior alignment and validation](#behavior-alignment-and-validation)
 - [Metadata and manifests](#metadata-and-manifests)
-- [Morphology utilities](#morphology-utilities)
 - [Generated analysis outputs](#generated-analysis-outputs)
 - [Coding and documentation standards](#coding-and-documentation-standards)
 - [Current development notes](#current-development-notes)
@@ -56,7 +55,6 @@ vip-slap2-analysis/
 │   ├── calcium/           # soma calcium extraction and plotting notebooks
 │   ├── glutamate/         # glutamate extraction, QC, and analysis notebooks
 │   ├── metadata/          # metadata construction and dataset organization
-│   ├── morphology/        # morphology/tracing notebooks
 │   ├── plotting/          # figure-generation notebooks
 │   ├── qc/                # quality-control notebooks
 │   └── voltage/           # voltage-imaging access and processing notebooks
@@ -66,10 +64,9 @@ vip-slap2-analysis/
 │   ├── common/            # shared session/asset models
 │   ├── glutamate/         # SLAP2 summary loading, alignment, analyses
 │   ├── io/                # MATLAB v7.3/HDF5 helpers and session registry code
-│   ├── metadata/          # dataset manifest and quality overview builders
-│   ├── morphology/        # SNT/SWC loading, metrics, smoothing, plotting
+│   ├── metadata/          # metadata/acquisition JSON generation helpers
 │   ├── packaging/         # reusable packaging helpers for derived datasets
-│   ├── plotting/          # movies, heatmaps, QC plots, and plot utilities
+│   ├── plotting/          # style.py (palettes, saving), movies, heatmaps, QC plots
 │   ├── utils/             # one-off reorganization and helper utilities
 │   └── voltage/           # voltage-imaging processing scaffolding
 └── pyproject.toml
@@ -331,20 +328,6 @@ mouse-level summaries from on-disk assets and QC files. These manifest tables ar
 intended to make batch analyses auditable by exposing which files were present,
 which QC outputs were generated, and how sessions were categorized.
 
-## Morphology utilities
-
-Morphology utilities support reconstruction-derived context for selected VIP
-neurons. Current inputs include SNT/SWC reconstructions and measurement exports.
-The plotting utilities are intended to produce clean vector graphics that can be
-edited in Illustrator.
-
-Typical morphology outputs include:
-
-- XY, XZ, and ZY projections;
-- smoothed display traces for anisotropic z sampling;
-- cable length, branch-point, tip, and branch-order metrics;
-- Sholl-style summaries when exported measurement tables are available.
-
 ## Generated analysis outputs
 
 `run_glutamate_analysis` writes CSV files for all output tables and attempts to
@@ -413,6 +396,9 @@ physiology data, docstrings should answer:
 5. What is returned, and how should downstream code interpret it?
 
 ## Current development notes
+
+- Morphology utilities moved to the `slap2-volume-alignment` repo (2026-11); the T0.3 audit and MATLAB preprocessors were retired. Recover them from the `archive/*` git tags. See `CHANGELOG.md`, `docs/RETROSPECTIVE_SYNC.md` and `docs/CONSOLIDATION_AUDIT.md`.
+- Plot colours: import from `vip_slap2_analysis.plotting.style` (categorical hexes for categories, PNW palettes for continuous data).
 
 - The package is actively evolving and several workflows still live primarily in
   notebooks.
