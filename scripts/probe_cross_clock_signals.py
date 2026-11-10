@@ -112,7 +112,8 @@ def main(argv=None) -> int:
             print(f"{sid}: epoch {args.epoch} not identified; this probe needs ground truth"); continue
         prefix = list_acquisition_prefixes(dyn)[args.epoch - 1]
         paths = find_dmd_dat_files(dyn, args.dmd, prefix=prefix)
-        timing = read_dmd_acquisition_timing(dyn, args.dmd, prefix=prefix)
+        from vip_slap2_analysis.common.cycle_registration import default_timing_cache_dir
+        timing = read_dmd_acquisition_timing(dyn, args.dmd, prefix=prefix, cache_dir=default_timing_cache_dir(asset))
         print(f"{sid}: reading {len(paths)} chunks of {prefix} DMD{args.dmd} ({timing.n_cycles} cycles) ...")
         inten, xo, yo, zf = per_cycle_signals(paths)
         N = inten.size

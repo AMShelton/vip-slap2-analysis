@@ -180,6 +180,18 @@ and a cohort CSV.
 * `scripts/compare_modern_legacy_summary.py` is the numerical gate before trusting a modern file
   over a legacy one on real data (no real `experiment_summary.h5` was available in this sandbox).
 
+### Reading `.dat` headers over the network
+
+`read_cycle_start_headers_sparse` samples one 32-byte header every 25 cycles with explicit seeks,
+interpolates the cycles in between (FPGA cycle starts are line-clock driven: on the reference data
+the interpolation error is < 60 ticks = 0.3 µs against the 32 µs HARP tick), reads any block whose
+endpoints are not an integer number of periods apart exhaustively (dropped/delayed cycles), and
+verifies one random block per file exhaustively, falling back to the full read if the interpolation
+is off by more than 2 µs. On VAST this replaces ~1000 random 4 kB reads per chunk with ~40 seeks and
+one block read. Results are cached per acquisition in `analysis/qc/sync/dat_timing_cache/` (keyed on
+chunk names, sizes, mtimes), so the DMD2 transfer, the cross-epoch check and re-runs never touch the
+`.dat` files again.
+
 ## 5. Operating procedure (historical voltage session)
 
 1. `python scripts/run_cycle_registration.py --summary-xlsx <VIP_SD_summary.xlsx> --session <id> --dmd 1 2 --out <status.csv>`

@@ -28,7 +28,7 @@ def test_dat_header_and_cycle_timestamps_roundtrip(tmp_path):
     timing = read_dmd_acquisition_timing(dd, 1)
     assert timing.n_cycles == 2500 and timing.chunk_cycle_counts == [1000, 1000, 500]
     assert timing.first_cycle_has_start_flag and timing.n_start_of_acq_flags == 1
-    np.testing.assert_allclose(timing.cycle_start_s, truth, atol=1e-9)
+    np.testing.assert_allclose(timing.cycle_start_s, truth, atol=1e-8)   # sparse interpolation: within 2 FPGA ticks (10 ns)
     assert timing.gap_indices.size == 0
     assert abs(timing.median_cycle_period_s - 67 / LINE_RATE_HZ) < 1e-8
     assert list_acquisition_prefixes(dd) == ["acq_1"]
@@ -117,3 +117,57 @@ def test_reference_dmd2_registration_transferred_through_shared_fpga():
     t, lab = e.cycle_times_harp_s()
     assert abs(t[0] - rec.rise_times_s[0]) < 1e-4     # both DMDs start on the same FPGA tick
     assert np.all(lab == 0)
+
+
+def test_sparse_cycle_headers_match_exhaustive_and_find_gaps(tmp_path):
+    import numpy as np
+    from synthetic_slap2 import write_dat_chunks, FPGA_CLOCK_HZ
+    from vip_slap2_analysis.io.slap2_dat import read_cycle_start_headers, read_cycle_start_headers_sparse, read_dat_file_header, find_dmd_dat_files
+    dd = tmp_path / "dd"
+    paths, _ = write_dat_chunks(dd, prefix="acquisition_1", dmd=1, n_cycles=1000, lines_per_cycle=50, reference_timestamp=10_000, cycles_per_chunk=1000)
+    p = paths[0]; h = read_dat_file_header(p)
+    # inject a dropped-cycle gap: shift timestamps of cycles >= 400 by one cycle period (edit the file in place)
+    bpc, base = h.bytesPerCycle, h.firstCycleOffsetBytes
+    import struct
+    period_ticks = int(round(50 * FPGA_CLOCK_HZ / 10686.6669921875))
+    with open(p, "r+b") as f:
+        for c in range(400, 1000):
+            for l in range(50):
+                off = base + c * bpc + l * (40 + 16) + 24
+                f.seek(off); ts = struct.unpack("<Q", f.read(8))[0]; f.seek(off); f.write(struct.pack("<Q", ts + period_ticks))
+    full = read_cycle_start_headers(p, h)
+    sp = read_cycle_start_headers_sparse(p, h, stride=25, verify_blocks=2)
+    assert sp["sparse"] is True
+    assert np.max(np.abs(sp["timestamp"].astype(np.int64) - full["timestamp"].astype(np.int64))) <= 1   # gap block exhaustive; rest within 1 tick
+    assert np.array_equal(sp["lineNumber"], full["lineNumber"])
+    assert sp["n_direct_cycles"] < 200 and sp["n_exhaustive_blocks"] >= 1
+    assert sp["flags"][0] == full["flags"][0]
+
+
+def test_sparse_reader_falls_back_on_jittery_cycles(tmp_path):
+    import numpy as np
+    from synthetic_slap2 import write_dat_chunks
+    from vip_slap2_analysis.io.slap2_dat import read_cycle_start_headers, read_cycle_start_headers_sparse, read_dat_file_header
+    dd = tmp_path / "dd"
+    paths, _ = write_dat_chunks(dd, prefix="acquisition_1", dmd=1, n_cycles=600, lines_per_cycle=20, reference_timestamp=10_000,
+                                cycles_per_chunk=600, cycle_jitter_ticks=5000)       # 25 us jitter per cycle start
+    p = paths[0]; h = read_dat_file_header(p)
+    sp = read_cycle_start_headers_sparse(p, h, stride=25, verify_blocks=3)
+    full = read_cycle_start_headers(p, h)
+    assert sp["sparse"] is False and "fallback_reason" in sp
+    assert np.array_equal(sp["timestamp"], full["timestamp"])
+
+
+def test_timing_cache_roundtrip(tmp_path):
+    import numpy as np
+    from synthetic_slap2 import write_dat_chunks
+    from vip_slap2_analysis.io.slap2_dat import read_dmd_acquisition_timing
+    dd = tmp_path / "dd"
+    write_dat_chunks(dd, prefix="acquisition_1", dmd=1, n_cycles=300, lines_per_cycle=20, reference_timestamp=10_000, cycles_per_chunk=100)
+    cache = tmp_path / "cache"
+    t1 = read_dmd_acquisition_timing(dd, 1, prefix="acquisition_1", cache_dir=cache)
+    files = list(cache.glob("dat_timing_DMD1_*.npz"))
+    assert len(files) == 1
+    t2 = read_dmd_acquisition_timing(dd, 1, prefix="acquisition_1", cache_dir=cache)
+    assert t2.n_cycles == t1.n_cycles and np.array_equal(t2.cycle_start_s, t1.cycle_start_s) and t2.chunk_cycle_counts == t1.chunk_cycle_counts
+    assert t2.reference_timestamp == 10_000 and t2.prefix == "acquisition_1"

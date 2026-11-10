@@ -45,7 +45,8 @@ def main(argv=None) -> int:
         dyn = asset.get_asset("slap2", "dynamic_data_dir")
         if reg is None or dyn is None:
             print(f"{sid}: missing registration or dynamic_data"); continue
-        abs_ts, info = absolute_fpga_cycle_starts(dyn, args.dmd)
+        from vip_slap2_analysis.common.cycle_registration import default_timing_cache_dir
+        abs_ts, info = absolute_fpga_cycle_starts(dyn, args.dmd, cache_dir=default_timing_cache_dir(asset))
         xs, ys, labels = [], [], []
         for e in reg.epochs:
             if e.cycle_index_offset is None or e.pulse_times_harp_s is None or int(e.source_epoch_index) not in abs_ts:

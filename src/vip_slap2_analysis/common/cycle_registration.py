@@ -1729,7 +1729,14 @@ def source_epochs_from_summary(summary: Any, dmd: int) -> List[SourceEpochCycles
     return out
 
 
-def source_epochs_from_raw_dat(dynamic_data_dir: PathLike, dmd: int, *, line_rate_hz: Optional[float] = None) -> List[SourceEpochCycles]:
+def default_timing_cache_dir(asset: Any) -> Optional[Path]:
+    """``<qc_dir>/sync/dat_timing_cache`` when the asset has a qc_dir, else None."""
+    qc = getattr(asset, "qc_dir", None)
+    return Path(qc) / "sync" / "dat_timing_cache" if qc is not None else None
+
+
+def source_epochs_from_raw_dat(dynamic_data_dir: PathLike, dmd: int, *, line_rate_hz: Optional[float] = None,
+                               cache_dir: Optional[PathLike] = None) -> List[SourceEpochCycles]:
     """Build source epochs from raw ``.dat`` headers: one epoch per acquisition prefix (chronological)."""
     from vip_slap2_analysis.io.slap2_dat import (
         list_acquisition_prefixes, read_dmd_acquisition_timing, find_meta_file, read_meta_summary,
@@ -1737,7 +1744,7 @@ def source_epochs_from_raw_dat(dynamic_data_dir: PathLike, dmd: int, *, line_rat
     out: List[SourceEpochCycles] = []
     for i, prefix in enumerate(list_acquisition_prefixes(dynamic_data_dir), start=1):
         try:
-            timing = read_dmd_acquisition_timing(dynamic_data_dir, dmd, prefix=prefix)
+            timing = read_dmd_acquisition_timing(dynamic_data_dir, dmd, prefix=prefix, cache_dir=cache_dir)
         except FileNotFoundError:
             continue
         except ValueError as exc:
@@ -1827,7 +1834,8 @@ def run_cycle_registration(
 
     extra_limitations: List[str] = []
     if dynamic_data_dir is not None and Path(dynamic_data_dir).exists():
-        src = source_epochs_from_raw_dat(dynamic_data_dir, dmd)
+        cache_dir = default_timing_cache_dir(asset)
+        src = source_epochs_from_raw_dat(dynamic_data_dir, dmd, cache_dir=cache_dir)
         inputs["source_epochs_source"] = f"raw_dat:{dynamic_data_dir}"
         if summary is not None:
             # Cross-check the summary's epoch structure against the raw acquisitions (R4).
@@ -1858,7 +1866,7 @@ def run_cycle_registration(
     if transfer_from is not None:
         if dynamic_data_dir is None or not Path(dynamic_data_dir).exists():
             raise ValueError("transfer_from requires dynamic_data_dir (raw .dat headers of both DMDs)")
-        src_ts = {e.epoch_index: e.cycle_start_s for e in source_epochs_from_raw_dat(dynamic_data_dir, int(transfer_from.dmd))}
+        src_ts = {e.epoch_index: e.cycle_start_s for e in source_epochs_from_raw_dat(dynamic_data_dir, int(transfer_from.dmd), cache_dir=default_timing_cache_dir(asset))}
         reg = transfer_registration_via_fpga(
             transfer_from, src_cycle_start_s=src_ts, dst_cycle_start_s={e.epoch_index: e.cycle_start_s for e in src},
             dst_lines_per_cycle={e.epoch_index: e.lines_per_cycle for e in src},

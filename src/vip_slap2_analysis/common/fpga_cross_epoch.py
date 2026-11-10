@@ -274,7 +274,7 @@ def cross_epoch_fpga_check(
     )
 
 
-def absolute_fpga_cycle_starts(dynamic_data_dir: PathLike, dmd: int) -> Tuple[Dict[int, np.ndarray], Dict[int, Dict[str, Any]]]:
+def absolute_fpga_cycle_starts(dynamic_data_dir: PathLike, dmd: int, *, cache_dir: Optional[PathLike] = None) -> Tuple[Dict[int, np.ndarray], Dict[int, Dict[str, Any]]]:
     """Absolute FPGA cycle start times (s) per acquisition prefix, chronological, 1-based epoch index.
 
     Returns ``(times_by_epoch, header_info_by_epoch)``; the header info records
@@ -285,7 +285,7 @@ def absolute_fpga_cycle_starts(dynamic_data_dir: PathLike, dmd: int) -> Tuple[Di
     info: Dict[int, Dict[str, Any]] = {}
     for i, prefix in enumerate(list_acquisition_prefixes(dynamic_data_dir), start=1):
         try:
-            t = read_dmd_acquisition_timing(dynamic_data_dir, dmd, prefix=prefix)
+            t = read_dmd_acquisition_timing(dynamic_data_dir, dmd, prefix=prefix, cache_dir=cache_dir)
         except FileNotFoundError:
             continue
         out[i] = float(t.reference_timestamp) / float(t.fpga_clock_hz) + np.asarray(t.cycle_start_s, dtype=float)
@@ -307,7 +307,8 @@ def run_fpga_cross_epoch_check(asset: Any, *, dmd: int, dynamic_data_dir: PathLi
         reg = load_cycle_registration(qc_dir, dmd) if qc_dir is not None else None
         if reg is None:
             raise FileNotFoundError(f"No saved cycle registration for DMD{dmd} under {qc_dir}; run scripts/run_cycle_registration.py first")
-    abs_ts, info = absolute_fpga_cycle_starts(dynamic_data_dir, dmd)
+    from vip_slap2_analysis.common.cycle_registration import default_timing_cache_dir
+    abs_ts, info = absolute_fpga_cycle_starts(dynamic_data_dir, dmd, cache_dir=default_timing_cache_dir(asset))
     chk = cross_epoch_fpga_check(reg, abs_ts)
     refs = [v["reference_timestamp"] for _, v in sorted(info.items())]
     if any(b <= a for a, b in zip(refs, refs[1:])):
