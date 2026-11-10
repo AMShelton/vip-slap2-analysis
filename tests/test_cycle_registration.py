@@ -456,3 +456,24 @@ def test_integer_line_cadence_not_assumed_without_flag():
     rises = 3000.0 + np.arange(0, n * lpc, L) / lr
     reg = _reg(rises, rises[0] - 3.0, rises[-1] + 0.001, [_src(n=n)])
     assert reg.epochs[0].status == STATUS_AMBIGUOUS and reg.epochs[0].cycle_index_offset is None
+
+
+def test_integer_line_cadence_jittery_pulses_fall_back_to_affine_fit():
+    # 804730_2025-07-30: 0.6 ms RMS pulse jitter on a 9.6 ms cadence; counts complete, both anchors
+    L, lpc, n = 104, 103, 6000
+    lr = LINE_RATE
+    rng = np.random.default_rng(3)
+    truth = lambda l: 3000.0 + (l / lr) * (1 + HARP_PPM * 1e-6)
+    pulse_lines = np.arange(0, n * lpc, L)
+    rises = truth(pulse_lines) + rng.normal(0, 6e-4, pulse_lines.size)
+    rises = np.sort(rises)
+    src = SourceEpochCycles(epoch_index=1, n_cycles=n, lines_per_cycle=lpc, line_rate_hz=lr, cycle_start_s=np.arange(n) * lpc / lr)
+    reg = register_di3_to_source_cycles(rise_times_s=rises, record_start_s=rises[0] - 16.0, record_end_s=rises[-1] + 40.0,
+                                        source_epochs=[src], dmd=1, assume_first_pulse_is_acquisition_start=True)
+    e = reg.epochs[0]
+    assert e.status == STATUS_IDENTIFIED_ASSUMED and e.timing_source == "di3_integer_line_cadence_affine_fit_jittery_pulses"
+    assert any("jitter" in nte for nte in e.notes)
+    times, labels = e.cycle_times_harp_s()
+    err = times[labels == 0] - truth(np.arange(n) * lpc)[labels == 0]
+    assert np.max(np.abs(err)) < 1e-4          # affine fit over ~5900 pulses: ~8 us origin precision
+    assert e.anchor_tolerance_s > lpc / lr + 0.002

@@ -102,7 +102,12 @@ measured pulses and stores per-cycle times (`timing_source = di3_integer_line_ca
 nominal line times when raw `.dat` headers are absent). The pulse phase within the first `L` lines
 is an assumption, so the status is `identified_with_assumptions`; `scripts/run_cycle_registration.py`
 makes it by default (`--no-head-assumption` leaves such epochs ambiguous). Without a head anchor the
-epoch stays ambiguous.
+epoch stays ambiguous. In every 2025 session seen so far `L` = DMD1's lines-per-cycle + 1 (211/210,
+230/229, 147/146 …), i.e. the 2025 DI3 was a line counter slipping one line per DMD1 cycle, not the
+cycle clock. One session (804730_2025-07-30) has 0.6 ms RMS pulse jitter on a 9.6 ms cadence with a
+complete, both-anchored train: pulse-by-pulse interpolation is not meaningful there, so the affine fit
+over all 178 k pulses is used (`timing_source = …affine_fit_jittery_pulses`, origin precise to
+jitter/√n if the jitter is zero-mean) with a correspondingly wider anchor tolerance.
 
 **Steps in the HARP-vs-FPGA relation.** Two early-2026 sessions (826031_02-02, 02-11) contain a
 single −2.3/−2.5 ms jump of DI3-minus-FPGA inside one acquisition (`scripts/plot_harp_fpga_residuals.py`).

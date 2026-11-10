@@ -328,21 +328,25 @@ def _linear_fit_residual(pulses: np.ndarray, cycle_idx: np.ndarray) -> Tuple[flo
 RELATION_STEP_THRESHOLD_S = 2e-4
 
 
-def detect_relation_steps(x_fpga: np.ndarray, y_harp: np.ndarray, *, threshold_s: float = RELATION_STEP_THRESHOLD_S) -> List[Dict[str, float]]:
+def detect_relation_steps(x_fpga: np.ndarray, y_harp: np.ndarray, *, threshold_s: float = RELATION_STEP_THRESHOLD_S,
+                          max_step_fraction: float = 1e-3) -> List[Dict[str, float]]:
     """Discontinuities of HARP-vs-FPGA: jumps of the affine-fit residual between consecutive pulses.
 
     Seen on 826031_2026-02-02 / 02-11 as a single -2.3/-2.5 ms step in a session;
-    a dropped pulse is *not* a step (cycle indices already account for it).
+    a dropped pulse is *not* a step (cycle indices already account for it). A
+    train whose residual jumps more often than ``max_step_fraction`` of its
+    intervals is jittery, not stepped: no steps are returned so that callers
+    judge it on the global fit (804730_2025-07-30, 0.6 ms RMS jitter).
     """
     if x_fpga.size < 3:
         return []
     a, b = np.polyfit(x_fpga, y_harp, 1)
     r = y_harp - (a * x_fpga + b)
     d = np.diff(r)
-    out = []
-    for i in np.flatnonzero(np.abs(d) > float(threshold_s)):
-        out.append({"after_pulse_index": int(i), "harp_s": float(y_harp[i + 1]), "step_s": float(d[i])})
-    return out
+    idx = np.flatnonzero(np.abs(d) > float(threshold_s))
+    if idx.size > max(5, int(max_step_fraction * d.size)):
+        return []
+    return [{"after_pulse_index": int(i), "harp_s": float(y_harp[i + 1]), "step_s": float(d[i])} for i in idx]
 
 
 def destep_harp_times(y_harp: np.ndarray, steps: Sequence[Dict[str, float]]) -> np.ndarray:
@@ -563,6 +567,7 @@ def infer_clock_relationship(
 ANCHOR_FPGA_CROSS_EPOCH = "fpga_cross_epoch"
 TIMING_INTEGER_LINE_FPGA = "di3_integer_line_cadence_via_fpga_lines"
 TIMING_INTEGER_LINE_NOMINAL = "di3_integer_line_cadence_via_nominal_lines"
+TIMING_INTEGER_LINE_AFFINE = "di3_integer_line_cadence_affine_fit_jittery_pulses"
 
 
 def _resolve_integer_line_epochs(
@@ -572,6 +577,7 @@ def _resolve_integer_line_epochs(
     lines_per_pulse: Optional[int],
     max_rate_error: float = 2e-4,
     max_segment_rms_s: float = 2e-4,
+    jitter_fallback_max_rms_s: float = 2e-3,
 ) -> List[str]:
     """Register epochs whose DI3 runs at an integer number of lines per pulse (not the DMD cycle).
 
@@ -581,6 +587,13 @@ def _resolve_integer_line_epochs(
     recording when the train began) pulse ``j`` marks line ``j*L`` of the
     acquisition and the first pulse marks line 0 = cycle 0. That phase (pulse at
     line 0 rather than line L) is an assumption, hence ``identified_with_assumptions``.
+
+    Jittery trains (804730_2025-07-30: 0.6 ms RMS pulse jitter on a 9.6 ms
+    cadence, counts otherwise consistent) cannot be interpolated pulse by pulse;
+    when the slope is right and the jitter is below ``jitter_fallback_max_rms_s``
+    the affine fit over all pulses is used instead (its origin is precise to
+    jitter/sqrt(n) if the jitter is zero-mean, biased by the mean delay if not),
+    and the note says so.
 
     With raw ``.dat`` timestamps the FPGA time of every line ``j*L`` is known, so
     the pulse train is fitted against them: the slope must be 1 within
@@ -646,14 +659,32 @@ def _resolve_integer_line_epochs(
             continue
         rel_steps = detect_relation_steps(x, y)
         rms, rmax = _segment_fit_residuals(x, y, rel_steps)
+        jitter_note = None
         if rms > max_segment_rms_s:
             r_all = y - (a * x + b)
-            e.notes.append(f"Integer-line cadence: pulses do not sit on the FPGA line grid with L={L} (residual {rms*1e6:.0f} us RMS within "
-                           f"{len(rel_steps) + 1} step-free segment(s), max {rmax*1e6:.0f} us; slope {(a-1)*1e6:+.1f} ppm; "
-                           f"global residual p5/p95 {np.percentile(r_all, 5)*1e6:+.0f}/{np.percentile(r_all, 95)*1e6:+.0f} us); left unresolved.")
-            demote(e)
-            continue
-        mapped = piecewise_fpga_to_harp(cycle_fpga, x, y, rel_steps)
+            rms_all = float(np.sqrt(np.mean(r_all ** 2)))
+            p5, p50, p95 = (float(np.percentile(r_all, q)) for q in (5, 50, 95))
+            counts_ok = abs(int(inside.sum()) * L - total_lines) <= 2 * L
+            if rms_all <= jitter_fallback_max_rms_s and counts_ok and e.tail_covered:
+                # jittery but complete train: the affine fit over all pulses is the best available map
+                rel_steps = []
+                timing_source = TIMING_INTEGER_LINE_AFFINE
+                jitter_note = (f"DI3 pulses jitter {rms_all*1e6:.0f} us RMS about the FPGA line grid (p5/p50/p95 {p5*1e6:+.0f}/{p50*1e6:+.0f}/{p95*1e6:+.0f} us), "
+                               f"too much to interpolate pulse by pulse; cycle times come from the affine fit over {int(inside.sum())} pulses "
+                               f"(origin precision ~{rms_all/np.sqrt(inside.sum())*1e6:.0f} us if the jitter is zero-mean; a one-sided delay would bias it by its mean). "
+                               f"Pulse count x L matches the saved lines ({int(inside.sum())} x {L} vs {total_lines}).")
+                rms, rmax = rms_all, float(np.max(np.abs(r_all)))
+            else:
+                e.notes.append(f"Integer-line cadence: pulses do not sit on the FPGA line grid with L={L} (residual {rms*1e6:.0f} us RMS within "
+                               f"{len(rel_steps) + 1} step-free segment(s), max {rmax*1e6:.0f} us; slope {(a-1)*1e6:+.1f} ppm; "
+                               f"global residual {rms_all*1e6:.0f} us RMS, p5/p95 {p5*1e6:+.0f}/{p95*1e6:+.0f} us; "
+                               f"counts {'consistent' if counts_ok else 'inconsistent'}, tail {'covered' if e.tail_covered else 'not covered'}); left unresolved.")
+                demote(e)
+                continue
+        if timing_source == TIMING_INTEGER_LINE_AFFINE:
+            mapped = a * np.asarray(cycle_fpga, dtype=float) + b
+        else:
+            mapped = piecewise_fpga_to_harp(cycle_fpga, x, y, rel_steps)
         n_cov = int(np.sum(mapped <= float(y[-1]) + pulse_period))     # cycles up to one pulse interval past the last pulse
         n_cov = max(1, min(N, n_cov))
         cyc_period = float(np.median(np.diff(mapped))) if mapped.size > 1 else float(lpc / lr)
@@ -672,9 +703,11 @@ def _resolve_integer_line_epochs(
         e.first_pulse_harp_s = float(mapped[0]); e.last_pulse_harp_s = float(mapped[n_cov - 1])
         e.lines_per_cycle = lpc; e.line_rate_hz = lr
         e.timing_source = timing_source
-        e.anchor_tolerance_s = cyc_period + 0.002
+        e.anchor_tolerance_s = cyc_period + 0.002 + (3.0 * rms if timing_source == TIMING_INTEGER_LINE_AFFINE else 0.0)
         e.relation_steps = rel_steps
         e.pulse_times_harp_s = mapped[:n_cov]
+        if jitter_note:
+            e.notes.append(jitter_note)
         # the first-pass notes ("only coverage anchors are reported", "unverified phase") are superseded here
         e.notes = [n for n in e.notes if "Only coverage anchors are reported" not in n and "first pulse assumed to mark acquisition start" not in n]
         e.notes.append(f"Integer-line DI3 cadence: {L} lines per pulse; pulse j taken as line j*{L} with the first pulse at line 0 "
