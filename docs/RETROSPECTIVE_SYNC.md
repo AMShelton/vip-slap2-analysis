@@ -92,6 +92,18 @@ cycle start and the predicted cycles inside its train equal the pulses; such epo
 DI3 trains whose cadence differs >2 % from the acquisition's cycle period (preview acquisitions
 at 75 ms).
 
+**Integer-line DI3 cadence (2025 glutamate, 826032_2026-02-02).** In these sessions DI3 fires every
+`L` lines of the FPGA line clock (e.g. 211) rather than once per DMD cycle, so pulse counting cannot
+give cycle offsets. They are still line-locked: with a head anchor, pulse `j` marks line `j·L` and the
+first pulse marks line 0 = cycle 0. `_resolve_integer_line_epochs` fits the pulses to the FPGA times
+of those lines (slope must be 1 within 200 ppm — a wrong `L` is off by ~1/L — and residual < 200 µs
+within step-free segments), then maps every cycle start FPGA→HARP by interpolation between the
+measured pulses and stores per-cycle times (`timing_source = di3_integer_line_cadence_via_fpga_lines`;
+nominal line times when raw `.dat` headers are absent). The pulse phase within the first `L` lines
+is an assumption, so the status is `identified_with_assumptions`; `scripts/run_cycle_registration.py`
+makes it by default (`--no-head-assumption` leaves such epochs ambiguous). Without a head anchor the
+epoch stays ambiguous.
+
 **Steps in the HARP-vs-FPGA relation.** Two early-2026 sessions (826031_02-02, 02-11) contain a
 single −2.3/−2.5 ms jump of DI3-minus-FPGA inside one acquisition (`scripts/plot_harp_fpga_residuals.py`).
 `detect_relation_steps` finds such jumps (> 200 µs between consecutive pulses); the DMD2 transfer maps

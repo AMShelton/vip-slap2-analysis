@@ -561,6 +561,123 @@ def infer_clock_relationship(
 
 
 ANCHOR_FPGA_CROSS_EPOCH = "fpga_cross_epoch"
+TIMING_INTEGER_LINE_FPGA = "di3_integer_line_cadence_via_fpga_lines"
+TIMING_INTEGER_LINE_NOMINAL = "di3_integer_line_cadence_via_nominal_lines"
+
+
+def _resolve_integer_line_epochs(
+    epochs: List[EpochCycleRegistration],
+    src_list: Sequence[SourceEpochCycles],
+    *,
+    lines_per_pulse: Optional[int],
+    max_rate_error: float = 2e-4,
+    max_segment_rms_s: float = 2e-4,
+) -> List[str]:
+    """Register epochs whose DI3 runs at an integer number of lines per pulse (not the DMD cycle).
+
+    2025 glutamate sessions (and 826032_2026-02-02) expose a DI3 train every
+    ``L`` lines of the FPGA line clock rather than one pulse per DMD cycle. The
+    train is still a *line-locked* clock, so with a head anchor (HARP already
+    recording when the train began) pulse ``j`` marks line ``j*L`` of the
+    acquisition and the first pulse marks line 0 = cycle 0. That phase (pulse at
+    line 0 rather than line L) is an assumption, hence ``identified_with_assumptions``.
+
+    With raw ``.dat`` timestamps the FPGA time of every line ``j*L`` is known, so
+    the pulse train is fitted against them: the slope must be 1 within
+    ``max_rate_error`` (a wrong ``L`` is off by ~1/L) and the residual within
+    step-free segments below ``max_segment_rms_s``. Cycle starts are then mapped
+    FPGA -> HARP by interpolation between the measured pulses (exact at pulses),
+    and stored per cycle like a transferred registration. Without raw
+    timestamps the nominal line rate is used for the line times (legacy-grade
+    within-interval accuracy, correct origin).
+    """
+    notes: List[str] = []
+    if not lines_per_pulse or lines_per_pulse <= 0:
+        notes.append("Integer-line cadence but the lines-per-pulse count could not be determined; epochs left unresolved.")
+        return notes
+    L = int(lines_per_pulse)
+    by_idx = {int(s.epoch_index): s for s in src_list}
+
+    def demote(ep: EpochCycleRegistration) -> None:
+        # _register_epoch may have set offset 0 / identified_with_assumptions from the head anchor alone;
+        # without a per-cycle timebase that would be misread downstream (pulses are not cycles here).
+        ep.status = STATUS_AMBIGUOUS
+        ep.cycle_index_offset = None
+        ep.candidate_offset_range = (0, int(ep.n_source_cycles))
+
+    for e in epochs:
+        src = by_idx.get(int(e.source_epoch_index))
+        if src is None or e.pulse_times_harp_s is None or len(e.pulse_times_harp_s) < 3:
+            if e.status == STATUS_IDENTIFIED_ASSUMED:
+                demote(e)
+            continue
+        if not e.head_covered:
+            e.notes.append("Integer-line cadence without head coverage: the first observed pulse's line index is unknown; left unresolved.")
+            demote(e)
+            continue
+        pulses = np.asarray(e.pulse_times_harp_s, dtype=float)
+        lpc = int(src.lines_per_cycle); lr = float(src.line_rate_hz); N = int(src.n_cycles)
+        pulse_period = L / lr
+        steps = np.rint(np.diff(pulses) / pulse_period).astype(int) if pulses.size > 1 else np.zeros(0, dtype=int)
+        steps[steps < 1] = 1
+        line_idx = np.r_[0, np.cumsum(steps)] * L                      # first pulse = line 0 (assumption)
+        total_lines = N * lpc
+        inside = line_idx < total_lines
+        if inside.sum() < 3:
+            e.notes.append("Integer-line cadence: fewer than 3 pulses fall inside the saved acquisition; left unresolved.")
+            demote(e)
+            continue
+        li = line_idx[inside]; y = pulses[inside]
+        c_of = li // lpc; l_of = li % lpc
+        if src.cycle_start_s is not None:
+            cyc_fpga = np.asarray(src.cycle_start_s, dtype=float)
+            x = cyc_fpga[c_of] + l_of / lr
+            cycle_fpga = cyc_fpga
+            timing_source = TIMING_INTEGER_LINE_FPGA
+        else:
+            x = li / lr
+            cycle_fpga = np.arange(N) * lpc / lr
+            timing_source = TIMING_INTEGER_LINE_NOMINAL
+        a, b = np.polyfit(x, y, 1)
+        if abs(a - 1.0) > max_rate_error:
+            e.notes.append(f"Integer-line cadence: HARP/FPGA slope {a:.6f} with L={L} lines per pulse is not 1 within {max_rate_error*1e6:.0f} ppm "
+                           f"(L wrong or cadence not line-locked); left unresolved.")
+            demote(e)
+            continue
+        rel_steps = detect_relation_steps(x, y)
+        rms, rmax = _segment_fit_residuals(x, y, rel_steps)
+        if rms > max_segment_rms_s:
+            e.notes.append(f"Integer-line cadence: pulses do not sit on the FPGA line grid (residual {rms*1e6:.0f} us RMS within segments); left unresolved.")
+            demote(e)
+            continue
+        mapped = piecewise_fpga_to_harp(cycle_fpga, x, y, rel_steps)
+        n_cov = int(np.sum(mapped <= float(y[-1]) + pulse_period))     # cycles up to one pulse interval past the last pulse
+        n_cov = max(1, min(N, n_cov))
+        cyc_period = float(np.median(np.diff(mapped))) if mapped.size > 1 else float(lpc / lr)
+        e.status = STATUS_IDENTIFIED_ASSUMED
+        e.anchor = "head"
+        e.cycle_index_offset = 0
+        e.candidate_offset_range = (0, 0)
+        e.missing_initial_cycles = 0
+        e.missing_terminal_cycles = int(N - n_cov)
+        e.n_observed_pulses = n_cov
+        e.observed_cycle_period_s = cyc_period
+        e.nominal_cycle_period_s = float(lpc / lr)
+        e.rate_ratio_harp_over_source = float(a)
+        e.period_error_ppm = float((a - 1.0) * 1e6)
+        e.residual_rms_s = float(rms); e.residual_max_s = float(rmax)
+        e.first_pulse_harp_s = float(mapped[0]); e.last_pulse_harp_s = float(mapped[n_cov - 1])
+        e.lines_per_cycle = lpc; e.line_rate_hz = lr
+        e.timing_source = timing_source
+        e.anchor_tolerance_s = cyc_period + 0.002
+        e.relation_steps = rel_steps
+        e.pulse_times_harp_s = mapped[:n_cov]
+        e.notes.append(f"Integer-line DI3 cadence: {L} lines per pulse; pulse j taken as line j*{L} with the first pulse at line 0 "
+                       f"(head anchor, {e.lead_s:.3f} s of DI3-low lead; the pulse phase within the first {L} lines is assumed). "
+                       f"{int(inside.sum())} pulses fitted to the FPGA line grid: slope {a:.9f} ({(a-1)*1e6:+.1f} ppm), residual {rms*1e6:.1f} us RMS. "
+                       f"Cycle starts mapped per cycle by interpolation between pulses ({timing_source}); cycles 0..{n_cov-1} covered.")
+        notes.append(f"Epoch {e.source_epoch_index}: integer-line cadence ({L} lines/pulse) registered from the head anchor; status identified_with_assumptions.")
+    return notes
 
 
 def _resolve_epochs_via_shared_fpga(
@@ -778,6 +895,8 @@ def register_di3_to_source_cycles(
         if relationship == RELATIONSHIP_DIRECT:
             fpga_notes = _resolve_epochs_via_shared_fpga(epochs, src_list)
             limitations.extend(fpga_notes)
+        elif relationship == RELATIONSHIP_INTEGER_LINE and assume_first_pulse_is_acquisition_start:
+            limitations.extend(_resolve_integer_line_epochs(epochs, src_list, lines_per_pulse=int(round(eff)) if np.isfinite(eff) else None))
         statuses = {e.status for e in epochs}
         if statuses <= {STATUS_IDENTIFIED}:
             status = STATUS_IDENTIFIED

@@ -403,3 +403,56 @@ def test_transfer_interpolates_across_a_harp_step():
     straddle = (f2 > fpga1[2499]) & (f2 < fpga1[2500])
     assert straddle.sum() <= 2 and np.all(err[straddle] <= 0.0024 + 1e-6)
     assert np.max(err[~straddle]) < 1e-4
+
+
+def _integer_line_session(L=211, lpc=227, n_cycles=3000, lead_s=3.0, first_pulse_line=0, with_fpga=True, truth_ppm=HARP_PPM):
+    """DI3 every L lines (not the cycle clock); HARP-first; returns (reg, true cycle HARP times)."""
+    lr = LINE_RATE
+    total_lines = n_cycles * lpc
+    harp_of_line = lambda l: 3000.0 + (l / lr) * (1 + truth_ppm * 1e-6)
+    pulse_lines = np.arange(first_pulse_line, total_lines, L)
+    rises = harp_of_line(pulse_lines)
+    cyc_fpga = np.arange(n_cycles) * lpc / lr
+    src = SourceEpochCycles(epoch_index=1, n_cycles=n_cycles, lines_per_cycle=lpc, line_rate_hz=lr,
+                            cycle_start_s=cyc_fpga if with_fpga else None)
+    reg = register_di3_to_source_cycles(rise_times_s=rises, record_start_s=rises[0] - lead_s, record_end_s=rises[-1] + 0.001,
+                                        source_epochs=[src], dmd=1, assume_first_pulse_is_acquisition_start=True)
+    return reg, harp_of_line(np.arange(n_cycles) * lpc)
+
+
+def test_integer_line_cadence_head_anchor_gives_per_cycle_times():
+    reg, truth = _integer_line_session()
+    assert reg.relationship == RELATIONSHIP_INTEGER_LINE
+    e = reg.epochs[0]
+    assert e.status == STATUS_IDENTIFIED_ASSUMED and e.cycle_index_offset == 0 and e.anchor == "head"
+    assert e.timing_source == "di3_integer_line_cadence_via_fpga_lines"
+    assert abs(e.period_error_ppm - HARP_PPM) < 0.5 and e.residual_rms_s < 1e-5
+    times, labels = e.cycle_times_harp_s()
+    cov = labels == 0
+    assert cov.sum() >= 2990                           # all but the last pulse-interval's worth of cycles
+    assert np.max(np.abs(times[cov] - truth[cov])) < 1e-4
+    assert reg.status == STATUS_IDENTIFIED_ASSUMED and reg.safe_for_physiology
+    assert any("identified_with_assumptions" in l for l in reg.limitations)
+
+
+def test_integer_line_cadence_without_fpga_uses_nominal_lines():
+    reg, truth = _integer_line_session(with_fpga=False)
+    e = reg.epochs[0]
+    assert e.status == STATUS_IDENTIFIED_ASSUMED and e.timing_source == "di3_integer_line_cadence_via_nominal_lines"
+    times, labels = e.cycle_times_harp_s()
+    assert np.max(np.abs(times[labels == 0] - truth[labels == 0])) < 1e-4
+
+
+def test_integer_line_cadence_without_head_anchor_stays_ambiguous():
+    reg, _ = _integer_line_session(lead_s=0.01)
+    e = reg.epochs[0]
+    assert e.status == STATUS_AMBIGUOUS and e.cycle_index_offset is None
+    assert not reg.safe_for_physiology
+
+
+def test_integer_line_cadence_not_assumed_without_flag():
+    L, lpc, n = 211, 227, 3000
+    lr = LINE_RATE
+    rises = 3000.0 + np.arange(0, n * lpc, L) / lr
+    reg = _reg(rises, rises[0] - 3.0, rises[-1] + 0.001, [_src(n=n)])
+    assert reg.epochs[0].status == STATUS_AMBIGUOUS and reg.epochs[0].cycle_index_offset is None
