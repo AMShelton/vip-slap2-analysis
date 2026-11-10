@@ -1,2 +1,0 @@
-session_id,source_epoch_id,first_harp_di3_source_cycle,offset_uncertainty_cycles,method,evidence_file,reviewed_by,review_status,notes
-852836_2026-09-15_14-29-34,1,,,wall_clock_candidate,launcher_logs+acquisition_meta,,UNRESOLVED,"Do not use this row for absolute-latency analyses until reviewed"

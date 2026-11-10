@@ -19,7 +19,7 @@ That is only correct when the HARP recording covers the start of the SLAP2 acqui
 Between 2026-07-23 and 2026-10-27 the workflow started SLAP2 first, so the first
 *recorded* pulse is cycle `k > 0`. The processed products of those sessions are offset
 by `k` cycles (≈ 20.7 ms per cycle for 227-line voltage acquisitions). No code path
-certified `k`; `metadata/t03_*` audited it read-only.
+certified `k`; the T0.3 start-order audit (`metadata/t03_*`, retired 2026-11; recover from tag `archive/pre-consolidation-2026-11-10`) audited it read-only.
 
 A second, smaller effect: the HARP clock runs ≈ +6 ppm relative to the SLAP2 FPGA /
 `.meta` line rate (measured on the 2026-10-27 reference: +5.6 to +6.5 ppm). A
