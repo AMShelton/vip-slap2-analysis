@@ -702,7 +702,9 @@ def run_session_synapse_qc(
         }
 
     if output_dir is None:
-        output_dir = summary_mat_path.parent / "analysis" /  "qc" / "slap2"
+        from vip_slap2_analysis.common.session import analysis_dir_for
+
+        output_dir = analysis_dir_for(summary_mat_path) / "qc" / "slap2"
     output_dir = Path(output_dir)
 
     if summary_mat_path.suffix.lower() == ".h5":

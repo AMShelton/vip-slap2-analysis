@@ -244,14 +244,18 @@ def _find_trial_table_for(summary_h5: Optional[Path]) -> Optional[Path]:
     """Locate ``trial_table.h5`` next to or one level above a modern summary file."""
     if summary_h5 is None:
         return None
-    # GIAnT: <processed>/trial_table.h5 with the summary at
-    # <processed>/source_extraction/<method>/experiment_summary.h5 (or one level less);
-    # Voltex: <processed>/trial_table.h5 with <processed>/Voltage/VoltageSummary.h5.
+    # <processed>/trial_table.h5 (trialTable.h5 also accepted) with the summary at
+    #   <processed>/source_extraction/Glutamate/[<method>/]experiment_summary.h5  (GIAnT)
+    #   <processed>/source_extraction/Voltage/experiment_summary.h5               (Voltex)
+    # or the older flat layouts. The walk stops at the processed folder.
     base = summary_h5.parent
-    for _ in range(3):
-        cand = base / "trial_table.h5"
-        if cand.exists():
-            return cand
+    for _ in range(5):
+        for name in ("trial_table.h5", "trialTable.h5"):
+            cand = base / name
+            if cand.exists():
+                return cand
+        if re.match(r"^\d{6}_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_slap2?_", base.name):
+            return None
         base = base.parent
     return None
 
