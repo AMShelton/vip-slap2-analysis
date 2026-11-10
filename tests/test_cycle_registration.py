@@ -477,3 +477,24 @@ def test_integer_line_cadence_jittery_pulses_fall_back_to_affine_fit():
     err = times[labels == 0] - truth(np.arange(n) * lpc)[labels == 0]
     assert np.max(np.abs(err)) < 1e-4          # affine fit over ~5900 pulses: ~8 us origin precision
     assert e.anchor_tolerance_s > lpc / lr + 0.002
+
+
+def test_integer_line_cadence_delayed_minority_is_dropped_not_averaged():
+    # 804730_2025-07-30 pattern: most pulses on the grid, ~20% delayed by 0.5-1.8 ms (one-sided)
+    L, lpc, n = 104, 103, 6000
+    lr = LINE_RATE
+    rng = np.random.default_rng(5)
+    truth = lambda l: 3000.0 + (l / lr) * (1 + HARP_PPM * 1e-6)
+    pulse_lines = np.arange(0, n * lpc, L)
+    rises = truth(pulse_lines)
+    late = rng.random(rises.size) < 0.2
+    rises[late] += rng.uniform(5e-4, 1.8e-3, late.sum())
+    src = SourceEpochCycles(epoch_index=1, n_cycles=n, lines_per_cycle=lpc, line_rate_hz=lr, cycle_start_s=np.arange(n) * lpc / lr)
+    reg = register_di3_to_source_cycles(rise_times_s=np.sort(rises), record_start_s=rises[0] - 16.0, record_end_s=rises[-1] + 40.0,
+                                        source_epochs=[src], dmd=1, assume_first_pulse_is_acquisition_start=True)
+    e = reg.epochs[0]
+    assert e.status == STATUS_IDENTIFIED_ASSUMED and e.timing_source == "di3_integer_line_cadence_via_fpga_lines"
+    assert any("displaced from the FPGA line grid" in nte for nte in e.notes)
+    times, labels = e.cycle_times_harp_s()
+    err = times[labels == 0] - truth(np.arange(n) * lpc)[labels == 0]
+    assert np.max(np.abs(err)) < 5e-5          # the delayed pulses must not bias the timebase

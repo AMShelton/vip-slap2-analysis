@@ -660,17 +660,39 @@ def _resolve_integer_line_epochs(
         rel_steps = detect_relation_steps(x, y)
         rms, rmax = _segment_fit_residuals(x, y, rel_steps)
         jitter_note = None
+        n_fit = int(inside.sum())
         if rms > max_segment_rms_s:
             r_all = y - (a * x + b)
             rms_all = float(np.sqrt(np.mean(r_all ** 2)))
             p5, p50, p95 = (float(np.percentile(r_all, q)) for q in (5, 50, 95))
             counts_ok = abs(int(inside.sum()) * L - total_lines) <= 2 * L
-            if rms_all <= jitter_fallback_max_rms_s and counts_ok and e.tail_covered:
+            # Robust path first: 804730_2025-07-30 has most pulses exactly on the grid and a minority delayed
+            # by up to ~1.8 ms (p5/p50/p95 = -357/-311/+1506 us). The on-grid majority is identified from the
+            # residual's median/MAD, the delayed pulses are dropped, and the rest is treated like a clean train.
+            med = float(np.median(r_all)); mad = float(np.median(np.abs(r_all - med))) * 1.4826
+            keep = np.abs(r_all - med) <= max(3.0 * mad, 1e-4)
+            robust_done = False
+            if keep.sum() >= max(3, int(0.5 * r_all.size)):
+                xk, yk = x[keep], y[keep]
+                ak, bk = np.polyfit(xk, yk, 1)
+                steps_k = detect_relation_steps(xk, yk)
+                rms_k, rmax_k = _segment_fit_residuals(xk, yk, steps_k)
+                if rms_k <= max_segment_rms_s and abs(ak - 1.0) <= max_rate_error:
+                    n_drop = int((~keep).sum())
+                    x, y, a, b, rel_steps, rms, rmax = xk, yk, ak, bk, steps_k, rms_k, rmax_k
+                    n_fit = int(keep.sum())
+                    jitter_note = (f"{n_drop} of {r_all.size} DI3 pulses ({100.0*n_drop/r_all.size:.1f}%) are displaced from the FPGA line grid "
+                                   f"(residual p5/p50/p95 {p5*1e6:+.0f}/{p50*1e6:+.0f}/{p95*1e6:+.0f} us about the all-pulse fit); they were excluded and the "
+                                   f"remaining {n_fit} sit on the grid at {rms*1e6:.1f} us RMS. Cycle times interpolate between the retained pulses only.")
+                    robust_done = True
+            if robust_done:
+                pass
+            elif rms_all <= jitter_fallback_max_rms_s and counts_ok and e.tail_covered:
                 # jittery but complete train: the affine fit over all pulses is the best available map
                 rel_steps = []
                 timing_source = TIMING_INTEGER_LINE_AFFINE
                 jitter_note = (f"DI3 pulses jitter {rms_all*1e6:.0f} us RMS about the FPGA line grid (p5/p50/p95 {p5*1e6:+.0f}/{p50*1e6:+.0f}/{p95*1e6:+.0f} us), "
-                               f"too much to interpolate pulse by pulse; cycle times come from the affine fit over {int(inside.sum())} pulses "
+                               f"too much to interpolate pulse by pulse and with no on-grid majority; cycle times come from the affine fit over {int(inside.sum())} pulses "
                                f"(origin precision ~{rms_all/np.sqrt(inside.sum())*1e6:.0f} us if the jitter is zero-mean; a one-sided delay would bias it by its mean). "
                                f"Pulse count x L matches the saved lines ({int(inside.sum())} x {L} vs {total_lines}).")
                 rms, rmax = rms_all, float(np.max(np.abs(r_all)))
@@ -712,7 +734,7 @@ def _resolve_integer_line_epochs(
         e.notes = [n for n in e.notes if "Only coverage anchors are reported" not in n and "first pulse assumed to mark acquisition start" not in n]
         e.notes.append(f"Integer-line DI3 cadence: {L} lines per pulse; pulse j taken as line j*{L} with the first pulse at line 0 "
                        f"(head anchor, {e.lead_s:.3f} s of DI3-low lead; the pulse phase within the first {L} lines is assumed). "
-                       f"{int(inside.sum())} pulses fitted to the FPGA line grid: slope {a:.9f} ({(a-1)*1e6:+.1f} ppm), residual {rms*1e6:.1f} us RMS. "
+                       f"{n_fit} pulses fitted to the FPGA line grid: slope {a:.9f} ({(a-1)*1e6:+.1f} ppm), residual {rms*1e6:.1f} us RMS. "
                        f"Cycle starts mapped per cycle by interpolation between pulses ({timing_source}); cycles 0..{n_cov-1} covered.")
         notes.append(f"Epoch {e.source_epoch_index}: integer-line cadence ({L} lines/pulse) registered from the head anchor; status identified_with_assumptions.")
     return notes
