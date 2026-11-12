@@ -46,6 +46,67 @@ def _stats(a: np.ndarray, b: np.ndarray) -> dict:
     }
 
 
+def valid_trial_coverage(summary, dmd):
+    """Lines covered by valid trials vs all trials of the summary (1-based source lines), with time spans."""
+    try:
+        lr = float(summary.get_line_rate_hz(dmd))
+    except Exception:
+        lr = float("nan")
+    spans, cov_valid, cov_all, invalid = [], 0, 0, []
+    valid = set(int(v) for v in summary.valid_trials[dmd - 1])
+    # trial table line ranges (GIAnT trial_table.h5) give the span of trials that have no frames
+    tt = getattr(summary, "trial_table", None) or {}
+    fl, ll = tt.get("first_line"), tt.get("last_line")
+
+    def _table_span(t):
+        if fl is None or ll is None:
+            return None
+        a = np.atleast_2d(fl); b = np.atleast_2d(ll)
+        n = int(summary.n_trials)
+        try:
+            if a.shape[0] == n:                       # (nTrials, nDMDs): MATLAB nDMDs x nTrials read through h5py
+                j = dmd - 1 if a.shape[1] >= dmd else 0
+                return int(a[t - 1, j]), int(b[t - 1, j])
+            if a.shape[1] == n:                       # (nDMDs, nTrials)
+                i = dmd - 1 if a.shape[0] >= dmd else 0
+                return int(a[i, t - 1]), int(b[i, t - 1])
+        except Exception:
+            return None
+        return None
+
+    for t in range(1, int(summary.n_trials) + 1):
+        lines = None
+        if t in valid:
+            try:
+                lines = summary.get_trial_source_lines(dmd, t)
+            except Exception:
+                lines = None
+        if lines is None or len(lines) == 0:
+            span = _table_span(t)
+            if span is None:
+                invalid.append({"trial": t, "reason": "no frames; no trial-table span"})
+                continue
+            lo, hi = span
+            cov_all += hi - lo + 1
+            invalid.append({"trial": t, "first_line": lo, "last_line": hi,
+                            "t_start_s": lo / lr if np.isfinite(lr) else None, "t_end_s": hi / lr if np.isfinite(lr) else None})
+            spans.append((lo, hi))
+            continue
+        lo, hi = int(np.min(lines)), int(np.max(lines))
+        cov_all += hi - lo + 1
+        if t in valid:
+            cov_valid += hi - lo + 1
+        else:
+            invalid.append({"trial": t, "first_line": lo, "last_line": hi,
+                            "t_start_s": lo / lr if np.isfinite(lr) else None, "t_end_s": hi / lr if np.isfinite(lr) else None})
+        spans.append((lo, hi))
+    total_lines = (max(h for _, h in spans) - min(l0 for l0, _ in spans) + 1) if spans else 0
+    return {"n_trials": int(summary.n_trials), "n_valid_trials": len(valid), "lines_in_valid_trials": int(cov_valid),
+            "lines_in_all_trials": int(cov_all), "acquisition_lines_spanned": int(total_lines),
+            "valid_fraction_of_acquisition": (cov_valid / total_lines) if total_lines else None,
+            "invalid_trials": invalid, "line_rate_hz": lr}
+
+
 def compare(modern_path: Path, legacy_path: Path, *, max_trials: int | None = None, dmds=(1, 2)) -> dict:
     report: dict = {"modern": str(modern_path), "legacy": str(legacy_path), "per_dmd": {}, "problems": []}
     g = GiantExperimentSummary(modern_path)
@@ -57,72 +118,12 @@ def compare(modern_path: Path, legacy_path: Path, *, max_trials: int | None = No
         report["problems"].append(f"trial count differs: modern {g.n_trials} vs legacy {l.n_trials}")
     same_segmentation = g.n_trials == l.n_trials
 
-    def _coverage(summary, dmd):
-        """Lines covered by valid trials vs all trials of the summary (1-based source lines), with time spans."""
-        try:
-            lr = float(summary.get_line_rate_hz(dmd))
-        except Exception:
-            lr = float("nan")
-        spans, cov_valid, cov_all, invalid = [], 0, 0, []
-        valid = set(int(v) for v in summary.valid_trials[dmd - 1])
-        # trial table line ranges (GIAnT trial_table.h5) give the span of trials that have no frames
-        tt = getattr(summary, "trial_table", None) or {}
-        fl, ll = tt.get("first_line"), tt.get("last_line")
-
-        def _table_span(t):
-            if fl is None or ll is None:
-                return None
-            a = np.atleast_2d(fl); b = np.atleast_2d(ll)
-            n = int(summary.n_trials)
-            try:
-                if a.shape[0] == n:                       # (nTrials, nDMDs): MATLAB nDMDs x nTrials read through h5py
-                    j = dmd - 1 if a.shape[1] >= dmd else 0
-                    return int(a[t - 1, j]), int(b[t - 1, j])
-                if a.shape[1] == n:                       # (nDMDs, nTrials)
-                    i = dmd - 1 if a.shape[0] >= dmd else 0
-                    return int(a[i, t - 1]), int(b[i, t - 1])
-            except Exception:
-                return None
-            return None
-
-        for t in range(1, int(summary.n_trials) + 1):
-            lines = None
-            if t in valid:
-                try:
-                    lines = summary.get_trial_source_lines(dmd, t)
-                except Exception:
-                    lines = None
-            if lines is None or len(lines) == 0:
-                span = _table_span(t)
-                if span is None:
-                    invalid.append({"trial": t, "reason": "no frames; no trial-table span"})
-                    continue
-                lo, hi = span
-                cov_all += hi - lo + 1
-                invalid.append({"trial": t, "first_line": lo, "last_line": hi,
-                                "t_start_s": lo / lr if np.isfinite(lr) else None, "t_end_s": hi / lr if np.isfinite(lr) else None})
-                spans.append((lo, hi))
-                continue
-            lo, hi = int(np.min(lines)), int(np.max(lines))
-            cov_all += hi - lo + 1
-            if t in valid:
-                cov_valid += hi - lo + 1
-            else:
-                invalid.append({"trial": t, "first_line": lo, "last_line": hi,
-                                "t_start_s": lo / lr if np.isfinite(lr) else None, "t_end_s": hi / lr if np.isfinite(lr) else None})
-            spans.append((lo, hi))
-        total_lines = (max(h for _, h in spans) - min(l0 for l0, _ in spans) + 1) if spans else 0
-        return {"n_trials": int(summary.n_trials), "n_valid_trials": len(valid), "lines_in_valid_trials": int(cov_valid),
-                "lines_in_all_trials": int(cov_all), "acquisition_lines_spanned": int(total_lines),
-                "valid_fraction_of_acquisition": (cov_valid / total_lines) if total_lines else None,
-                "invalid_trials": invalid, "line_rate_hz": lr}
-
     for dmd in dmds:
         if dmd > g.n_dmds or dmd > l.n_dmds:
             continue
         out = {"modern_n_sources": g.n_synapses[dmd - 1], "legacy_n_sources": l.n_synapses[dmd - 1],
                "modern_valid_trials": g.valid_trials[dmd - 1], "legacy_valid_trials": l.valid_trials[dmd - 1], "trials": [],
-               "modern_coverage": _coverage(g, dmd), "legacy_coverage": _coverage(l, dmd)}
+               "modern_coverage": valid_trial_coverage(g, dmd), "legacy_coverage": valid_trial_coverage(l, dmd)}
         mc, lc = out["modern_coverage"], out["legacy_coverage"]
         if mc["valid_fraction_of_acquisition"] is not None and lc["valid_fraction_of_acquisition"] is not None and \
                 abs(mc["valid_fraction_of_acquisition"] - lc["valid_fraction_of_acquisition"]) > 0.01:
@@ -201,7 +202,13 @@ def main(argv=None) -> int:
         for tag in ("modern", "legacy"):
             c = d[f"{tag}_coverage"]
             inv = c["invalid_trials"]
-            spans = ", ".join(f"{x['trial']}:{x.get('t_start_s', float('nan')):.0f}-{x.get('t_end_s', float('nan')):.0f}s" for x in inv[:12] if 't_start_s' in x)
+            def _span(x):
+                if x.get("t_start_s") is not None:
+                    return f"{x['trial']}:{x['t_start_s']:.0f}-{x['t_end_s']:.0f}s"
+                if "first_line" in x:
+                    return f"{x['trial']}:lines {x['first_line']}-{x['last_line']}"
+                return f"{x['trial']}:{x.get('reason', '?')}"
+            spans = ", ".join(_span(x) for x in inv[:12])
             print(f" {k} {tag}: {c['n_valid_trials']}/{c['n_trials']} trials valid, {c['valid_fraction_of_acquisition'] if c['valid_fraction_of_acquisition'] is None else round(c['valid_fraction_of_acquisition'], 3)} of the acquisition covered"
                   + (f"; invalid trials (trial:start-end): {spans}{' ...' if len(inv) > 12 else ''}" if inv else ""))
         for r in d["trials"][:3]:
