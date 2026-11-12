@@ -1339,8 +1339,14 @@ def compute_voltage_roi_transform_from_asset(
     strict_epoch_match: bool = True,
     cycle_registration: Any = "auto",
     summary_preference: Optional[str] = None,
+    trace_source: str = "recompute",
 ) -> Dict[str, Any]:
     """Compute raw/F0/dFF for one ROI directly from a session asset.
+
+    ``trace_source="recompute"`` (default here, for F0 exploration) fits F0 and
+    applies the indicator sign in Python; ``"product"`` returns the
+    preprocessor's stored ``f0``/``dff`` for the ROI when the summary has them
+    (what batch extraction uses by default), falling back to recompute otherwise.
 
     This helper is meant for interactive inspection.  It reconstructs the full
     DMD session trace using the same code path as batch extraction, selects one
@@ -1383,9 +1389,26 @@ def compute_voltage_roi_transform_from_asset(
             min_epoch_duration_sec=min_epoch_duration_sec,
             cycle_registration=reg,
         )
-
-    if roi_index < 0 or roi_index >= bundle.traces.shape[0]:
-        raise IndexError(f"roi_index={roi_index} is out of bounds for {bundle.traces.shape[0]} ROIs")
+        if roi_index < 0 or roi_index >= bundle.traces.shape[0]:
+            raise IndexError(f"roi_index={roi_index} is out of bounds for {bundle.traces.shape[0]} ROIs")
+        if str(trace_source).lower() == "product" and getattr(vs, "product_dff_available", False):
+            check = crosscheck_voltex_polarity(vs, asset, voltage_indicator=voltage_indicator, dff_polarity=dff_polarity)
+            kw = dict(sample_rate_hz=rate, epoch_start_sec=float(epoch_start_sec),
+                      epoch_end_sec=(float(epoch_end_sec) if epoch_end_sec is not None else None), epoch_df=epoch_df,
+                      drop_discarded=drop_discarded, dtype=np.float32, trace_mode=trace_mode, timebase_strategy=timebase_strategy,
+                      max_timebase_error_sec=max_timebase_error_sec, strict_epoch_match=strict_epoch_match,
+                      min_epoch_duration_sec=min_epoch_duration_sec, cycle_registration=reg)
+            dff_bundle, meta, payload = _product_dff_bundle(vs, bundle, dmd=int(dmd), reconstruct_kwargs=kw,
+                                                           polarity_check=check, with_raw_and_f0=True)
+            return {
+                "timebase_sec": np.asarray(bundle.timebase_sec, dtype=np.float64),
+                "sample_epoch": (np.asarray(bundle.sample_epoch, dtype=np.int16) if getattr(bundle, "sample_epoch", None) is not None else None),
+                "raw_f": np.asarray(payload["raw_f"][int(roi_index)], dtype=np.float32),
+                "f0": np.asarray(payload["f0"][int(roi_index)], dtype=np.float32),
+                "dff": np.asarray(payload["dff"][int(roi_index)], dtype=np.float32),
+                "metadata": meta, "dmd": int(dmd), "roi_index": int(roi_index), "sample_rate_hz": float(rate),
+                "reconstruction_metadata": dict(getattr(bundle, "metadata", {}) or {}),
+            }
 
     polarity = _resolve_voltage_dff_polarity_for_dmd(
         asset,
@@ -1825,6 +1848,52 @@ def _summarize_change_locked_sequences_streaming(
 # -----------------------------------------------------------------------------
 
 
+def _product_dff_bundle(
+    vs: Any,
+    raw_bundle: ReconstructedTraceBundle,
+    *,
+    dmd: int,
+    reconstruct_kwargs: Dict[str, Any],
+    polarity_check: Mapping[str, Any],
+    with_raw_and_f0: bool = True,
+) -> Tuple[ReconstructedTraceBundle, Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Use the preprocessor's stored ``dff`` (and ``f0``) as the session trace instead of recomputing.
+
+    ``raw_bundle`` is the ``raw_f`` reconstruction already made for the DMD (its
+    timebase, epochs and registration are reused as-is); the ``dff`` and ``f0``
+    datasets are reconstructed through the same code path so sample selection,
+    discards and timing are identical across the three signals.
+    """
+    with vs.using("dff"):
+        dff_bundle = reconstruct_voltage_dmd_session_traces(vs, dmd=int(dmd), **reconstruct_kwargs)
+    if dff_bundle.traces.shape != raw_bundle.traces.shape:
+        raise RuntimeError(f"DMD{dmd}: Voltex dff reconstruction shape {dff_bundle.traces.shape} differs from raw_f {raw_bundle.traces.shape}")
+    attrs = ((getattr(vs, "metadata", {}) or {}).get("dff_attrs") or {}).get(str(int(dmd))) or {}
+    vx = voltex_dff_polarity(attrs) or {}
+    meta: Dict[str, Any] = {
+        "trace_signal": "voltex_dff",
+        "trace_source": "product",
+        "output_signal": "dff",
+        "transform": "preprocessor",
+        "preprocessor": "SLAP2-Voltage-Extraction (Voltex)",
+        "preprocessor_format_version": (getattr(vs, "metadata", {}) or {}).get("format_version"),
+        "preprocessor_params": (getattr(vs, "metadata", {}) or {}).get("params"),
+        "dff_attrs": attrs,
+        "dff_sign": vx.get("dff_sign"),
+        "indicator": vx.get("indicator_name"),
+        "polarity": vx.get("sign_convention"),
+        "polarity_crosscheck": (polarity_check or {}).get("by_dmd", {}).get(str(int(dmd))),
+        "note": "dF/F and F0 are the preprocessor's own outputs; no baseline or sign operation was applied here.",
+    }
+    payload: Optional[Dict[str, Any]] = None
+    if with_raw_and_f0:
+        with vs.using("f0"):
+            f0_bundle = reconstruct_voltage_dmd_session_traces(vs, dmd=int(dmd), **reconstruct_kwargs)
+        payload = {"raw_f": raw_bundle.traces, "f0": f0_bundle.traces, "dff": dff_bundle.traces}
+    out = replace(raw_bundle, traces=np.asarray(dff_bundle.traces, dtype=np.float32))
+    return out, meta, payload
+
+
 def process_voltage_extraction(
     asset: SessionAssets,
     *,
@@ -1858,6 +1927,8 @@ def process_voltage_extraction(
     voltex_trace_kind: str = "raw_f",
     apply_motion_censor: bool = False,
     output_subdir: Optional[str] = None,
+    trace_source: str = "product",
+    trace_source_fallback: str = "recompute",
 ) -> Dict[str, Any]:
     """Extract voltage image/change/omission packages for one session asset.
 
@@ -1889,6 +1960,19 @@ def process_voltage_extraction(
         Optional sub-folder under ``analysis/derived/voltage`` and
         ``analysis/qc/voltage`` (e.g. ``"sync_compare/legacy"``) so comparison runs
         never overwrite the session's standard products.
+    trace_source
+        Where dF/F comes from when ``trace_signal`` asks for a dF/F product.
+        ``"product"`` (default) uses the preprocessor's own polarity-corrected
+        ``dff`` and ``f0`` (Voltex ``VoltageSummary.h5``: F0 fitted per
+        acquisition epoch with motion-censored samples excluded, sign from
+        ``indicatorName``); nothing is re-baselined here and outputs are named
+        ``voltex_dff_<mode>``. ``"recompute"`` is the historical path: F0 and sign
+        are computed here from ``raw_f`` (``dff_robust_f0`` / ``dff_static_f0``),
+        the only option for legacy MAT/H5 products. ``trace_signal="raw"`` is
+        unaffected by this option.
+    trace_source_fallback
+        What to do when ``trace_source="product"`` but the summary carries no
+        stored ``dff``: ``"recompute"`` (default; recorded in QC) or ``"error"``.
     metadata
         Optional caller metadata.  ``metadata['prepost_sec']`` can override event
         windows with keys ``image``/``image_identity``, ``change``, and
@@ -1973,8 +2057,43 @@ def process_voltage_extraction(
         voltage_dir.mkdir(parents=True, exist_ok=True)
         voltage_qc_dir.mkdir(parents=True, exist_ok=True)
 
+    if str(voltex_trace_kind) != "raw_f":
+        raise NotImplementedError(
+            f"voltex_trace_kind={voltex_trace_kind!r} is no longer a user option: use trace_source='product' to consume "
+            "Voltex's stored dff/f0, or trace_source='recompute' to derive dF/F from raw_f here.")
+    requested_source = str(trace_source).strip().lower()
+    if requested_source not in {"product", "recompute"}:
+        raise ValueError("trace_source must be 'product' or 'recompute'")
+    if str(trace_source_fallback).strip().lower() not in {"recompute", "error"}:
+        raise ValueError("trace_source_fallback must be 'recompute' or 'error'")
+    output_signal, _f0_method_requested = _parse_trace_signal(trace_signal)
+
+    vs, summary_provenance = load_voltage_summary_with_provenance(
+        asset, keep_open=True, summary_preference=summary_preference,
+        trace_kind="raw_f", apply_motion_censor=apply_motion_censor,
+    )
+    voltex_polarity_check = crosscheck_voltex_polarity(vs, asset, voltage_indicator=voltage_indicator, dff_polarity=dff_polarity)
+    product_available = bool(getattr(vs, "product_dff_available", False))
+    trace_source_note = None
+    if output_signal != "dff":
+        effective_source = "n/a"           # raw output: no dF/F involved
+    elif requested_source == "product" and product_available:
+        effective_source = "product"
+    elif requested_source == "product":
+        if str(trace_source_fallback).lower() == "error":
+            vs.close() if hasattr(vs, "close") else None
+            raise RuntimeError(
+                f"{asset.session_id}: trace_source='product' but the selected voltage summary "
+                f"({summary_provenance.get('selected_format')}) stores no dff/f0; rerun the preprocessor or use trace_source='recompute'.")
+        effective_source = "recompute"
+        trace_source_note = (f"trace_source='product' requested but the selected summary "
+                             f"({summary_provenance.get('selected_format')}) has no stored dff/f0; dF/F recomputed from raw_f.")
+    else:
+        effective_source = "recompute"
+    signal_label = "voltex_dff" if effective_source == "product" else str(trace_signal)
+
     # Resolve output names early so skipped runs are cheap.
-    suffix = _trace_suffix(trace_signal, trace_mode)
+    suffix = _trace_suffix(signal_label, trace_mode)
     mean_npz = voltage_dir / f"voltage_mean_{suffix}.npz"
     single_h5 = voltage_dir / f"voltage_single_trial_{suffix}.h5"
     session_traces_h5 = voltage_dir / f"voltage_session_traces_{suffix}.h5"
@@ -1989,6 +2108,8 @@ def process_voltage_extraction(
     if write_session_traces:
         expected_outputs.append(session_traces_h5)
     if all(p.exists() for p in expected_outputs) and not overwrite:
+        if hasattr(vs, "close"):
+            vs.close()
         return {
             "status": "exists",
             "mean_npz": str(mean_npz),
@@ -2041,16 +2162,6 @@ def process_voltage_extraction(
     )
     seq_events = build_change_locked_sequences(ordered_images_f)
 
-    if str(voltex_trace_kind) != "raw_f":
-        raise NotImplementedError(
-            f"voltex_trace_kind={voltex_trace_kind!r}: this pipeline derives F0 and polarity-corrected dF/F from raw_f "
-            "itself; feeding Voltex's stored dff/f0 through the same transform would double-apply the baseline and sign. "
-            "Use raw_f (default), or read Voltex's dff directly with VoltexSummary(trace_kind='dff') outside extraction.")
-    vs, summary_provenance = load_voltage_summary_with_provenance(
-        asset, keep_open=True, summary_preference=summary_preference,
-        trace_kind=voltex_trace_kind, apply_motion_censor=apply_motion_censor,
-    )
-    voltex_polarity_check = crosscheck_voltex_polarity(vs, asset, voltage_indicator=voltage_indicator, dff_polarity=dff_polarity)
     registrations: Dict[int, Any] = {}
     registration_info: Dict[str, Any] = {}
     for dmd in range(1, int(vs.n_dmds) + 1):
@@ -2086,6 +2197,10 @@ def process_voltage_extraction(
             "summary_format": summary_provenance.get("selected_format"),
             "summary_path": summary_provenance.get("selected_path"),
             "voltex_polarity_crosscheck": voltex_polarity_check,
+            "trace_source_requested": requested_source,
+            "trace_source_effective": effective_source,
+            "trace_source_note": trace_source_note,
+            "preprocessor_params": (getattr(vs, "metadata", {}) or {}).get("params") if effective_source == "product" else None,
             "cycle_registration": registration_info,
             "require_identified_cycle_alignment": bool(require_identified_cycle_alignment),
             "bonsai_event_log_csv": str(resolve_corrected_event_log(asset)),
@@ -2096,7 +2211,8 @@ def process_voltage_extraction(
                 "change": tuple(float(x) for x in windows.change),
                 "omission": tuple(float(x) for x in windows.omission),
             },
-            "trace_signal": str(trace_signal),
+            "trace_signal": str(signal_label),
+            "trace_signal_requested": str(trace_signal),
             "trace_mode": str(trace_mode),
             "trace_suffix": suffix,
             "drop_discarded": bool(drop_discarded),
@@ -2142,11 +2258,16 @@ def process_voltage_extraction(
             "summary_provenance": summary_provenance,
             "summary_format": base_meta["summary_format"],
             "voltex_polarity_crosscheck": voltex_polarity_check,
+            "trace_source_requested": requested_source,
+            "trace_source_effective": effective_source,
+            "trace_source_note": trace_source_note,
+            "preprocessor_params": base_meta["preprocessor_params"],
             "cycle_registration": registration_info,
             "require_identified_cycle_alignment": bool(require_identified_cycle_alignment),
             "bonsai_event_log_csv": str(resolve_corrected_event_log(asset)),
             "sample_rate_hz": float(rate),
-            "trace_signal": str(trace_signal),
+            "trace_signal": str(signal_label),
+            "trace_signal_requested": str(trace_signal),
             "trace_mode": str(trace_mode),
             "trace_suffix": suffix,
             "voltage_indicator_override": _normalize_indicator_text(voltage_indicator) or None,
@@ -2219,22 +2340,33 @@ def process_voltage_extraction(
                         f"{_creg.get('reason') or _creg.get('epochs_without_measured_times') or 'unknown reason'}"
                     )
 
-                bundle, transform_meta, transform_payload = _transform_voltage_bundle(
-                    bundle,
-                    trace_signal=trace_signal,
-                    sample_rate_hz=rate,
-                    f0_percentile=f0_percentile,
-                    robust_f0_bin_sec=robust_f0_bin_sec,
-                    robust_f0_smooth_sec=robust_f0_smooth_sec,
-                    indicator=_resolve_voltage_dff_polarity_for_dmd(
-                        asset,
-                        dmd,
-                        voltage_indicator=voltage_indicator,
+                if effective_source == "product":
+                    bundle, transform_meta, transform_payload = _product_dff_bundle(
+                        vs, bundle, dmd=dmd, reconstruct_kwargs=dict(
+                            sample_rate_hz=rate, epoch_start_sec=epoch_start_sec, epoch_end_sec=epoch_end_sec, epoch_df=epoch_df,
+                            drop_discarded=drop_discarded, dtype=dtype, trace_mode=trace_mode, timebase_strategy=timebase_strategy,
+                            max_timebase_error_sec=max_timebase_error_sec, strict_epoch_match=strict_epoch_match,
+                            min_epoch_duration_sec=min_epoch_duration_sec, cycle_registration=registrations.get(dmd)),
+                        polarity_check=voltex_polarity_check, with_raw_and_f0=bool(write_session_traces),
+                    )
+                else:
+                    bundle, transform_meta, transform_payload = _transform_voltage_bundle(
+                        bundle,
+                        trace_signal=trace_signal,
+                        sample_rate_hz=rate,
+                        f0_percentile=f0_percentile,
+                        robust_f0_bin_sec=robust_f0_bin_sec,
+                        robust_f0_smooth_sec=robust_f0_smooth_sec,
+                        indicator=_resolve_voltage_dff_polarity_for_dmd(
+                            asset,
+                            dmd,
+                            voltage_indicator=voltage_indicator,
+                            dff_polarity=dff_polarity,
+                        ).get("indicator"),
                         dff_polarity=dff_polarity,
-                    ).get("indicator"),
-                    dff_polarity=dff_polarity,
-                    f0_scope=f0_scope,
-                )
+                        f0_scope=f0_scope,
+                    )
+                    transform_meta = {**transform_meta, "trace_source": "recompute"}
 
                 event_rate = float((getattr(bundle, "metadata", {}) or {}).get("alignment_sample_rate_hz", rate))
                 event_tvecs = _time_vectors(windows, event_rate)

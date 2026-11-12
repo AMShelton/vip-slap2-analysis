@@ -164,6 +164,24 @@ physiology functions or `min_epoch_duration` in behavior preprocessing. See
 [`EPOCH_DURATION_QC_PATCH_NOTES.md`](EPOCH_DURATION_QC_PATCH_NOTES.md) for the
 full policy and modality-specific behavior.
 
+## Where dF/F comes from (`trace_source`)
+
+The preprocessors own dF/F. `process_voltage_extraction(..., trace_source="product")`
+(default) extracts Voltex's stored, polarity-corrected `dff` and its `f0` as they are
+(F0 fitted per acquisition epoch with motion-censored samples excluded, sign from the
+`indicatorName` Voltex was run with); outputs are named `voltage_*_voltex_dff_<mode>.*`
+and the QC JSON carries `trace_source_effective`, Voltex's `/params` and a
+`voltex_polarity_crosscheck` of Voltex's sign against the registry indicator (a
+mismatch is an error). `trace_source="recompute"` is the historical path — F0 and the
+indicator sign derived here from `raw_f`, outputs `dff_robust_f0_<mode>` /
+`dff_static_f0_<mode>` — and the only option for legacy MAT/H5 products, which hold raw
+F alone; with `"product"` requested on such a product the run falls back to it and says
+so in QC (`trace_source_fallback="error"` refuses instead). Glutamate has always consumed
+the preprocessor's stored signal: `trace_signal="dF"` with `trace_mode` `ls` (default),
+`denoised` or `events` selects GIAnT's `dF_<mode>` (legacy SummaryLoCo `dF`), and dF/F is
+`dF/F0` with the stored F0. `compute_voltage_roi_transform_from_asset` keeps
+`trace_source="recompute"` as its default for F0 exploration.
+
 ## Glutamate workflow
 
 ### Open a SLAP2 summary file

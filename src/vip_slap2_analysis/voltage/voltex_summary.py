@@ -358,6 +358,24 @@ class VoltexSummary:
     def get_traces(self, *args: Any, **kwargs: Any) -> np.ndarray:
         return self.get_roi_traces(*args, **kwargs)
 
+    def has_trace_kind(self, kind: str, dmd: Optional[int] = None) -> bool:
+        """True when ``sources/temporal/<kind>`` exists for ``dmd`` (or for every DMD with ROIs)."""
+        dmds = [int(dmd)] if dmd is not None else [d for d in range(1, int(self.n_dmds) + 1) if self.n_rois[d - 1] > 0]
+        with self._open() as f:
+            return all(f"Path{d}/sources/temporal/{kind}" in f for d in dmds) and bool(dmds)
+
+    @property
+    def product_dff_available(self) -> bool:
+        """Voltex wrote its own polarity-corrected ``dff`` (and ``f0``) for every DMD with ROIs."""
+        try:
+            return self.has_trace_kind("dff") and self.has_trace_kind("f0")
+        except Exception:
+            return False
+
+    def using(self, kind: str) -> "_TraceKindContext":
+        """Context manager that temporarily switches the default ``trace_kind`` (raw_f / dff / f0)."""
+        return _TraceKindContext(self, kind)
+
     def get_discard_frames(self, dmd: int, trial: int, trace_mode: str = "trial") -> np.ndarray:
         """All-False unless ``apply_motion_censor`` and ``frame_info/motion_censor`` exist."""
         sl = self._sample_slice(dmd, trial)
@@ -490,3 +508,18 @@ def find_voltex_summary_candidates(session_dir: PathLike) -> List[Path]:
     root = Path(session_dir)
     hits = list(root.rglob("VoltageSummary.h5")) + list(root.rglob("voltage_summary.h5"))
     return sorted(set(hits), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+class _TraceKindContext:
+    def __init__(self, vs: "VoltexSummary", kind: str) -> None:
+        if kind not in ("raw_f", "dff", "f0"):
+            raise ValueError("trace kind must be 'raw_f', 'dff' or 'f0'")
+        self.vs, self.kind, self._prev = vs, kind, vs.trace_kind
+
+    def __enter__(self) -> "VoltexSummary":
+        self.vs.trace_kind = self.kind
+        return self.vs
+
+    def __exit__(self, *exc: Any) -> None:
+        self.vs.trace_kind = self._prev
+

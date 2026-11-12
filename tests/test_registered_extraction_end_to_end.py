@@ -227,3 +227,49 @@ def test_voltage_polarity_crosscheck_and_trace_kind_guard(tmp_path):
     with pytest.raises(NotImplementedError, match="raw_f"):
         process_voltage_extraction(asset, trace_signal="raw", overwrite=True, write_sequence=False, voltex_trace_kind="dff",
                                    voltage_indicator="ASAP7y")
+
+
+def test_voltage_extraction_uses_voltex_product_dff_by_default(tmp_path):
+    """trace_source='product': Voltex's stored dff/f0 are the extracted signal; nothing is re-baselined."""
+    import json
+    import h5py
+    from vip_slap2_analysis.voltage.postprocess import load_voltage_summary_from_asset
+    asset, truth = _build_session(tmp_path)
+    run_cycle_registration(asset, dmd=1, dynamic_data_dir=truth["dd"])
+    common = dict(trace_signal="dff_robust_f0", overwrite=True, write_single_trials=False, write_sequence=False,
+                  write_session_traces=True, use_roi_qc=False, cycle_registration="auto", voltage_indicator="ASAP7y",
+                  compression=None, compression_opts=None)
+    out = process_voltage_extraction(asset, **common)                       # default trace_source="product"
+    assert out["status"] == "ok"
+    assert Path(out["session_traces_h5"]).name == "voltage_session_traces_voltex_dff_trial.h5"
+    qc = json.loads(Path(out["qc_json"]).read_text())
+    assert qc["trace_source_requested"] == "product" and qc["trace_source_effective"] == "product"
+    assert qc["trace_signal"] == "voltex_dff" and qc["trace_signal_requested"] == "dff_robust_f0"
+    assert qc["preprocessor_params"] is not None
+    # the session dff equals Voltex's stored dff (synthetic: (raw-100)/100), f0 equals Voltex's f0 (100)
+    with h5py.File(out["session_traces_h5"], "r") as f:
+        raw = f["DMD1/raw_f"][()]; dff = f["DMD1/dff"][()]; f0 = f["DMD1/f0"][()]
+        meta = json.loads(f["DMD1"].attrs["signal_transform_json"])
+    assert meta["trace_source"] == "product" and meta["transform"] == "preprocessor" and meta["dff_sign"] == -1
+    ok = np.isfinite(raw) & np.isfinite(dff)
+    assert np.allclose(dff[ok], (raw[ok] - 100.0) / 100.0, atol=1e-5) and np.allclose(f0[np.isfinite(f0)], 100.0)
+
+    # explicit recompute keeps the historical products and names
+    out2 = process_voltage_extraction(asset, trace_source="recompute", **common)
+    assert Path(out2["session_traces_h5"]).name == "voltage_session_traces_dff_robust_f0_trial.h5"
+    qc2 = json.loads(Path(out2["qc_json"]).read_text())
+    assert qc2["trace_source_effective"] == "recompute" and qc2["trace_signal"] == "dff_robust_f0"
+    with h5py.File(out2["session_traces_h5"], "r") as f:
+        meta2 = json.loads(f["DMD1"].attrs["signal_transform_json"])
+    assert meta2["trace_source"] == "recompute" and meta2["dff_sign"] == -1
+
+    # on-the-fly inspection can read the product too
+    from vip_slap2_analysis.voltage.extraction import compute_voltage_roi_transform_from_asset
+    roi = compute_voltage_roi_transform_from_asset(asset, dmd=1, roi_index=0, cycle_registration="auto",
+                                                   voltage_indicator="ASAP7y", trace_source="product")
+    assert roi["metadata"]["trace_source"] == "product" and np.allclose(roi["f0"][np.isfinite(roi["f0"])], 100.0)
+    # raw output is unaffected by trace_source
+    out3 = process_voltage_extraction(asset, trace_signal="raw", overwrite=True, write_sequence=False, write_single_trials=False,
+                                      use_roi_qc=False, cycle_registration="auto", voltage_indicator="ASAP7y",
+                                      compression=None, compression_opts=None)
+    assert json.loads(Path(out3["qc_json"]).read_text())["trace_source_effective"] == "n/a"
