@@ -55,16 +55,57 @@ def compare(modern_path: Path, legacy_path: Path, *, max_trials: int | None = No
     report["modern_trial_epoch_source"] = g.trial_epoch_source; report["legacy_trial_epoch_source"] = l.trial_epoch_source
     if g.n_trials != l.n_trials:
         report["problems"].append(f"trial count differs: modern {g.n_trials} vs legacy {l.n_trials}")
+    same_segmentation = g.n_trials == l.n_trials
+
+    def _coverage(summary, dmd):
+        """Lines covered by valid trials vs all trials of the summary (1-based source lines), with time spans."""
+        try:
+            lr = float(summary.get_line_rate_hz(dmd))
+        except Exception:
+            lr = float("nan")
+        spans, cov_valid, cov_all, invalid = [], 0, 0, []
+        valid = set(summary.valid_trials[dmd - 1])
+        for t in range(1, int(summary.n_trials) + 1):
+            lines = summary.get_trial_source_lines(dmd, t)
+            if lines is None or len(lines) == 0:
+                invalid.append({"trial": t, "reason": "no frames/lines"})
+                continue
+            lo, hi = int(np.min(lines)), int(np.max(lines))
+            cov_all += hi - lo + 1
+            if t in valid:
+                cov_valid += hi - lo + 1
+            else:
+                invalid.append({"trial": t, "first_line": lo, "last_line": hi,
+                                "t_start_s": lo / lr if np.isfinite(lr) else None, "t_end_s": hi / lr if np.isfinite(lr) else None})
+            spans.append((lo, hi))
+        total_lines = (max(h for _, h in spans) - min(l0 for l0, _ in spans) + 1) if spans else 0
+        return {"n_trials": int(summary.n_trials), "n_valid_trials": len(valid), "lines_in_valid_trials": int(cov_valid),
+                "lines_in_all_trials": int(cov_all), "acquisition_lines_spanned": int(total_lines),
+                "valid_fraction_of_acquisition": (cov_valid / total_lines) if total_lines else None,
+                "invalid_trials": invalid, "line_rate_hz": lr}
+
     for dmd in dmds:
         if dmd > g.n_dmds or dmd > l.n_dmds:
             continue
         out = {"modern_n_sources": g.n_synapses[dmd - 1], "legacy_n_sources": l.n_synapses[dmd - 1],
-               "modern_valid_trials": g.valid_trials[dmd - 1], "legacy_valid_trials": l.valid_trials[dmd - 1], "trials": []}
+               "modern_valid_trials": g.valid_trials[dmd - 1], "legacy_valid_trials": l.valid_trials[dmd - 1], "trials": [],
+               "modern_coverage": _coverage(g, dmd), "legacy_coverage": _coverage(l, dmd)}
+        mc, lc = out["modern_coverage"], out["legacy_coverage"]
+        if mc["valid_fraction_of_acquisition"] is not None and lc["valid_fraction_of_acquisition"] is not None and \
+                abs(mc["valid_fraction_of_acquisition"] - lc["valid_fraction_of_acquisition"]) > 0.01:
+            report["problems"].append(
+                f"DMD{dmd}: valid-trial coverage of the acquisition differs: modern {mc['valid_fraction_of_acquisition']:.1%} "
+                f"({mc['n_valid_trials']}/{mc['n_trials']} trials) vs legacy {lc['valid_fraction_of_acquisition']:.1%} "
+                f"({lc['n_valid_trials']}/{lc['n_trials']}); events inside invalid trials are dropped by extraction")
         if out["modern_n_sources"] != out["legacy_n_sources"]:
             report["problems"].append(f"DMD{dmd}: source count differs ({out['modern_n_sources']} vs {out['legacy_n_sources']}); traces compared only on the common prefix, identities NOT assumed equal")
         common = sorted(set(g.valid_trials[dmd - 1]) & set(l.valid_trials[dmd - 1]))
         if set(g.valid_trials[dmd - 1]) != set(l.valid_trials[dmd - 1]):
             report["problems"].append(f"DMD{dmd}: valid trial sets differ")
+        if not same_segmentation:
+            report["problems"].append(f"DMD{dmd}: trial segmentation differs (modern {g.n_trials} vs legacy {l.n_trials} trials over the same "
+                                      "acquisition); per-trial trace statistics are not meaningful and were skipped")
+            common = []
         for t in common[: (max_trials or len(common))]:
             row = {"trial": t}
             mg = g.get_traces(dmd, t, signal="dF", mode="ls", squeeze_channels=False)[:, :, 0]
@@ -124,6 +165,12 @@ def main(argv=None) -> int:
     for p in rep["problems"]:
         print(" -", p)
     for k, d in rep["per_dmd"].items():
+        for tag in ("modern", "legacy"):
+            c = d[f"{tag}_coverage"]
+            inv = c["invalid_trials"]
+            spans = ", ".join(f"{x['trial']}:{x.get('t_start_s', float('nan')):.0f}-{x.get('t_end_s', float('nan')):.0f}s" for x in inv[:12] if 't_start_s' in x)
+            print(f" {k} {tag}: {c['n_valid_trials']}/{c['n_trials']} trials valid, {c['valid_fraction_of_acquisition'] if c['valid_fraction_of_acquisition'] is None else round(c['valid_fraction_of_acquisition'], 3)} of the acquisition covered"
+                  + (f"; invalid trials (trial:start-end): {spans}{' ...' if len(inv) > 12 else ''}" if inv else ""))
         for r in d["trials"][:3]:
             print(f" {k} trial {r['trial']}: dF_ls rel_rms={r['dF_ls'].get('rel_rms_diff')} r={r['dF_ls'].get('pearson_r')} frame_lines_identical={r['frame_lines']['identical']}")
     return 0
