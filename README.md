@@ -182,6 +182,18 @@ the preprocessor's stored signal: `trace_signal="dF"` with `trace_mode` `ls` (de
 `dF/F0` with the stored F0. `compute_voltage_roi_transform_from_asset` keeps
 `trace_source="recompute"` as its default for F0 exploration.
 
+## Canonical product location and the legacy archive
+
+Extraction products live directly under `analysis/derived/<modality>/` and
+`analysis/qc/<modality>/` (plus `analysis/qc/slap2/` for the glutamate synapse QC). Products of
+the pre-2026-11 preprocessors (SummaryLoCo, extractDendrites) were moved aside once with
+`scripts/archive_legacy_derived.py` into `legacy_LoCo/` (glutamate, calcium, slap2 QC) and
+`legacy_extractDendrites/` (voltage) inside those same folders, each with an
+`_archive_manifest.json`; `qc/behavior` and `qc/sync` were not touched. The processing console
+refuses to write a session whose modality folders still hold root-level products without a
+`legacy_*` sub-folder (`REQUIRE_LEGACY_ARCHIVED`). `output_subdir` remains available for
+comparison runs that must not touch the canonical products.
+
 ## Glutamate workflow
 
 ### Open a SLAP2 summary file
