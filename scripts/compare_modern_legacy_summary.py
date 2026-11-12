@@ -98,10 +98,24 @@ def compare(modern_path: Path, legacy_path: Path, *, max_trials: int | None = No
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--modern", required=True); ap.add_argument("--legacy", required=True)
+    ap.add_argument("--modern", default=None, help="GIAnT experiment_summary.h5 (or use --summary-xlsx/--session)")
+    ap.add_argument("--legacy", default=None, help="legacy SummaryLoCo*.mat (or use --summary-xlsx/--session)")
+    ap.add_argument("--summary-xlsx", default=None, help="resolve both files from the session registry")
+    ap.add_argument("--session", default=None)
     ap.add_argument("--max-trials", type=int, default=None); ap.add_argument("--out", default=None)
     a = ap.parse_args(argv)
-    rep = compare(Path(a.modern), Path(a.legacy), max_trials=a.max_trials)
+    modern, legacy = a.modern, a.legacy
+    if a.summary_xlsx and a.session:
+        from vip_slap2_analysis.io.session_registry import VIPSessionRegistry
+        reg = VIPSessionRegistry.from_excel(a.summary_xlsx)
+        asset = reg.resolve_assets(a.session)
+        cands = asset.get_asset("glutamate", "summary_candidates") or {}
+        modern = modern or cands.get("giant_experiment_summary_h5") or asset.get_asset("glutamate", "summary_h5")
+        legacy = legacy or cands.get("legacy_summary_loco_mat") or getattr(asset, "summary_mat", None)
+        print(f"modern: {modern}\nlegacy: {legacy}")
+    if not modern or not legacy:
+        ap.error("give --modern and --legacy, or --summary-xlsx and --session")
+    rep = compare(Path(modern), Path(legacy), max_trials=a.max_trials)
     txt = json.dumps(rep, indent=2, default=str)
     if a.out:
         Path(a.out).write_text(txt, encoding="utf-8")
