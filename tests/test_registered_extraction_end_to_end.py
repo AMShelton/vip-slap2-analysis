@@ -199,3 +199,31 @@ def test_require_identified_alignment_refuses_ambiguous_session(tmp_path):
     qc = json.loads(Path(out["qc_json"]).read_text())
     assert qc["per_dmd"]["DMD1"]["cycle_registration"]["applied"] is False
     assert "ambiguous" in qc["per_dmd"]["DMD1"]["cycle_registration"]["reason"]
+
+
+def test_voltage_polarity_crosscheck_and_trace_kind_guard(tmp_path):
+    """Pipeline recomputes dF/F from raw_f with the registry indicator; Voltex's stored polarity must agree."""
+    import json
+    from vip_slap2_analysis.voltage.extraction import crosscheck_voltex_polarity, voltex_dff_polarity
+    from vip_slap2_analysis.voltage.postprocess import load_voltage_summary_with_provenance
+    asset, truth = _build_session(tmp_path)
+    run_cycle_registration(asset, dmd=1, dynamic_data_dir=truth["dd"])
+    # the synthetic Voltex file declares indicator_direction='decreases' (ASAP7-like)
+    assert voltex_dff_polarity({"indicator_direction": "decreases", "indicator_name": "ASAP7y"})["dff_sign"] == -1
+    assert voltex_dff_polarity({"indicator_direction": "auto", "indicator_name": "ASAP8"})["dff_sign"] == 1
+    assert voltex_dff_polarity({"indicator_direction": "auto", "indicator_name": ""})["dff_sign"] is None
+    vs, _ = load_voltage_summary_with_provenance(asset, keep_open=True)
+    with vs:
+        chk = crosscheck_voltex_polarity(vs, asset, voltage_indicator="ASAP7y")
+        assert chk["checked"] and chk["consistent"] and chk["by_dmd"]["1"]["pipeline"]["dff_sign"] == -1
+        with pytest.raises(RuntimeError, match="polarity disagrees"):
+            crosscheck_voltex_polarity(vs, asset, voltage_indicator="ASAP8")
+    # extraction records the check and refuses to run on Voltex's stored dff
+    out = process_voltage_extraction(asset, trace_signal="raw", overwrite=True, write_sequence=False, write_single_trials=False,
+                                     use_roi_qc=False, cycle_registration="auto", voltage_indicator="ASAP7y",
+                                     compression=None, compression_opts=None)
+    qc = json.loads(Path(out["qc_json"]).read_text())
+    assert qc["voltex_polarity_crosscheck"]["consistent"] is True
+    with pytest.raises(NotImplementedError, match="raw_f"):
+        process_voltage_extraction(asset, trace_signal="raw", overwrite=True, write_sequence=False, voltex_trace_kind="dff",
+                                   voltage_indicator="ASAP7y")

@@ -667,6 +667,68 @@ def _resolve_voltage_dff_polarity_for_dmd(
     return out
 
 
+def voltex_dff_polarity(dff_attrs: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Polarity Voltex used for its stored ``dff``, from the dataset attributes it writes.
+
+    ``SLAP2-Voltage-Extraction`` (``computeVoltageDFF.m``) writes
+    ``indicator_direction`` as *requested* (``auto`` / ``increases`` / ``decreases``)
+    and ``indicator_name``; under ``auto`` it resolved ASAP8 -> increases (+1) and
+    ASAP7 -> decreases (-1), erroring on anything else, so a written file with
+    ``auto`` implies the name was one of those. Returns ``None`` when attributes
+    are absent (legacy product or older Voltex).
+    """
+    if not dff_attrs:
+        return None
+    direction = str(dff_attrs.get("indicator_direction", "") or "").strip().lower()
+    name = str(dff_attrs.get("indicator_name", "") or "").strip()
+    if direction in ("increases", "increase", "standard", "positive", "brightens"):
+        sign = 1
+    elif direction in ("decreases", "decrease", "inverted", "negative", "quenched", "quenching"):
+        sign = -1
+    elif direction == "auto":
+        low = name.lower()
+        sign = 1 if "asap8" in low else (-1 if "asap7" in low else None)
+    else:
+        sign = None
+    return {"indicator_direction": direction or None, "indicator_name": name or None, "dff_sign": sign,
+            "sign_convention": dff_attrs.get("sign_convention")}
+
+
+def crosscheck_voltex_polarity(vs: Any, asset: SessionAssets, *, voltage_indicator: Optional[str] = None,
+                               dff_polarity: str = "auto") -> Dict[str, Any]:
+    """Compare the polarity this pipeline will apply with the one Voltex applied to its stored ``dff``.
+
+    The pipeline never uses Voltex's ``dff``: it recomputes dF/F from ``raw_f`` with
+    the indicator taken from the session registry. This check catches the case
+    where the two indicator sources disagree (wrong ``indicatorName`` at Voltex
+    time, or a wrong ``indicator1`` in the sessions sheet), which would silently
+    invert either product. Raises ``RuntimeError`` on a sign mismatch.
+    """
+    out: Dict[str, Any] = {"checked": False, "by_dmd": {}}
+    attrs_all = (getattr(vs, "metadata", {}) or {}).get("dff_attrs") or {}
+    if not attrs_all:
+        out["note"] = "no Voltex dff attributes (legacy product or older Voltex); nothing to compare"
+        return out
+    mismatches = []
+    for dmd_key, attrs in attrs_all.items():
+        dmd = int(dmd_key)
+        vx = voltex_dff_polarity(attrs)
+        here = _resolve_voltage_dff_polarity_for_dmd(asset, dmd, voltage_indicator=voltage_indicator, dff_polarity=dff_polarity)
+        row = {"voltex": vx, "pipeline": {k: here.get(k) for k in ("indicator", "dff_sign", "dff_polarity_source", "transform")}}
+        row["consistent"] = (vx is None or vx.get("dff_sign") is None or int(vx["dff_sign"]) == int(here["dff_sign"]))
+        out["by_dmd"][str(dmd)] = row
+        if not row["consistent"]:
+            mismatches.append(f"DMD{dmd}: Voltex dff sign {vx['dff_sign']} (indicator_name={vx.get('indicator_name')!r}, "
+                              f"indicator_direction={vx.get('indicator_direction')!r}) vs pipeline sign {here['dff_sign']} "
+                              f"(indicator={here.get('indicator')!r} from {here.get('dff_polarity_source')})")
+    out["checked"] = True
+    out["consistent"] = not mismatches
+    if mismatches:
+        raise RuntimeError("Voltage-indicator polarity disagrees between the Voltex product and the session registry; "
+                           "fix the indicator metadata before extracting. " + "; ".join(mismatches))
+    return out
+
+
 def _safe_f0_values(f0: np.ndarray, raw_f: np.ndarray) -> np.ndarray:
     """Guard against invalid or near-zero F0 values.
 
@@ -1979,10 +2041,16 @@ def process_voltage_extraction(
     )
     seq_events = build_change_locked_sequences(ordered_images_f)
 
+    if str(voltex_trace_kind) != "raw_f":
+        raise NotImplementedError(
+            f"voltex_trace_kind={voltex_trace_kind!r}: this pipeline derives F0 and polarity-corrected dF/F from raw_f "
+            "itself; feeding Voltex's stored dff/f0 through the same transform would double-apply the baseline and sign. "
+            "Use raw_f (default), or read Voltex's dff directly with VoltexSummary(trace_kind='dff') outside extraction.")
     vs, summary_provenance = load_voltage_summary_with_provenance(
         asset, keep_open=True, summary_preference=summary_preference,
         trace_kind=voltex_trace_kind, apply_motion_censor=apply_motion_censor,
     )
+    voltex_polarity_check = crosscheck_voltex_polarity(vs, asset, voltage_indicator=voltage_indicator, dff_polarity=dff_polarity)
     registrations: Dict[int, Any] = {}
     registration_info: Dict[str, Any] = {}
     for dmd in range(1, int(vs.n_dmds) + 1):
@@ -2017,6 +2085,7 @@ def process_voltage_extraction(
             "summary_provenance": summary_provenance,
             "summary_format": summary_provenance.get("selected_format"),
             "summary_path": summary_provenance.get("selected_path"),
+            "voltex_polarity_crosscheck": voltex_polarity_check,
             "cycle_registration": registration_info,
             "require_identified_cycle_alignment": bool(require_identified_cycle_alignment),
             "bonsai_event_log_csv": str(resolve_corrected_event_log(asset)),
@@ -2072,6 +2141,7 @@ def process_voltage_extraction(
             "trace_h5": base_meta["trace_h5"],
             "summary_provenance": summary_provenance,
             "summary_format": base_meta["summary_format"],
+            "voltex_polarity_crosscheck": voltex_polarity_check,
             "cycle_registration": registration_info,
             "require_identified_cycle_alignment": bool(require_identified_cycle_alignment),
             "bonsai_event_log_csv": str(resolve_corrected_event_log(asset)),
