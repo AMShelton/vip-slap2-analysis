@@ -64,11 +64,44 @@ def compare(modern_path: Path, legacy_path: Path, *, max_trials: int | None = No
         except Exception:
             lr = float("nan")
         spans, cov_valid, cov_all, invalid = [], 0, 0, []
-        valid = set(summary.valid_trials[dmd - 1])
+        valid = set(int(v) for v in summary.valid_trials[dmd - 1])
+        # trial table line ranges (GIAnT trial_table.h5) give the span of trials that have no frames
+        tt = getattr(summary, "trial_table", None) or {}
+        fl, ll = tt.get("first_line"), tt.get("last_line")
+
+        def _table_span(t):
+            if fl is None or ll is None:
+                return None
+            a = np.atleast_2d(fl); b = np.atleast_2d(ll)
+            n = int(summary.n_trials)
+            try:
+                if a.shape[0] == n:                       # (nTrials, nDMDs): MATLAB nDMDs x nTrials read through h5py
+                    j = dmd - 1 if a.shape[1] >= dmd else 0
+                    return int(a[t - 1, j]), int(b[t - 1, j])
+                if a.shape[1] == n:                       # (nDMDs, nTrials)
+                    i = dmd - 1 if a.shape[0] >= dmd else 0
+                    return int(a[i, t - 1]), int(b[i, t - 1])
+            except Exception:
+                return None
+            return None
+
         for t in range(1, int(summary.n_trials) + 1):
-            lines = summary.get_trial_source_lines(dmd, t)
+            lines = None
+            if t in valid:
+                try:
+                    lines = summary.get_trial_source_lines(dmd, t)
+                except Exception:
+                    lines = None
             if lines is None or len(lines) == 0:
-                invalid.append({"trial": t, "reason": "no frames/lines"})
+                span = _table_span(t)
+                if span is None:
+                    invalid.append({"trial": t, "reason": "no frames; no trial-table span"})
+                    continue
+                lo, hi = span
+                cov_all += hi - lo + 1
+                invalid.append({"trial": t, "first_line": lo, "last_line": hi,
+                                "t_start_s": lo / lr if np.isfinite(lr) else None, "t_end_s": hi / lr if np.isfinite(lr) else None})
+                spans.append((lo, hi))
                 continue
             lo, hi = int(np.min(lines)), int(np.max(lines))
             cov_all += hi - lo + 1
