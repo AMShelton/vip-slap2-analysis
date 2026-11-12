@@ -38,6 +38,7 @@ from vip_slap2_analysis.common.epoch_alignment import (
 from scipy import signal
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import medfilt
+from vip_slap2_analysis.common.products import DEFAULT_VOLTAGE_TRACE_VARIANT
 
 try:
     import h5py
@@ -76,7 +77,7 @@ def resolve_session_paths(
     encoder_pkl: Optional[str | Path] = None,
     harp_df_csv: Optional[str | Path] = None,
     bonsai_event_log_csv: Optional[str | Path] = None,
-    trace_variant: str = "dff_robust_f0_trial",
+    trace_variant: str = DEFAULT_VOLTAGE_TRACE_VARIANT,
 ) -> SessionPaths:
     """Resolve the files needed for alignment/regression from an asset or manual paths."""
     if trace_h5 is None and asset is not None:

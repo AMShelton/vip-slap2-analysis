@@ -12,6 +12,8 @@ import warnings
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
+from vip_slap2_analysis.common.products import DEFAULT_VOLTAGE_TRACE_VARIANT
+
 import h5py
 import numpy as np
 import pandas as pd
@@ -73,10 +75,18 @@ def _load_json(path: Optional[Path]) -> dict:
         return json.load(f)
 
 
-def resolve_voltage_products(asset, trace_variant: str = "dff_robust_f0_trial") -> dict:
-    """Resolve processed voltage/behavior products for one session asset."""
+def resolve_voltage_products(asset, trace_variant: str = DEFAULT_VOLTAGE_TRACE_VARIANT, subdir: Optional[str] = None) -> dict:
+    """Resolve processed voltage/behavior products for one session asset.
+
+    Current products live at ``analysis/derived/voltage`` (``voltex_dff_trial`` by
+    default). Pass ``subdir="legacy_extractDendrites"`` with
+    ``trace_variant="dff_robust_f0_trial"`` to read the archived legacy products.
+    """
     voltage_dir = Path(asset.derived_dir) / "voltage"
     voltage_qc_dir = Path(asset.qc_dir) / "voltage"
+    if subdir:
+        voltage_dir = voltage_dir / subdir
+        voltage_qc_dir = voltage_qc_dir / subdir
     behavior_qc_dir = Path(asset.qc_dir) / "behavior"
 
     qc_json = _first_existing(
@@ -137,7 +147,7 @@ def build_voltage_session_table(
     exclude_session_types: Optional[Sequence[str]] = None,
     session_labels: Optional[Sequence[str]] = None,
     session_ids: Optional[Sequence[str]] = None,
-    trace_variant: str = "dff_robust_f0_trial",
+    trace_variant: str = DEFAULT_VOLTAGE_TRACE_VARIANT,
     require_products: Sequence[str] = (
         "trace_h5",
         "single_trial_h5",

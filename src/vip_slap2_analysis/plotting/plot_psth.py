@@ -20,10 +20,12 @@ from vip_slap2_analysis.plotting.plot_session_heatmap import (
     build_pc1_trace_for_session,
 )
 
+from vip_slap2_analysis.common.products import DEFAULT_VOLTAGE_TRACE_VARIANT
+
 def plot_voltage_mean_image_response_heatmap(
     asset,
     *,
-    trace_variant="dff_robust_f0_trial",
+    trace_variant=DEFAULT_VOLTAGE_TRACE_VARIANT,
     mean_npz=None,
     dmd=1,
     image_name=None,

@@ -18,7 +18,9 @@ from vip_slap2_analysis.plotting.plot_session_heatmap import (
     build_pc1_trace_for_session,
 )
 
-def resolve_voltage_mean_npz(asset, trace_variant="dff_robust_f0_trial", mean_npz=None):
+from vip_slap2_analysis.common.products import DEFAULT_VOLTAGE_TRACE_VARIANT
+
+def resolve_voltage_mean_npz(asset, trace_variant=DEFAULT_VOLTAGE_TRACE_VARIANT, mean_npz=None):
     if mean_npz is not None:
         path = Path(mean_npz)
         if not path.exists():
@@ -33,7 +35,7 @@ def resolve_voltage_mean_npz(asset, trace_variant="dff_robust_f0_trial", mean_np
     return path
 
 
-def load_voltage_mean_npz(asset, trace_variant="dff_robust_f0_trial", mean_npz=None):
+def load_voltage_mean_npz(asset, trace_variant=DEFAULT_VOLTAGE_TRACE_VARIANT, mean_npz=None):
     path = resolve_voltage_mean_npz(asset, trace_variant=trace_variant, mean_npz=mean_npz)
     pkg = np.load(path, allow_pickle=True)["data"][0]
     return pkg, path
