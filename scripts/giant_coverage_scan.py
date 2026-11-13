@@ -65,6 +65,44 @@ def per_trial_motion_summary(summary_h5, dmd: int, coverage: dict) -> dict:
     return out
 
 
+def trial_qc_summary(summary_h5, dmd: int) -> dict:
+    """Read Path<n>/trial_qc written by the parameterised SILo gate (GIAnT fix/aind-slap2-dynamic-data, 66f7ca8)."""
+    import h5py
+    import numpy as np
+    out = {"qc_rule": None}
+    try:
+        with h5py.File(summary_h5, "r") as f:
+            g = f.get(f"Path{int(dmd)}/trial_qc")
+            if g is None or "rule" not in g:
+                return out
+            def _s(k):
+                v = g[k][()]
+                if isinstance(v, bytes):
+                    return v.decode()
+                v = np.asarray(v)
+                return "".join(chr(int(c)) for c in v.ravel()) if v.dtype.kind in "iu" else str(v.ravel()[0]) if v.size == 1 else str(v)
+            corr = np.asarray(g["template_corr"][()], dtype=float).ravel() if "template_corr" in g else np.array([])
+            valid = np.asarray(g["valid"][()], dtype=float).ravel().astype(bool) if "valid" in g else np.zeros(corr.size, bool)
+            keep = np.asarray(g["trial_table_keep"][()], dtype=float).ravel().astype(bool) if "trial_table_keep" in g else np.ones(corr.size, bool)
+            reasons = _s("excluded_reason") if "excluded_reason" in g else ""
+            from collections import Counter
+            rc = Counter(r for r in reasons.split(";") if r)
+            fin = np.isfinite(corr)
+            out.update({
+                "qc_rule": _s("rule"), "qc_corr_thresh": float(np.asarray(g["corr_thresh"][()]).ravel()[0]) if "corr_thresh" in g else None,
+                "qc_legacy_thresh": float(np.asarray(g["legacy_outlier_thresh"][()]).ravel()[0]) if "legacy_outlier_thresh" in g else None,
+                "qc_n_trial_table_rejected": int((~keep).sum()), "qc_n_not_aligned": int((keep & ~fin).sum()),
+                "qc_reasons": dict(rc),
+                "qc_corr_valid_min": float(np.nanmin(corr[valid])) if valid.any() and fin[valid].any() else None,
+                "qc_corr_valid_median": float(np.nanmedian(corr[valid])) if valid.any() and fin[valid].any() else None,
+                "qc_corr_excluded_max": float(np.nanmax(corr[keep & fin & ~valid])) if (keep & fin & ~valid).any() else None,
+                "qc_corr_excluded_median": float(np.nanmedian(corr[keep & fin & ~valid])) if (keep & fin & ~valid).any() else None,
+            })
+    except Exception as exc:
+        out["qc_error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--summary-xlsx", required=True)
@@ -91,6 +129,7 @@ def main(argv=None) -> int:
                 for dmd in range(1, int(g.n_dmds) + 1):
                     c = valid_trial_coverage(g, dmd)
                     motion = per_trial_motion_summary(path, dmd, c)
+                    tq = trial_qc_summary(path, dmd)
                     lr = c["line_rate_hz"] if c["line_rate_hz"] == c["line_rate_hz"] else LINE_RATE_FALLBACK_HZ
                     inv = c["invalid_trials"]
                     spans = "; ".join(f"{x['trial']}:{x['first_line']/lr:.0f}-{x['last_line']/lr:.0f}s" for x in inv if "first_line" in x)
@@ -98,12 +137,17 @@ def main(argv=None) -> int:
                     rows.append({"session_id": sid, "dmd": dmd, "status": "ok" if (frac is None or frac >= a.min_fraction) else "low_coverage",
                                  "n_trials": c["n_trials"], "n_valid_trials": c["n_valid_trials"], "valid_fraction": frac,
                                  "first_invalid_s": (inv[0]["first_line"] / lr) if inv and "first_line" in inv[0] else None,
-                                 "invalid_spans": spans, "summary_h5": str(path), **motion})
+                                 "invalid_spans": spans, "summary_h5": str(path), **motion, **tq})
                     print(f"{sid} DMD{dmd}: {c['n_valid_trials']}/{c['n_trials']} trials valid, {frac if frac is None else round(frac, 3)} covered"
                           + (f"; invalid: {spans[:160]}" if spans else "")
                           + (f"; censored frames {motion['discard_frac_all']:.1%} (last valid trial {motion['discard_frac_last_valid_trial']:.1%}); "
                              f"median |shift| first/last valid trial {motion['shift_px_first_valid_trial']:.1f}/{motion['shift_px_last_valid_trial']:.1f} px"
-                             if motion.get("discard_frac_all") is not None else ""))
+                             if motion.get("discard_frac_all") is not None else "")
+                          + (f"\n    trial_qc: rule={tq['qc_rule']} corr_thresh={tq.get('qc_corr_thresh')} (legacy would be {tq.get('qc_legacy_thresh')}); "
+                             f"trial-table rejected={tq.get('qc_n_trial_table_rejected')}, not aligned={tq.get('qc_n_not_aligned')}, reasons={tq.get('qc_reasons')}; "
+                             f"template corr valid min/median={tq.get('qc_corr_valid_min')}/{tq.get('qc_corr_valid_median')}, "
+                             f"excluded max/median={tq.get('qc_corr_excluded_max')}/{tq.get('qc_corr_excluded_median')}"
+                             if tq.get("qc_rule") else "\n    trial_qc: absent (summary written before the parameterised gate)"))
             finally:
                 g.close()
         except Exception as exc:
