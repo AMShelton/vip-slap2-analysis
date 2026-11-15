@@ -98,6 +98,14 @@ def trial_qc_summary(summary_h5, dmd: int) -> dict:
                 "qc_corr_excluded_max": float(np.nanmax(corr[keep & fin & ~valid])) if (keep & fin & ~valid).any() else None,
                 "qc_corr_excluded_median": float(np.nanmedian(corr[keep & fin & ~valid])) if (keep & fin & ~valid).any() else None,
             })
+            # per-trial failures recorded (not fatal) since GIAnT fix/aind-slap2-dynamic-data 2026-11-15
+            for key in ("extraction_failed_message", "localization_message"):
+                if key in g:
+                    msgs = [m for m in _s(key).split(";") if m]
+                    if msgs:
+                        out[f"qc_{key}"] = Counter(msgs).most_common(3)
+            if "extraction_failed_trials" in g:
+                out["qc_extraction_failed_trials"] = np.asarray(g["extraction_failed_trials"][()], dtype=float).ravel().astype(int).tolist()
     except Exception as exc:
         out["qc_error"] = f"{type(exc).__name__}: {exc}"
     return out
