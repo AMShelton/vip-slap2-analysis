@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import pytest
@@ -128,6 +129,7 @@ def test_registry_discovers_modern_and_legacy_with_precedence(tmp_path):
     (proc / "SILo").mkdir(parents=True)
     write_giant_experiment_summary(proc / "summarize_LoCo" / "experiment_summary.h5", trial_frames=[10], n_sources=1)
     write_giant_experiment_summary(proc / "SILo" / "experiment_summary.h5", trial_frames=[10], n_sources=1)
+    os.utime(proc / "SILo" / "experiment_summary.h5", (1, 1))  # newest summary wins
     write_giant_trial_table(sd / "processed" / "trial_table.h5", epoch_by_trial=[1], first_line=[1], last_line=[10])
     (proc / "ExperimentSummary").mkdir()
     (proc / "ExperimentSummary" / "SummaryLoCo-260804-100000.mat").write_bytes(b"not a real mat")
@@ -139,7 +141,7 @@ def test_registry_discovers_modern_and_legacy_with_precedence(tmp_path):
     a = reg.resolve_assets(sd.name)
     g = a.get_modality_assets("glutamate")
     assert g["summary_format"] == "giant_experiment_summary_h5"
-    assert "summarize_LoCo" in str(g["summary_path"])  # summarize_LoCo preferred over SILo
+    assert "summarize_LoCo" in str(g["summary_path"])  # summarize_LoCo is the newer one
     assert g["summary_mat"] is not None and g["summary_candidates"]["legacy_summary_loco_mat"] is not None
     assert g["trial_table_h5"] is not None
     v = a.get_modality_assets("voltage")

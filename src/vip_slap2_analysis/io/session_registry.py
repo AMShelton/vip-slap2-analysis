@@ -14,6 +14,7 @@ separate asset dataclasses.
 from __future__ import annotations
 
 import os
+import warnings
 import glob
 import re
 from dataclasses import dataclass
@@ -616,9 +617,13 @@ class VIPSessionRegistry:
         classified = classify_summary_candidates(h5_candidates)
         giant_candidates = classified.get(FORMAT_GIANT, [])
         voltex_candidates = classified.get(FORMAT_VOLTEX, [])
-        giant_summary_h5 = (
-            max(giant_candidates, key=lambda p: _rank_path(p, PREFERRED_GIANT_PARTS)) if giant_candidates else None
-        )
+        # Newest wins: a re-run may sit in raw dynamic_data (flat layout) while an older
+        # product sits in the processed folder. Warn when layout preference would disagree.
+        giant_summary_h5 = max(giant_candidates, key=os.path.getmtime) if giant_candidates else None
+        if len(giant_candidates) > 1:
+            by_layout = max(giant_candidates, key=lambda p: _rank_path(p, PREFERRED_GIANT_PARTS))
+            if by_layout != giant_summary_h5:
+                warnings.warn(f"{session_dir.name}: newest GIAnT summary {giant_summary_h5} is in a different layout than {by_layout}")
         voltex_summary_h5 = (
             max(voltex_candidates, key=lambda p: _rank_path(p, PREFERRED_VOLTEX_PARTS)) if voltex_candidates else None
         )

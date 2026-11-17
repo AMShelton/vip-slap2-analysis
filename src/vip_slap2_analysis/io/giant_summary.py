@@ -134,7 +134,7 @@ def validate_giant_summary_schema(path: PathLike) -> Dict[str, Any]:
                 # That is a legitimate, readable product with 0 sources and 0 valid trials, not a
                 # schema error (803496_2025-07-30 DMD2, 2026-11-17).
                 no_sources = "sources/temporal" not in g
-                required = REQUIRED_PATH_DATASETS if not no_sources else tuple(d for d in REQUIRED_PATH_DATASETS if not d.startswith("sources/"))
+                required = REQUIRED_PATH_DATASETS if not no_sources else tuple(d for d in REQUIRED_PATH_DATASETS if not d.startswith("sources/") and d != "frame_info/frame_line_idxs")
                 for ds in required:
                     if ds in g:
                         entry["datasets"][ds] = {"shape": list(g[ds].shape), "dtype": str(g[ds].dtype)}
