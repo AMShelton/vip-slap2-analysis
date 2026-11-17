@@ -128,8 +128,14 @@ def validate_giant_summary_schema(path: PathLike) -> Dict[str, Any]:
                 report["problems"].append("no /Path{n} groups")
             for pg in path_groups:
                 g = f[pg]
-                entry: Dict[str, Any] = {"datasets": {}, "missing_required": []}
-                for ds in REQUIRED_PATH_DATASETS:
+                entry: Dict[str, Any] = {"datasets": {}, "missing_required": [], "notes": []}
+                # A path on which SILo found no sources ("Number of sources: 0") has frame_info
+                # (all-zero trial_num_frames), trial_qc and visualizations but no sources/ group.
+                # That is a legitimate, readable product with 0 sources and 0 valid trials, not a
+                # schema error (803496_2025-07-30 DMD2, 2026-11-17).
+                no_sources = "sources/temporal" not in g
+                required = REQUIRED_PATH_DATASETS if not no_sources else tuple(d for d in REQUIRED_PATH_DATASETS if not d.startswith("sources/"))
+                for ds in required:
                     if ds in g:
                         entry["datasets"][ds] = {"shape": list(g[ds].shape), "dtype": str(g[ds].dtype)}
                     else:
@@ -139,6 +145,13 @@ def validate_giant_summary_schema(path: PathLike) -> Dict[str, Any]:
                         entry["datasets"][ds] = {"shape": list(g[ds].shape), "dtype": str(g[ds].dtype)}
                 if entry["missing_required"]:
                     report["problems"].append(f"{pg}: missing {entry['missing_required']}")
+                elif no_sources:
+                    tnf = np.asarray(g["frame_info/trial_num_frames"][()]).ravel()
+                    entry["notes"].append("no sources extracted on this path (SILo found 0 sources); 0 valid trials")
+                    entry["n_trials"] = int(tnf.size)
+                    entry["n_frames"] = int(tnf.sum())
+                    entry["n_sources"] = 0
+                    entry["n_channels"] = None
                 else:
                     tnf = np.asarray(g["frame_info/trial_num_frames"][()]).ravel()
                     fli = g["frame_info/frame_line_idxs"]
@@ -202,6 +215,8 @@ class GiantExperimentSummary:
         with self._open() as f:
             for dmd in self.path_dmds:
                 tnf = np.asarray(f[f"Path{dmd}/frame_info/trial_num_frames"][()]).ravel().astype(int)
+                if f"Path{dmd}/sources/temporal/dF_ls" not in f:
+                    tnf = np.zeros_like(tnf)        # no sources on this path: no frames are usable
                 self._tnf[dmd] = tnf
                 self._offsets[dmd] = np.concatenate([[0], np.cumsum(tnf)])
             self.activity_channel: int = int(np.asarray(f["params/activityChannel"][()]).ravel()[0]) if "params/activityChannel" in f else 1
@@ -216,7 +231,7 @@ class GiantExperimentSummary:
         self.n_synapses: List[int] = []
         with self._open() as f:
             for d in range(1, self.n_dmds + 1):
-                self.n_synapses.append(int(f[f"Path{d}/sources/temporal/dF_ls"].shape[2]) if f"Path{d}" in f else 0)
+                self.n_synapses.append(int(f[f"Path{d}/sources/temporal/dF_ls"].shape[2]) if f"Path{d}/sources/temporal/dF_ls" in f else 0)
 
         self.trial_table_path = self._resolve_trial_table(self.trial_table_path)
         self.trial_epoch: Optional[np.ndarray] = None

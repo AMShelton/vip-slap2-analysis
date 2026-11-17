@@ -116,6 +116,16 @@ def product_qc(summary_h5: Path, dmd: int, coverage: dict) -> dict:
         if g is None:
             return {"prod_error": f"Path{dmd} missing"}
         tnf = np.asarray(g["frame_info/trial_num_frames"][()]).ravel().astype(int)
+        if "sources/temporal/dF_ls" not in g:
+            out.update({"prod_n_sources": 0, "prod_n_frames": 0, "prod_n_valid_trials": 0,
+                        "prod_note": "SILo found 0 sources on this path; no extraction products"})
+            for k in ("trialCorrRule", "minTrialCorr", "maxDiscardFrac", "startTime", "endTime"):
+                p = f"params/{k}"
+                if p in f:
+                    v = f[p][()]
+                    out[f"silo_{k}"] = v.decode() if isinstance(v, bytes) else (float(np.asarray(v).ravel()[0]) if np.asarray(v).dtype.kind in "fiu" else str(np.asarray(v).ravel()[0]))
+            out["prod_valid_fraction"] = coverage.get("valid_fraction_of_acquisition")
+            return out
         dfl = g["sources/temporal/dF_ls"]
         f0 = g["sources/temporal/F0"]
         out["prod_n_sources"] = int(dfl.shape[2]) if dfl.ndim == 3 else None
@@ -171,7 +181,8 @@ def verdicts(row: dict, baseline: dict | None) -> list[str]:
             mark(frac >= base - 1e-6, f"coverage {frac:.3f} vs 2026-11-12 baseline {base:.3f} ({row['n_valid_trials']}/{row['n_trials']} trials valid, was {baseline.get('n_valid_trials')}/{baseline.get('n_trials')})")
         mark(frac >= 0.70, f"coverage {frac:.3f} {'>=' if frac >= 0.70 else '<'} 0.70 target", warn=frac >= 0.5)
     if row.get("prod_n_sources") is not None:
-        mark(row["prod_n_sources"] > 0, f"{row['prod_n_sources']} sources, {row['prod_n_frames']} frames in {row['prod_n_valid_trials']} valid trials")
+        mark(row["prod_n_sources"] > 0, f"{row['prod_n_sources']} sources, {row['prod_n_frames']} frames in {row['prod_n_valid_trials']} valid trials"
+             + (" - SILo found no source above peakth on this path; compare with the previous summary's source count" if row["prod_n_sources"] == 0 else ""))
         nanf = row.get("prod_dF_ls_nan_frac")
         if nanf is not None:
             mark(nanf < 0.10, f"dF_ls NaN fraction within valid frames {nanf:.1%} (censored frames only expected)", warn=nanf < 0.3)

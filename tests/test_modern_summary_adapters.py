@@ -54,6 +54,26 @@ def test_giant_reader_rejects_incompatible_file(tmp_path):
         GiantExperimentSummary(p)
 
 
+def test_giant_path_without_sources_is_readable_as_zero_sources(tmp_path):
+    """SILo 'Number of sources: 0' on one DMD writes frame_info/trial_qc but no sources/ group
+    (803496_2025-07-30 DMD2, 2026-11-17): the file must stay readable, with 0 sources and 0 valid trials there."""
+    import h5py
+    p = tmp_path / "experiment_summary.h5"
+    write_giant_experiment_summary(p, trial_frames=[100, 80], n_sources=3, n_channels=1, activity_channel=1,
+                                   frame_lines_by_trial=[np.arange(1, 5301, 53), np.arange(5301, 5301 + 80 * 53, 53)])
+    with h5py.File(p, "a") as f:
+        f.create_dataset("Path2/frame_info/trial_num_frames", data=np.zeros((2, 1)))
+        f.create_dataset("Path2/frame_info/frame_line_idxs", data=np.zeros((0, 1)))
+        f.create_dataset("Path2/trial_qc/rule", data=np.bytes_("absolute"))
+    rep = validate_giant_summary_schema(p)
+    assert rep["compatible"], rep["problems"]
+    assert rep["paths"]["Path2"]["n_sources"] == 0 and rep["paths"]["Path2"]["notes"]
+    exp = GiantExperimentSummary(p)
+    assert exp.n_dmds == 2 and exp.n_synapses == [3, 0] and exp.valid_trials[1] == []
+    assert exp.valid_trials[0] == [1, 2]
+    exp.close()
+
+
 def test_giant_acquisition_metadata_from_raw_headers(tmp_path):
     dd = tmp_path / "slap2" / "dynamic_data"
     write_dat_chunks(dd, prefix="acq_1", dmd=1, n_cycles=300, lines_per_cycle=67, reference_timestamp=5000)
