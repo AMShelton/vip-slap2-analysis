@@ -79,8 +79,14 @@ def trial_qc_summary(summary_h5, dmd: int) -> dict:
                 v = g[k][()]
                 if isinstance(v, bytes):
                     return v.decode()
+                if isinstance(v, str):
+                    return v
                 v = np.asarray(v)
-                return "".join(chr(int(c)) for c in v.ravel()) if v.dtype.kind in "iu" else str(v.ravel()[0]) if v.size == 1 else str(v)
+                if v.dtype.kind in "SO":          # variable-length UTF-8 strings (saveStructToH5)
+                    return ";".join(x.decode() if isinstance(x, bytes) else str(x) for x in v.ravel())
+                if v.dtype.kind in "iu":          # legacy char codes
+                    return "".join(chr(int(c)) for c in v.ravel())
+                return str(v.ravel()[0]) if v.size == 1 else str(v)
             corr = np.asarray(g["template_corr"][()], dtype=float).ravel() if "template_corr" in g else np.array([])
             valid = np.asarray(g["valid"][()], dtype=float).ravel().astype(bool) if "valid" in g else np.zeros(corr.size, bool)
             keep = np.asarray(g["trial_table_keep"][()], dtype=float).ravel().astype(bool) if "trial_table_keep" in g else np.ones(corr.size, bool)
