@@ -362,6 +362,23 @@ class GiantExperimentSummary:
                 return np.zeros((sl.stop - sl.start,), dtype=bool)
             return _read_1d(f[key], sl).astype(bool)
 
+    def get_trial_qc(self, dmd: int) -> Dict[str, Any]:
+        """Per-trial SILo QC of one DMD (``Path<n>/trial_qc``): ``valid``, ``trial_table_keep``,
+        ``template_corr`` (float arrays) and ``reason`` (one string per trial, '' when valid).
+        Empty dict when the product predates ``trial_qc``."""
+        with self._open() as f:
+            g = f.get(f"Path{int(dmd)}/trial_qc")
+            if g is None:
+                return {}
+            def vec(k, dtype):
+                return np.asarray(g[k][()], dtype=float).ravel().astype(dtype) if k in g else None
+            reason = None
+            if "excluded_reason" in g:
+                r = np.asarray(g["excluded_reason"][()])
+                reason = [_decode_str(x) for x in r.ravel()] if r.dtype.kind in "SO" else None
+            return {"valid": vec("valid", bool), "trial_table_keep": vec("trial_table_keep", bool),
+                    "template_corr": vec("template_corr", float), "reason": reason}
+
     def get_traces(
         self,
         dmd: int = 1,
