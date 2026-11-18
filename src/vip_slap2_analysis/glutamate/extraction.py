@@ -490,7 +490,7 @@ def process_glutamate_extraction(
                 post_time=windows.image[1],
             )
             if snippet is None or snippet.shape[1] != n_img_time:
-                continue
+                snippet = np.full((bundle.traces.shape[0], n_img_time), np.nan, dtype=float)  # keep the position
             ordered_snippets[evt.event_idx] = _apply_synapse_mask_to_array(snippet, syn_mask)
 
         mean_pkg[f"DMD{dmd}"]["image_identity"] = {img: summarize_event_tensor(arr) for img, arr in aligned_images.items()}
@@ -514,7 +514,11 @@ def process_glutamate_extraction(
         seq_pkg[f"DMD{dmd}"]["synapse_ids"] = synapse_ids
         seq_pkg[f"DMD{dmd}"]["valid_synapses_mask"] = syn_mask
 
-        image_count_by_id = {img: int(arr.shape[0]) for img, arr in aligned_images.items()}
+        def _n_valid(arr):
+            return int(np.isfinite(arr).any(axis=(1, 2)).sum())
+
+        image_presentations_by_id = {img: int(arr.shape[0]) for img, arr in aligned_images.items()}
+        image_count_by_id = {img: _n_valid(arr) for img, arr in aligned_images.items()}
         zero_count_ids = [img for img, cnt in image_count_by_id.items() if cnt == 0]
         qc["per_dmd"][f"DMD{dmd}"] = {
             "n_synapses_total": n_syn_total,
@@ -539,9 +543,12 @@ def process_glutamate_extraction(
             "source_acquisition_epochs": exp.get_dmd_epoch_metadata(dmd),
             "n_image_ids_extracted": int(len(image_count_by_id)),
             "image_count_by_id": image_count_by_id,
+            "image_presentations_by_id": image_presentations_by_id,
             "zero_count_image_ids": zero_count_ids,
-            "n_change_events_extracted": int(aligned_changes.shape[0]),
-            "n_omission_events_extracted": int(aligned_omissions.shape[0]),
+            "n_change_events_extracted": _n_valid(aligned_changes),
+            "n_omission_events_extracted": _n_valid(aligned_omissions),
+            "n_change_presentations": int(aligned_changes.shape[0]),
+            "n_omission_presentations": int(aligned_omissions.shape[0]),
             "stimulus_onsets_used_for_extraction": {
                 "image_identity": _jsonify_onset_dict(image_onsets_used),
                 "change": _jsonify_onset_array(change_onsets_used),

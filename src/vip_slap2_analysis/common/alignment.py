@@ -949,6 +949,9 @@ def align_traces_to_session_intervals(
 ):
     """
     Extract event-aligned trace snippets for stimulus intervals.
+
+    Returns one row per presentation; presentations without a usable window are all-NaN rows,
+    and the returned onsets are those of every presentation.
     
     The function supports image-identity dictionaries and flat interval lists, using
     an explicit bundle timebase when available and otherwise falling back to fixed-rate
@@ -965,6 +968,8 @@ def align_traces_to_session_intervals(
         snippets = []
         kept_onsets = []
 
+        # One row per presentation: a presentation with no usable window (excluded trial,
+        # outside covered imaging time, truncated or epoch-crossing window) is a NaN row.
         for onset, _ in intervals:
             snippet = extract_trace_snippet(
                 bundle,
@@ -974,7 +979,7 @@ def align_traces_to_session_intervals(
                 post_time=post_time,
             )
             if snippet is None:
-                continue
+                snippet = np.full((traces.shape[0], n_win), np.nan, dtype=float)
             snippets.append(snippet)
             kept_onsets.append(float(onset))
 
@@ -1020,10 +1025,15 @@ def summarize_event_tensor(x: np.ndarray) -> Dict[str, np.ndarray]:
     n_events = int(x.shape[0])
     counts = np.sum(np.isfinite(x), axis=0)
     out_shape = x.shape[1:]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN slices -> NaN
+        mean = np.nanmean(x, axis=0) if n_events else np.full(out_shape, np.nan)
+        std = np.nanstd(x, axis=0, ddof=0) if n_events else np.full(out_shape, np.nan)
     return {
-        "mean": np.nanmean(x, axis=0) if n_events else np.full(out_shape, np.nan),
-        "std": np.nanstd(x, axis=0, ddof=0) if n_events else np.full(out_shape, np.nan),
+        "mean": mean,
+        "std": std,
         "n_events": np.array(n_events, dtype=int),
+        "n_valid_presentations": np.array(int(np.isfinite(x).any(axis=(1, 2)).sum()), dtype=int),
         "n_finite": counts.astype(int),
     }
 
