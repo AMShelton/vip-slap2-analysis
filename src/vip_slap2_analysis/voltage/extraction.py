@@ -1463,6 +1463,7 @@ class _OnlineSummary:
         self.sumsq = np.zeros(self.shape, dtype=np.float64)
         self.count = np.zeros(self.shape, dtype=np.int64)
         self.n_events = 0
+        self.n_valid = 0
 
     def update(self, x: np.ndarray) -> None:
         arr = np.asarray(x, dtype=np.float64)
@@ -1474,6 +1475,7 @@ class _OnlineSummary:
         self.sumsq += vals * vals
         self.count += finite.astype(np.int64)
         self.n_events += 1
+        self.n_valid += int(finite.any())
 
     def as_dict(self) -> Dict[str, np.ndarray]:
         mean = np.full(self.shape, np.nan, dtype=np.float32)
@@ -1490,6 +1492,7 @@ class _OnlineSummary:
             "mean": mean,
             "std": std,
             "n_events": np.array(int(self.n_events), dtype=int),
+            "n_valid_presentations": np.array(int(self.n_valid), dtype=int),
             "n_finite": self.count.astype(np.int64),
         }
 
@@ -1640,6 +1643,7 @@ def _extract_interval_list_streaming(
         start = center - int(round(pre_time * sample_rate_hz))
         stop = start + n_win
         if start < 0 or stop > bundle.traces.shape[1]:
+            valid.append((onset, None, None))  # no usable window: NaN row, presentation kept
             continue
         valid.append((onset, start, stop))
 
@@ -1657,7 +1661,10 @@ def _extract_interval_list_streaming(
 
     summary = _OnlineSummary((n_rois, n_win))
     for i, (_onset, start, stop) in enumerate(valid):
-        snip = np.asarray(bundle.traces[roi_mask, start:stop], dtype=dtype)
+        if start is None:
+            snip = np.full((n_rois, n_win), np.nan, dtype=dtype)
+        else:
+            snip = np.asarray(bundle.traces[roi_mask, start:stop], dtype=dtype)
         if writer is not None:
             writer[i, :, :] = snip
         summary.update(snip)
@@ -1738,7 +1745,7 @@ def _summaries_to_position_dict(summaries: Sequence[_OnlineSummary]) -> Dict[str
     return {
         "mean": np.stack([d["mean"] for d in dicts], axis=0),
         "std": np.stack([d["std"] for d in dicts], axis=0),
-        "counts": np.asarray([int(d["n_events"]) for d in dicts], dtype=int),
+        "counts": np.asarray([int(d["n_valid_presentations"]) for d in dicts], dtype=int),
         "n_finite": np.stack([d["n_finite"] for d in dicts], axis=0),
     }
 
@@ -1757,6 +1764,7 @@ def _summarize_change_locked_sequences_streaming(
     _n_pre, _n_post, n_time = _n_window_samples(pre_time, post_time, sample_rate_hz)
     timebase_sec = _valid_timebase(bundle)
     out: Dict[str, Any] = {}
+    nan_snip = np.full((n_rois, n_time), np.nan, dtype=np.float32)  # excluded presentation keeps its position
 
     for image_name, groups in seq_events.items():
         pre_summaries = [_OnlineSummary((n_rois, n_time)) for _ in range(2)]
@@ -1780,7 +1788,8 @@ def _summarize_change_locked_sequences_streaming(
                 )
                 for evt in pre_evts
             ]
-            if len(pre_snips) == 2 and all(s is not None for s in pre_snips):
+            pre_snips = [nan_snip if s_ is None else s_ for s_ in pre_snips]
+            if len(pre_snips) == 2:
                 for pos, snip in enumerate(pre_snips):
                     pre_summaries[pos].update(snip)  # type: ignore[arg-type]
                 pre_n_sequences += 1
@@ -1798,9 +1807,8 @@ def _summarize_change_locked_sequences_streaming(
                     roi_mask=roi_mask,
                     timebase_sec=timebase_sec,
                 )
-                if snip is not None:
-                    repeated_summaries[pos].update(snip)
-                    rep_count_this_sequence += 1
+                repeated_summaries[pos].update(nan_snip if snip is None else snip)
+                rep_count_this_sequence += 1
             if rep_count_this_sequence > 0:
                 repeated_n_sequences += 1
                 sequence_lengths.append(int(rep_count_this_sequence))
@@ -1814,9 +1822,8 @@ def _summarize_change_locked_sequences_streaming(
                 roi_mask=roi_mask,
                 timebase_sec=timebase_sec,
             )
-            if term_snip is not None:
-                terminal_summary.update(term_snip)
-                terminal_n_sequences += 1
+            terminal_summary.update(nan_snip if term_snip is None else term_snip)
+            terminal_n_sequences += 1
 
         pre = _summaries_to_position_dict(pre_summaries)
         rep = _summaries_to_position_dict(repeated_summaries)
