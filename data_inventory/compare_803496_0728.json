@@ -1,0 +1,1381 @@
+{
+  "modern": "\\\\allen\\aind\\scratch\\ophys\\Andrew\\VIP_synaptic_dynamics\\iGluSnFR4f\\803496\\2025-07-28_803496\\803496_2025-07-28_08-04-39_slap2_2026-01-19_22-09-49\\source_extraction\\Glutamate\\experiment_summary.h5",
+  "legacy": "\\\\allen\\aind\\scratch\\ophys\\Andrew\\VIP_synaptic_dynamics\\iGluSnFR4f\\803496\\2025-07-28_803496\\803496_2025-07-28_08-04-39_slap2_2026-01-19_22-09-49\\source_extraction\\Glutamate\\ExperimentSummary\\SummaryLoCo-260119-113615.mat",
+  "per_dmd": {
+    "DMD1": {
+      "modern_n_sources": 74,
+      "legacy_n_sources": 94,
+      "modern_valid_trials": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "15",
+        "16",
+        "17",
+        "18",
+        "19",
+        "20",
+        "21",
+        "22",
+        "23",
+        "24",
+        "25",
+        "26",
+        "27",
+        "28",
+        "29",
+        "30",
+        "31",
+        "32",
+        "33",
+        "34",
+        "35",
+        "36",
+        "37",
+        "38",
+        "39",
+        "40",
+        "41",
+        "42",
+        "43",
+        "44",
+        "45",
+        "46",
+        "47",
+        "48",
+        "49",
+        "50",
+        "51",
+        "52",
+        "53",
+        "54",
+        "55",
+        "56",
+        "57",
+        "58",
+        "59",
+        "60",
+        "61",
+        "62",
+        "63",
+        "64",
+        "65",
+        "66",
+        "67",
+        "68",
+        "69",
+        "70",
+        "71",
+        "72",
+        "73",
+        "74",
+        "75",
+        "76",
+        "77",
+        "78",
+        "79",
+        "80",
+        "81",
+        "82",
+        "83",
+        "84",
+        "86"
+      ],
+      "legacy_valid_trials": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "15",
+        "16",
+        "17",
+        "18",
+        "19",
+        "20",
+        "21",
+        "22",
+        "23",
+        "24",
+        "25",
+        "26",
+        "27",
+        "28",
+        "29",
+        "30",
+        "31",
+        "32",
+        "33",
+        "34",
+        "35",
+        "36",
+        "37",
+        "38",
+        "39",
+        "40",
+        "41",
+        "42",
+        "43",
+        "44",
+        "45",
+        "46",
+        "47",
+        "48",
+        "49",
+        "50",
+        "51",
+        "52",
+        "53",
+        "54",
+        "55",
+        "56",
+        "57",
+        "58",
+        "59",
+        "60",
+        "61",
+        "62"
+      ],
+      "trials": [],
+      "modern_coverage": {
+        "n_trials": 93,
+        "n_valid_trials": 85,
+        "lines_in_valid_trials": 16991084,
+        "lines_in_all_trials": 18590645,
+        "acquisition_lines_spanned": 18594801,
+        "valid_fraction_of_acquisition": 0.9137545489193458,
+        "invalid_trials": [
+          {
+            "trial": 85,
+            "first_line": 16795304,
+            "last_line": 16995248,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 87,
+            "first_line": 17195192,
+            "last_line": 17395136,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 88,
+            "first_line": 17395136,
+            "last_line": 17595080,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 89,
+            "first_line": 17595080,
+            "last_line": 17795024,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 90,
+            "first_line": 17795024,
+            "last_line": 17994968,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 91,
+            "first_line": 17994968,
+            "last_line": 18194912,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 92,
+            "first_line": 18194912,
+            "last_line": 18394856,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 93,
+            "first_line": 18394856,
+            "last_line": 18594801,
+            "t_start_s": null,
+            "t_end_s": null
+          }
+        ],
+        "line_rate_hz": NaN
+      },
+      "legacy_coverage": {
+        "n_trials": 62,
+        "n_valid_trials": 62,
+        "lines_in_valid_trials": 0,
+        "lines_in_all_trials": 0,
+        "acquisition_lines_spanned": 0,
+        "valid_fraction_of_acquisition": null,
+        "invalid_trials": [
+          {
+            "trial": 1,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 2,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 3,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 4,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 5,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 6,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 7,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 8,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 9,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 10,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 11,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 12,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 13,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 14,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 15,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 16,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 17,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 18,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 19,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 20,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 21,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 22,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 23,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 24,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 25,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 26,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 27,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 28,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 29,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 30,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 31,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 32,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 33,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 34,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 35,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 36,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 37,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 38,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 39,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 40,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 41,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 42,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 43,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 44,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 45,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 46,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 47,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 48,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 49,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 50,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 51,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 52,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 53,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 54,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 55,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 56,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 57,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 58,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 59,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 60,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 61,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 62,
+            "reason": "no frames; no trial-table span"
+          }
+        ],
+        "line_rate_hz": NaN
+      }
+    },
+    "DMD2": {
+      "modern_n_sources": 18,
+      "legacy_n_sources": 53,
+      "modern_valid_trials": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "12",
+        "13",
+        "14",
+        "15",
+        "16",
+        "17",
+        "18",
+        "19",
+        "20",
+        "21"
+      ],
+      "legacy_valid_trials": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "8",
+        "9",
+        "10",
+        "11",
+        "12",
+        "13",
+        "14",
+        "15",
+        "16",
+        "17",
+        "18",
+        "19",
+        "20",
+        "21",
+        "22",
+        "23",
+        "24",
+        "25",
+        "26",
+        "27",
+        "28",
+        "29",
+        "30",
+        "31",
+        "32",
+        "33",
+        "34",
+        "35",
+        "36",
+        "37",
+        "38",
+        "39",
+        "40",
+        "41",
+        "42",
+        "43",
+        "44",
+        "45",
+        "46",
+        "47",
+        "48",
+        "49",
+        "50",
+        "51",
+        "52",
+        "53",
+        "54",
+        "55",
+        "56",
+        "57",
+        "58",
+        "59",
+        "60",
+        "61",
+        "62"
+      ],
+      "trials": [],
+      "modern_coverage": {
+        "n_trials": 93,
+        "n_valid_trials": 19,
+        "lines_in_valid_trials": 3798007,
+        "lines_in_all_trials": 18593944,
+        "acquisition_lines_spanned": 18594801,
+        "valid_fraction_of_acquisition": 0.2042510161845776,
+        "invalid_trials": [
+          {
+            "trial": 10,
+            "first_line": 1799497,
+            "last_line": 1999441,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 11,
+            "first_line": 1999441,
+            "last_line": 2199385,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 22,
+            "first_line": 4198826,
+            "last_line": 4398770,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 23,
+            "first_line": 4398770,
+            "last_line": 4598714,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 24,
+            "first_line": 4598714,
+            "last_line": 4798659,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 25,
+            "first_line": 4798659,
+            "last_line": 4998603,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 26,
+            "first_line": 4998603,
+            "last_line": 5198547,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 27,
+            "first_line": 5198547,
+            "last_line": 5398491,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 28,
+            "first_line": 5398491,
+            "last_line": 5598435,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 29,
+            "first_line": 5598435,
+            "last_line": 5798379,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 30,
+            "first_line": 5798379,
+            "last_line": 5998323,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 31,
+            "first_line": 5998323,
+            "last_line": 6198267,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 32,
+            "first_line": 6198267,
+            "last_line": 6398211,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 33,
+            "first_line": 6398211,
+            "last_line": 6598155,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 34,
+            "first_line": 6598155,
+            "last_line": 6798099,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 35,
+            "first_line": 6798099,
+            "last_line": 6998044,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 36,
+            "first_line": 6998044,
+            "last_line": 7197988,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 37,
+            "first_line": 7197988,
+            "last_line": 7397932,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 38,
+            "first_line": 7397932,
+            "last_line": 7597876,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 39,
+            "first_line": 7597876,
+            "last_line": 7797820,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 40,
+            "first_line": 7797820,
+            "last_line": 7997764,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 41,
+            "first_line": 7997764,
+            "last_line": 8197708,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 42,
+            "first_line": 8197708,
+            "last_line": 8397652,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 43,
+            "first_line": 8397652,
+            "last_line": 8597596,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 44,
+            "first_line": 8597596,
+            "last_line": 8797540,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 45,
+            "first_line": 8797540,
+            "last_line": 8997484,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 46,
+            "first_line": 8997484,
+            "last_line": 9197428,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 47,
+            "first_line": 9197428,
+            "last_line": 9397373,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 48,
+            "first_line": 9397373,
+            "last_line": 9597317,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 49,
+            "first_line": 9597317,
+            "last_line": 9797261,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 50,
+            "first_line": 9797261,
+            "last_line": 9997205,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 51,
+            "first_line": 9997205,
+            "last_line": 10197149,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 52,
+            "first_line": 10197149,
+            "last_line": 10397093,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 53,
+            "first_line": 10397093,
+            "last_line": 10597037,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 54,
+            "first_line": 10597037,
+            "last_line": 10796981,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 55,
+            "first_line": 10796981,
+            "last_line": 10996925,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 56,
+            "first_line": 10996925,
+            "last_line": 11196869,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 57,
+            "first_line": 11196869,
+            "last_line": 11396813,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 58,
+            "first_line": 11396813,
+            "last_line": 11596757,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 59,
+            "first_line": 11596757,
+            "last_line": 11796702,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 60,
+            "first_line": 11796702,
+            "last_line": 11996646,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 61,
+            "first_line": 11996646,
+            "last_line": 12196590,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 62,
+            "first_line": 12196590,
+            "last_line": 12396534,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 63,
+            "first_line": 12396534,
+            "last_line": 12596478,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 64,
+            "first_line": 12596478,
+            "last_line": 12796422,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 65,
+            "first_line": 12796422,
+            "last_line": 12996366,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 66,
+            "first_line": 12996366,
+            "last_line": 13196310,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 67,
+            "first_line": 13196310,
+            "last_line": 13396254,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 68,
+            "first_line": 13396254,
+            "last_line": 13596198,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 69,
+            "first_line": 13596198,
+            "last_line": 13796142,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 70,
+            "first_line": 13796142,
+            "last_line": 13996087,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 71,
+            "first_line": 13996087,
+            "last_line": 14196031,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 72,
+            "first_line": 14196031,
+            "last_line": 14395975,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 73,
+            "first_line": 14395975,
+            "last_line": 14595919,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 74,
+            "first_line": 14595919,
+            "last_line": 14795863,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 75,
+            "first_line": 14795863,
+            "last_line": 14995807,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 76,
+            "first_line": 14995807,
+            "last_line": 15195751,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 77,
+            "first_line": 15195751,
+            "last_line": 15395695,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 78,
+            "first_line": 15395695,
+            "last_line": 15595639,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 79,
+            "first_line": 15595639,
+            "last_line": 15795583,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 80,
+            "first_line": 15795583,
+            "last_line": 15995527,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 81,
+            "first_line": 15995527,
+            "last_line": 16195471,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 82,
+            "first_line": 16195471,
+            "last_line": 16395416,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 83,
+            "first_line": 16395416,
+            "last_line": 16595360,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 84,
+            "first_line": 16595360,
+            "last_line": 16795304,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 85,
+            "first_line": 16795304,
+            "last_line": 16995248,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 86,
+            "first_line": 16995248,
+            "last_line": 17195192,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 87,
+            "first_line": 17195192,
+            "last_line": 17395136,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 88,
+            "first_line": 17395136,
+            "last_line": 17595080,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 89,
+            "first_line": 17595080,
+            "last_line": 17795024,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 90,
+            "first_line": 17795024,
+            "last_line": 17994968,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 91,
+            "first_line": 17994968,
+            "last_line": 18194912,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 92,
+            "first_line": 18194912,
+            "last_line": 18394856,
+            "t_start_s": null,
+            "t_end_s": null
+          },
+          {
+            "trial": 93,
+            "first_line": 18394856,
+            "last_line": 18594801,
+            "t_start_s": null,
+            "t_end_s": null
+          }
+        ],
+        "line_rate_hz": NaN
+      },
+      "legacy_coverage": {
+        "n_trials": 62,
+        "n_valid_trials": 61,
+        "lines_in_valid_trials": 0,
+        "lines_in_all_trials": 0,
+        "acquisition_lines_spanned": 0,
+        "valid_fraction_of_acquisition": null,
+        "invalid_trials": [
+          {
+            "trial": 1,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 2,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 3,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 4,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 5,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 6,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 7,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 8,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 9,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 10,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 11,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 12,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 13,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 14,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 15,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 16,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 17,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 18,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 19,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 20,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 21,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 22,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 23,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 24,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 25,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 26,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 27,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 28,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 29,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 30,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 31,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 32,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 33,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 34,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 35,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 36,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 37,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 38,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 39,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 40,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 41,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 42,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 43,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 44,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 45,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 46,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 47,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 48,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 49,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 50,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 51,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 52,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 53,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 54,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 55,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 56,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 57,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 58,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 59,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 60,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 61,
+            "reason": "no frames; no trial-table span"
+          },
+          {
+            "trial": 62,
+            "reason": "no frames; no trial-table span"
+          }
+        ],
+        "line_rate_hz": NaN
+      }
+    }
+  },
+  "problems": [
+    "trial count differs: modern 93 vs legacy 62",
+    "DMD1: source count differs (74 vs 94); traces compared only on the common prefix, identities NOT assumed equal",
+    "DMD1: valid trial sets differ",
+    "DMD1: trial segmentation differs (modern 93 vs legacy 62 trials over the same acquisition); per-trial trace statistics are not meaningful and were skipped",
+    "DMD2: source count differs (18 vs 53); traces compared only on the common prefix, identities NOT assumed equal",
+    "DMD2: valid trial sets differ",
+    "DMD2: trial segmentation differs (modern 93 vs legacy 62 trials over the same acquisition); per-trial trace statistics are not meaningful and were skipped"
+  ],
+  "modern_n_trials": 93,
+  "legacy_n_trials": 62,
+  "modern_n_dmds": 2,
+  "legacy_n_dmds": 2,
+  "modern_trial_epoch_source": "trial_table.h5:/epoch",
+  "legacy_trial_epoch_source": "explicit:exptSummary/trialTable/epoch",
+  "verdict": "differences_found"
+}
